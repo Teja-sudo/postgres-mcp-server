@@ -25,28 +25,31 @@ Set the `POSTGRES_SERVERS` environment variable with a JSON object containing yo
 ```bash
 export POSTGRES_SERVERS='{
   "dev": {
-    "host": "pgbouncer-server-devdb.elb.us-east-1.amazonaws.com",
+    "host": "***.amazonaws.com",
     "port": "5432",
     "username": "your_username",
     "password": "your_password",
     "defaultDatabase": "myapp_dev",
     "defaultSchema": "public",
-    "isDefault": true
+    "isDefault": true,
+    "ssl": true
   },
   "staging": {
-    "host": "pgbouncer-server-stagingdb.elb.us-east-1.amazonaws.com",
+    "host": "***.amazonaws.com",
     "port": "5432",
     "username": "your_username",
     "password": "your_password",
-    "defaultDatabase": "myapp_staging"
+    "defaultDatabase": "myapp_staging",
+    "ssl": "require"
   },
   "production": {
-    "host": "pgbouncer-server-proddb.elb.us-east-1.amazonaws.com",
+    "host": "***.amazonaws.com",
     "port": "5432",
     "username": "your_username",
     "password": "your_password",
     "defaultDatabase": "myapp_prod",
-    "defaultSchema": "app"
+    "defaultSchema": "app",
+    "ssl": { "rejectUnauthorized": false }
   }
 }'
 ```
@@ -60,6 +63,12 @@ export POSTGRES_SERVERS='{
 - `defaultDatabase` (optional): Default database to connect to (default: "postgres")
 - `defaultSchema` (optional): Default schema to use (default: "public")
 - `isDefault` (optional): Mark this server as the default server to connect to
+- `ssl` (optional): SSL/TLS connection configuration. Options:
+  - `true` or `"require"`: Enable SSL (recommended for cloud databases)
+  - `"prefer"`: Use SSL if available
+  - `"allow"`: Try non-SSL first, then SSL
+  - `false` or `"disable"`: Disable SSL
+  - Object with options: `{ "rejectUnauthorized": false, "ca": "...", "cert": "...", "key": "..." }`
 
 #### POSTGRES_ACCESS_MODE (optional)
 
@@ -87,12 +96,27 @@ Add the server to your Claude Desktop MCP configuration (`claude_desktop_config.
       "command": "npx",
       "args": ["@tejasanik/postgres-mcp-server"],
       "env": {
-        "POSTGRES_SERVERS": "{\"dev\":{\"host\":\"your-host.com\",\"port\":\"5432\",\"username\":\"user\",\"password\":\"pass\"}}",
+        "POSTGRES_SERVERS": "{\"dev\":{\"host\":\"your-host.com\",\"port\":\"5432\",\"username\":\"user\",\"password\":\"pass\",\"ssl\":true}}",
         "POSTGRES_ACCESS_MODE": "readonly"
       }
     }
   }
 }
+```
+
+### Claude Code CLI Configuration
+
+Add the server using the Claude Code CLI:
+
+```bash
+claude mcp add-json postgres_dbs --scope user '{
+  "command": "npx",
+  "args": ["@tejasanik/postgres-mcp-server", "-y"],
+  "env": {
+    "POSTGRES_SERVERS": "{\"dev\":{\"host\":\"your-host.com\",\"port\":\"5432\",\"username\":\"user\",\"password\":\"pass\",\"ssl\":true,\"isDefault\":true},\"staging\":{\"host\":\"staging-host.com\",\"port\":\"5432\",\"username\":\"user\",\"password\":\"pass\",\"ssl\":true}}",
+    "POSTGRES_ACCESS_MODE": "readonly"
+  }
+}'
 ```
 
 ## Available Tools

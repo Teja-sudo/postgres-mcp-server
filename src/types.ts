@@ -6,6 +6,12 @@ export interface ServerConfig {
   defaultDatabase?: string;
   defaultSchema?: string;
   isDefault?: boolean;
+  ssl?: boolean | 'require' | 'prefer' | 'allow' | 'disable' | {
+    rejectUnauthorized?: boolean;
+    ca?: string;
+    cert?: string;
+    key?: string;
+  };
 }
 
 export interface ServersConfig {

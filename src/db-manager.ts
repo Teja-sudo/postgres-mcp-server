@@ -15,6 +15,30 @@ const DEFAULT_QUERY_TIMEOUT_MS = 30000; // 30 seconds
 const MAX_QUERY_TIMEOUT_MS = 300000; // 5 minutes
 
 /**
+ * Converts the ServerConfig ssl option to pg Pool ssl config format.
+ */
+function getSslConfig(ssl: ServerConfig['ssl']): boolean | object | undefined {
+  if (ssl === undefined || ssl === false || ssl === 'disable') {
+    return undefined;
+  }
+
+  if (ssl === true || ssl === 'require') {
+    // Most cloud providers need rejectUnauthorized: false for self-signed certs
+    return { rejectUnauthorized: false };
+  }
+
+  if (ssl === 'prefer' || ssl === 'allow') {
+    return { rejectUnauthorized: false };
+  }
+
+  if (typeof ssl === 'object') {
+    return ssl;
+  }
+
+  return undefined;
+}
+
+/**
  * Determines the access mode from environment variable.
  * POSTGRES_ACCESS_MODE can be 'readonly' or 'full' (default).
  */
@@ -132,6 +156,8 @@ export class DatabaseManager {
       throw new Error('Invalid database name. Only alphanumeric characters and underscores are allowed.');
     }
 
+    const sslConfig = getSslConfig(serverConfig.ssl);
+
     this.currentPool = new Pool({
       host: serverConfig.host,
       port: parseInt(serverConfig.port || DEFAULT_PORT, 10),
@@ -141,7 +167,8 @@ export class DatabaseManager {
       max: 10,
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 10000,
-      statement_timeout: this.queryTimeoutMs
+      statement_timeout: this.queryTimeoutMs,
+      ...(sslConfig && { ssl: sslConfig })
     });
 
     // Handle pool errors
