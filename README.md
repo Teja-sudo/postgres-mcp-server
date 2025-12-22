@@ -18,6 +18,8 @@ npx postgres-mcp-server
 
 ### Environment Variables
 
+#### POSTGRES_SERVERS (required)
+
 Set the `POSTGRES_SERVERS` environment variable with a JSON object containing your server configurations:
 
 ```bash
@@ -43,6 +45,21 @@ export POSTGRES_SERVERS='{
 }'
 ```
 
+#### POSTGRES_ACCESS_MODE (optional)
+
+Controls whether write operations are allowed:
+
+- `full` (default): Full access - allows all SQL operations including INSERT, UPDATE, DELETE, CREATE, DROP, etc.
+- `readonly` / `read-only` / `ro`: Read-only mode - only SELECT and other read operations are allowed
+
+```bash
+# For read-only access (recommended for production)
+export POSTGRES_ACCESS_MODE="readonly"
+
+# For full access (use with caution)
+export POSTGRES_ACCESS_MODE="full"
+```
+
 ### Claude Desktop Configuration
 
 Add the server to your Claude Desktop MCP configuration (`claude_desktop_config.json`):
@@ -52,9 +69,10 @@ Add the server to your Claude Desktop MCP configuration (`claude_desktop_config.
   "mcpServers": {
     "postgres": {
       "command": "npx",
-      "args": ["postgres-mcp-server"],
+      "args": ["@tejasanik/postgres-mcp-server"],
       "env": {
-        "POSTGRES_SERVERS": "{\"dev\":{\"host\":\"your-host.com\",\"port\":\"5432\",\"username\":\"user\",\"password\":\"pass\"}}"
+        "POSTGRES_SERVERS": "{\"dev\":{\"host\":\"your-host.com\",\"port\":\"5432\",\"username\":\"user\",\"password\":\"pass\"}}",
+        "POSTGRES_ACCESS_MODE": "readonly"
       }
     }
   }
@@ -221,9 +239,11 @@ Performs comprehensive database health checks including:
 
 ## Security
 
-- By default, the server runs in **read-only mode**, preventing any write operations (INSERT, UPDATE, DELETE, DROP, etc.)
-- Credentials are managed via environment variables
-- No credentials are logged or exposed through the MCP interface
+- **Access Mode**: By default, the server runs in **full access mode**. Set `POSTGRES_ACCESS_MODE=readonly` to prevent write operations (INSERT, UPDATE, DELETE, DROP, etc.). Recommended for production environments.
+- **SQL Injection Protection**: All user inputs are validated and parameterized queries are used where possible.
+- **Query Timeout**: Default 30-second timeout prevents runaway queries.
+- **Credentials**: Managed via environment variables and never logged or exposed through the MCP interface.
+- **File Permissions**: Large output files are created with restricted permissions (0600).
 
 ## Requirements
 

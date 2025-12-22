@@ -1,5 +1,8 @@
 import { getDbManager } from '../db-manager.js';
 import { SlowQuery, IndexRecommendation, HealthCheckResult } from '../types.js';
+import { validatePositiveInteger, isReadOnlySql } from '../utils/validation.js';
+
+const MAX_QUERIES_TO_ANALYZE = 10;
 
 export async function getTopQueries(args: {
   limit?: number;
@@ -7,9 +10,12 @@ export async function getTopQueries(args: {
   minCalls?: number;
 }): Promise<SlowQuery[]> {
   const dbManager = getDbManager();
-  const limit = args.limit || 10;
-  const orderBy = args.orderBy || 'total_time';
-  const minCalls = args.minCalls || 1;
+  const limit = validatePositiveInteger(args.limit, 'limit', 1, 100) || 10;
+  const minCalls = validatePositiveInteger(args.minCalls, 'minCalls', 1, 1000000) || 1;
+
+  // Validate orderBy
+  const validOrderBy = ['total_time', 'mean_time', 'calls'];
+  const orderBy = validOrderBy.includes(args.orderBy || '') ? args.orderBy! : 'total_time';
 
   // Check if pg_stat_statements extension is available
   const extCheck = await dbManager.query(`
@@ -22,8 +28,13 @@ export async function getTopQueries(args: {
     throw new Error('pg_stat_statements extension is not installed. Please install it to use this feature.');
   }
 
-  const orderColumn = orderBy === 'total_time' ? 'total_exec_time' :
-                      orderBy === 'mean_time' ? 'mean_exec_time' : 'calls';
+  // Map order by to actual column names (safe since we validated above)
+  const orderColumnMap: Record<string, string> = {
+    'total_time': 'total_exec_time',
+    'mean_time': 'mean_exec_time',
+    'calls': 'calls'
+  };
+  const orderColumn = orderColumnMap[orderBy];
 
   const query = `
     SELECT
@@ -43,6 +54,13 @@ export async function getTopQueries(args: {
     return result.rows;
   } catch (error) {
     // Try older column names (PostgreSQL < 13)
+    const legacyOrderColumnMap: Record<string, string> = {
+      'total_time': 'total_time',
+      'mean_time': 'mean_time',
+      'calls': 'calls'
+    };
+    const legacyOrderColumn = legacyOrderColumnMap[orderBy];
+
     const legacyQuery = `
       SELECT
         query,
@@ -52,7 +70,7 @@ export async function getTopQueries(args: {
         rows
       FROM pg_stat_statements
       WHERE calls >= $1
-      ORDER BY ${orderBy === 'total_time' ? 'total_time' : orderBy === 'mean_time' ? 'mean_time' : 'calls'} DESC
+      ORDER BY ${legacyOrderColumn} DESC
       LIMIT $2
     `;
     const result = await dbManager.query<SlowQuery>(legacyQuery, [minCalls, limit]);
@@ -67,8 +85,7 @@ export async function analyzeWorkloadIndexes(args: {
   queries: SlowQuery[];
   recommendations: IndexRecommendation[];
 }> {
-  const dbManager = getDbManager();
-  const topCount = args.topQueriesCount || 20;
+  const topCount = validatePositiveInteger(args.topQueriesCount, 'topQueriesCount', 1, 50) || 20;
 
   // Get top slow queries
   const slowQueries = await getTopQueries({ limit: topCount, orderBy: 'total_time' });
@@ -76,9 +93,17 @@ export async function analyzeWorkloadIndexes(args: {
   const recommendations: IndexRecommendation[] = [];
 
   // Analyze each query for potential index improvements
-  for (const query of slowQueries) {
-    const queryRecs = await analyzeQueryForIndexes(query.query);
-    recommendations.push(...queryRecs);
+  // Limit to prevent excessive processing
+  const queriesToAnalyze = slowQueries.slice(0, 20);
+
+  for (const query of queriesToAnalyze) {
+    try {
+      const queryRecs = await analyzeQueryForIndexes(query.query);
+      recommendations.push(...queryRecs);
+    } catch (error) {
+      // Skip queries that fail analysis
+      continue;
+    }
   }
 
   // Deduplicate recommendations
@@ -96,20 +121,49 @@ export async function analyzeQueryIndexes(args: {
   queryAnalysis: Array<{
     query: string;
     recommendations: IndexRecommendation[];
+    error?: string;
   }>;
   summary: IndexRecommendation[];
 }> {
-  if (args.queries.length > 10) {
-    throw new Error('Maximum 10 queries allowed per analysis');
+  if (!args.queries || !Array.isArray(args.queries)) {
+    throw new Error('queries parameter is required and must be an array');
   }
 
-  const queryAnalysis: Array<{ query: string; recommendations: IndexRecommendation[] }> = [];
+  if (args.queries.length === 0) {
+    throw new Error('queries array must contain at least one query');
+  }
+
+  if (args.queries.length > MAX_QUERIES_TO_ANALYZE) {
+    throw new Error(`Maximum ${MAX_QUERIES_TO_ANALYZE} queries allowed per analysis`);
+  }
+
+  const queryAnalysis: Array<{ query: string; recommendations: IndexRecommendation[]; error?: string }> = [];
   const allRecommendations: IndexRecommendation[] = [];
 
   for (const query of args.queries) {
-    const recommendations = await analyzeQueryForIndexes(query);
-    queryAnalysis.push({ query, recommendations });
-    allRecommendations.push(...recommendations);
+    if (!query || typeof query !== 'string') {
+      queryAnalysis.push({ query: String(query), recommendations: [], error: 'Invalid query' });
+      continue;
+    }
+
+    // Only analyze read-only queries for security
+    const { isReadOnly, reason } = isReadOnlySql(query);
+    if (!isReadOnly) {
+      queryAnalysis.push({ query, recommendations: [], error: `Cannot analyze: ${reason}` });
+      continue;
+    }
+
+    try {
+      const recommendations = await analyzeQueryForIndexes(query);
+      queryAnalysis.push({ query, recommendations });
+      allRecommendations.push(...recommendations);
+    } catch (error) {
+      queryAnalysis.push({
+        query,
+        recommendations: [],
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
   }
 
   return {
@@ -122,31 +176,46 @@ async function analyzeQueryForIndexes(query: string): Promise<IndexRecommendatio
   const dbManager = getDbManager();
   const recommendations: IndexRecommendation[] = [];
 
+  // Validate query is read-only before analyzing
+  const { isReadOnly, reason } = isReadOnlySql(query);
+  if (!isReadOnly) {
+    throw new Error(`Cannot analyze write query: ${reason}`);
+  }
+
   try {
-    // Get the execution plan
+    // Get the execution plan - EXPLAIN without ANALYZE is safe
     const explainResult = await dbManager.query(`EXPLAIN (FORMAT JSON) ${query}`);
+
+    if (!explainResult.rows.length || !explainResult.rows[0]['QUERY PLAN']) {
+      return recommendations;
+    }
+
     const plan = explainResult.rows[0]['QUERY PLAN'][0];
+
+    if (!plan || !plan.Plan) {
+      return recommendations;
+    }
 
     // Analyze the plan for sequential scans on large tables
     const seqScans = findSequentialScans(plan.Plan);
 
     for (const scan of seqScans) {
       // Check if there's a filter condition that could benefit from an index
-      if (scan.filter) {
+      if (scan.filter && scan.table) {
         const columns = extractColumnsFromFilter(scan.filter);
         if (columns.length > 0) {
           recommendations.push({
             table: scan.table,
             columns,
             index_type: 'btree',
-            reason: `Sequential scan with filter on ${columns.join(', ')}. Query cost: ${scan.cost}`,
+            reason: `Sequential scan with filter on ${columns.join(', ')}. Estimated cost: ${scan.cost || 'unknown'}`,
             estimated_improvement: 'Could significantly reduce query time for filtered queries'
           });
         }
       }
 
       // Check for sort operations that could use indexes
-      if (scan.sortKey) {
+      if (scan.sortKey && scan.table) {
         recommendations.push({
           table: scan.table,
           columns: [scan.sortKey],
@@ -158,15 +227,16 @@ async function analyzeQueryForIndexes(query: string): Promise<IndexRecommendatio
     }
   } catch (error) {
     // Query analysis failed, skip this query
+    throw error;
   }
 
   return recommendations;
 }
 
 function findSequentialScans(node: any, scans: any[] = []): any[] {
-  if (!node) return scans;
+  if (!node || typeof node !== 'object') return scans;
 
-  if (node['Node Type'] === 'Seq Scan') {
+  if (node['Node Type'] === 'Seq Scan' && node['Relation Name']) {
     scans.push({
       table: node['Relation Name'],
       filter: node['Filter'],
@@ -175,16 +245,22 @@ function findSequentialScans(node: any, scans: any[] = []): any[] {
     });
   }
 
-  if (node['Sort Key']) {
-    scans.push({
-      table: node['Relation Name'] || 'unknown',
-      sortKey: node['Sort Key'][0],
-      cost: node['Total Cost']
-    });
+  if (node['Sort Key'] && Array.isArray(node['Sort Key']) && node['Sort Key'].length > 0) {
+    const sortKey = String(node['Sort Key'][0]);
+    // Clean up the sort key to extract column name
+    const cleanSortKey = sortKey.replace(/\s+(ASC|DESC|NULLS\s+(FIRST|LAST))/gi, '').trim();
+
+    if (cleanSortKey && node['Relation Name']) {
+      scans.push({
+        table: node['Relation Name'],
+        sortKey: cleanSortKey,
+        cost: node['Total Cost']
+      });
+    }
   }
 
   // Recursively check child nodes
-  if (node.Plans) {
+  if (Array.isArray(node.Plans)) {
     for (const child of node.Plans) {
       findSequentialScans(child, scans);
     }
@@ -194,17 +270,25 @@ function findSequentialScans(node: any, scans: any[] = []): any[] {
 }
 
 function extractColumnsFromFilter(filter: string): string[] {
+  if (!filter || typeof filter !== 'string') return [];
+
   // Simple extraction of column names from filter expressions
   const columns: string[] = [];
+
+  // Match patterns like (column_name = ...) or (column_name > ...)
   const matches = filter.match(/\((\w+)\s*[=<>!]+/g);
   if (matches) {
     for (const match of matches) {
       const col = match.match(/\((\w+)/);
-      if (col) {
-        columns.push(col[1]);
+      if (col && col[1]) {
+        // Basic validation - only alphanumeric and underscore
+        if (/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(col[1])) {
+          columns.push(col[1]);
+        }
       }
     }
   }
+
   return [...new Set(columns)];
 }
 
@@ -212,7 +296,9 @@ function deduplicateRecommendations(recommendations: IndexRecommendation[]): Ind
   const seen = new Map<string, IndexRecommendation>();
 
   for (const rec of recommendations) {
-    const key = `${rec.table}:${rec.columns.sort().join(',')}:${rec.index_type}`;
+    if (!rec.table || !rec.columns || !Array.isArray(rec.columns)) continue;
+
+    const key = `${rec.table}:${[...rec.columns].sort().join(',')}:${rec.index_type}`;
     if (!seen.has(key)) {
       seen.set(key, rec);
     }
@@ -231,30 +317,33 @@ export async function analyzeDbHealth(): Promise<HealthCheckResult[]> {
       SELECT
         sum(heap_blks_read) as heap_read,
         sum(heap_blks_hit) as heap_hit,
-        sum(heap_blks_hit) / NULLIF(sum(heap_blks_hit) + sum(heap_blks_read), 0) as ratio
+        CASE WHEN sum(heap_blks_hit) + sum(heap_blks_read) > 0
+          THEN sum(heap_blks_hit)::float / (sum(heap_blks_hit) + sum(heap_blks_read))::float
+          ELSE 0
+        END as ratio
       FROM pg_statio_user_tables
     `);
 
-    const ratio = parseFloat(cacheResult.rows[0].ratio) || 0;
+    const ratio = parseFloat(cacheResult.rows[0]?.ratio) || 0;
     let status: HealthCheckResult['status'] = 'healthy';
-    if (ratio < 0.9) status = 'warning';
-    if (ratio < 0.8) status = 'critical';
+    if (ratio < 0.9 && ratio > 0) status = 'warning';
+    if (ratio < 0.8 && ratio > 0) status = 'critical';
 
     results.push({
       category: 'Buffer Cache Hit Rate',
       status,
-      message: `Cache hit ratio: ${(ratio * 100).toFixed(2)}%`,
+      message: ratio > 0 ? `Cache hit ratio: ${(ratio * 100).toFixed(2)}%` : 'No data available',
       details: {
-        heap_read: cacheResult.rows[0].heap_read,
-        heap_hit: cacheResult.rows[0].heap_hit,
-        recommendation: ratio < 0.9 ? 'Consider increasing shared_buffers' : 'Good cache performance'
+        heap_read: cacheResult.rows[0]?.heap_read || 0,
+        heap_hit: cacheResult.rows[0]?.heap_hit || 0,
+        recommendation: ratio < 0.9 && ratio > 0 ? 'Consider increasing shared_buffers' : 'Good cache performance'
       }
     });
   } catch (error) {
     results.push({
       category: 'Buffer Cache Hit Rate',
       status: 'warning',
-      message: `Could not check buffer cache: ${error}`
+      message: `Could not check buffer cache: ${error instanceof Error ? error.message : String(error)}`
     });
   }
 
@@ -272,27 +361,32 @@ export async function analyzeDbHealth(): Promise<HealthCheckResult[]> {
     `);
 
     const row = connResult.rows[0];
-    const usageRatio = row.total_connections / row.max_connections;
+    const totalConns = parseInt(row?.total_connections) || 0;
+    const maxConns = parseInt(row?.max_connections) || 100;
+    const usageRatio = maxConns > 0 ? totalConns / maxConns : 0;
+
     let status: HealthCheckResult['status'] = 'healthy';
     if (usageRatio > 0.7) status = 'warning';
     if (usageRatio > 0.9) status = 'critical';
 
+    const idleInTx = parseInt(row?.idle_in_transaction) || 0;
+
     results.push({
       category: 'Connection Health',
       status,
-      message: `Using ${row.total_connections}/${row.max_connections} connections (${(usageRatio * 100).toFixed(1)}%)`,
+      message: `Using ${totalConns}/${maxConns} connections (${(usageRatio * 100).toFixed(1)}%)`,
       details: {
-        active: row.active,
-        idle: row.idle,
-        idle_in_transaction: row.idle_in_transaction,
-        recommendation: row.idle_in_transaction > 5 ? 'Check for long-running idle transactions' : 'Connection usage healthy'
+        active: parseInt(row?.active) || 0,
+        idle: parseInt(row?.idle) || 0,
+        idle_in_transaction: idleInTx,
+        recommendation: idleInTx > 5 ? 'Check for long-running idle transactions' : 'Connection usage healthy'
       }
     });
   } catch (error) {
     results.push({
       category: 'Connection Health',
       status: 'warning',
-      message: `Could not check connections: ${error}`
+      message: `Could not check connections: ${error instanceof Error ? error.message : String(error)}`
     });
   }
 
@@ -300,13 +394,16 @@ export async function analyzeDbHealth(): Promise<HealthCheckResult[]> {
   try {
     const indexResult = await dbManager.query(`
       SELECT
-        schemaname,
-        tablename,
-        indexname,
-        pg_get_indexdef(i.indexrelid) as indexdef
-      FROM pg_indexes
-      JOIN pg_index i ON i.indexrelid = (schemaname || '.' || indexname)::regclass
-      WHERE NOT i.indisvalid
+        n.nspname as schemaname,
+        t.relname as tablename,
+        i.relname as indexname
+      FROM pg_index ix
+      JOIN pg_class i ON i.oid = ix.indexrelid
+      JOIN pg_class t ON t.oid = ix.indrelid
+      JOIN pg_namespace n ON n.oid = t.relnamespace
+      WHERE NOT ix.indisvalid
+      AND n.nspname NOT IN ('pg_catalog', 'pg_toast', 'information_schema')
+      LIMIT 100
     `);
 
     const status: HealthCheckResult['status'] = indexResult.rows.length > 0 ? 'critical' : 'healthy';
@@ -352,7 +449,7 @@ export async function analyzeDbHealth(): Promise<HealthCheckResult[]> {
     results.push({
       category: 'Unused Indexes',
       status: 'warning',
-      message: `Could not check unused indexes: ${error}`
+      message: `Could not check unused indexes: ${error instanceof Error ? error.message : String(error)}`
     });
   }
 
@@ -361,16 +458,18 @@ export async function analyzeDbHealth(): Promise<HealthCheckResult[]> {
     const dupResult = await dbManager.query(`
       SELECT
         pg_size_pretty(sum(pg_relation_size(idx))::bigint) as total_size,
-        array_agg(idx) as indexes,
-        (array_agg(indrelid))[1]::regclass as table_name
+        array_agg(idx::text) as indexes,
+        (array_agg(indrelid))[1]::regclass::text as table_name
       FROM (
         SELECT indexrelid::regclass as idx,
                indrelid,
                indkey as columns
         FROM pg_index
+        WHERE indrelid IN (SELECT oid FROM pg_class WHERE relnamespace = 'public'::regnamespace)
       ) sub
       GROUP BY indrelid, columns
       HAVING count(*) > 1
+      LIMIT 50
     `);
 
     const status: HealthCheckResult['status'] = dupResult.rows.length > 0 ? 'warning' : 'healthy';
@@ -409,7 +508,7 @@ export async function analyzeDbHealth(): Promise<HealthCheckResult[]> {
     `);
 
     let status: HealthCheckResult['status'] = 'healthy';
-    const needsVacuum = vacuumResult.rows.filter((r: any) => r.dead_ratio > 10);
+    const needsVacuum = vacuumResult.rows.filter((r: any) => parseFloat(r.dead_ratio) > 10);
     if (needsVacuum.length > 0) status = 'warning';
     if (needsVacuum.length > 5) status = 'critical';
 
@@ -423,7 +522,7 @@ export async function analyzeDbHealth(): Promise<HealthCheckResult[]> {
     results.push({
       category: 'Vacuum Health',
       status: 'warning',
-      message: `Could not check vacuum status: ${error}`
+      message: `Could not check vacuum status: ${error instanceof Error ? error.message : String(error)}`
     });
   }
 
@@ -440,16 +539,15 @@ export async function analyzeDbHealth(): Promise<HealthCheckResult[]> {
           ELSE 0
         END as usage_percent
       FROM pg_sequences
-      WHERE CASE WHEN max_value > 0
-        THEN 100.0 * last_value / max_value > 50
-        ELSE false
-      END
+      WHERE max_value > 0
+      AND 100.0 * last_value / max_value > 50
       ORDER BY usage_percent DESC
+      LIMIT 20
     `);
 
     let status: HealthCheckResult['status'] = 'healthy';
-    if (seqResult.rows.some((r: any) => r.usage_percent > 80)) status = 'warning';
-    if (seqResult.rows.some((r: any) => r.usage_percent > 95)) status = 'critical';
+    if (seqResult.rows.some((r: any) => parseFloat(r.usage_percent) > 80)) status = 'warning';
+    if (seqResult.rows.some((r: any) => parseFloat(r.usage_percent) > 95)) status = 'critical';
 
     results.push({
       category: 'Sequence Limits',
@@ -470,10 +568,11 @@ export async function analyzeDbHealth(): Promise<HealthCheckResult[]> {
     const constraintResult = await dbManager.query(`
       SELECT
         conname,
-        conrelid::regclass as table_name,
+        conrelid::regclass::text as table_name,
         contype
       FROM pg_constraint
       WHERE NOT convalidated
+      LIMIT 50
     `);
 
     const status: HealthCheckResult['status'] = constraintResult.rows.length > 0 ? 'warning' : 'healthy';

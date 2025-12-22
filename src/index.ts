@@ -8,7 +8,7 @@ import {
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
 
-import { getDbManager } from './db-manager.js';
+import { getDbManager, resetDbManager } from './db-manager.js';
 import {
   listServersAndDbs,
   switchServerDb,
@@ -158,7 +158,7 @@ const tools: Tool[] = [
         },
         analyze: {
           type: 'boolean',
-          description: 'Actually execute the query to get real timing (default: false)',
+          description: 'Actually execute the query to get real timing (default: false). Only allowed for SELECT queries.',
           default: false
         },
         buffers: {
@@ -208,7 +208,7 @@ const tools: Tool[] = [
       properties: {
         limit: {
           type: 'number',
-          description: 'Number of queries to return',
+          description: 'Number of queries to return (1-100)',
           default: 10
         },
         orderBy: {
@@ -233,7 +233,7 @@ const tools: Tool[] = [
       properties: {
         topQueriesCount: {
           type: 'number',
-          description: 'Number of top queries to analyze',
+          description: 'Number of top queries to analyze (1-50)',
           default: 20
         },
         includeHypothetical: {
@@ -383,8 +383,33 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
+// Graceful shutdown handling
+async function shutdown(): Promise<void> {
+  console.error('Shutting down PostgreSQL MCP Server...');
+  try {
+    resetDbManager();
+  } catch (error) {
+    console.error('Error during shutdown:', error);
+  }
+  process.exit(0);
+}
+
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
+process.on('SIGHUP', shutdown);
+
+// Handle uncaught errors
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught exception:', error);
+  shutdown();
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled rejection at:', promise, 'reason:', reason);
+});
+
 // Start server
-async function main() {
+async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error('PostgreSQL MCP Server started');

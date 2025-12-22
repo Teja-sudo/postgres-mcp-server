@@ -1,5 +1,6 @@
 import { getDbManager } from '../db-manager.js';
 import { SchemaInfo, TableInfo, ColumnInfo, ConstraintInfo, IndexInfo } from '../types.js';
+import { validateIdentifier } from '../utils/validation.js';
 
 export async function listSchemas(args: {
   includeSystemSchemas?: boolean;
@@ -31,6 +32,26 @@ export async function listObjects(args: {
   objectType?: 'table' | 'view' | 'sequence' | 'extension' | 'all';
   filter?: string;
 }): Promise<TableInfo[]> {
+  // Validate required parameters
+  if (!args.schema) {
+    throw new Error('schema parameter is required');
+  }
+
+  // Validate schema name to prevent SQL injection
+  validateIdentifier(args.schema, 'schema');
+
+  // Validate filter if provided
+  if (args.filter) {
+    // Allow more characters in filter since it's used with ILIKE and parameterized
+    if (args.filter.length > 128) {
+      throw new Error('filter must be 128 characters or less');
+    }
+    // Only allow safe characters in filter
+    if (!/^[a-zA-Z0-9_% ]+$/.test(args.filter)) {
+      throw new Error('filter contains invalid characters');
+    }
+  }
+
   const dbManager = getDbManager();
   const objectType = args.objectType || 'all';
   const objects: TableInfo[] = [];
@@ -57,14 +78,16 @@ export async function listObjects(args: {
   if (objectType === 'all' || objectType === 'view') {
     const viewsQuery = `
       SELECT
-        table_name as name,
+        v.table_name as name,
         'view' as type,
-        table_schema as schema,
-        '' as owner
-      FROM information_schema.views
-      WHERE table_schema = $1
-      ${args.filter ? "AND table_name ILIKE '%' || $2 || '%'" : ''}
-      ORDER BY table_name
+        v.table_schema as schema,
+        COALESCE(c.relowner::regrole::text, '') as owner
+      FROM information_schema.views v
+      LEFT JOIN pg_class c ON c.relname = v.table_name
+      LEFT JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = v.table_schema
+      WHERE v.table_schema = $1
+      ${args.filter ? "AND v.table_name ILIKE '%' || $2 || '%'" : ''}
+      ORDER BY v.table_name
     `;
     const params = args.filter ? [args.schema, args.filter] : [args.schema];
     const views = await dbManager.query<TableInfo>(viewsQuery, params);
@@ -75,14 +98,16 @@ export async function listObjects(args: {
   if (objectType === 'all' || objectType === 'sequence') {
     const sequencesQuery = `
       SELECT
-        sequence_name as name,
+        s.sequence_name as name,
         'sequence' as type,
-        sequence_schema as schema,
-        '' as owner
-      FROM information_schema.sequences
-      WHERE sequence_schema = $1
-      ${args.filter ? "AND sequence_name ILIKE '%' || $2 || '%'" : ''}
-      ORDER BY sequence_name
+        s.sequence_schema as schema,
+        COALESCE(c.relowner::regrole::text, '') as owner
+      FROM information_schema.sequences s
+      LEFT JOIN pg_class c ON c.relname = s.sequence_name
+      LEFT JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = s.sequence_schema
+      WHERE s.sequence_schema = $1
+      ${args.filter ? "AND s.sequence_name ILIKE '%' || $2 || '%'" : ''}
+      ORDER BY s.sequence_name
     `;
     const params = args.filter ? [args.schema, args.filter] : [args.schema];
     const sequences = await dbManager.query<TableInfo>(sequencesQuery, params);
@@ -96,7 +121,7 @@ export async function listObjects(args: {
         extname as name,
         'extension' as type,
         n.nspname as schema,
-        '' as owner
+        COALESCE(extowner::regrole::text, '') as owner
       FROM pg_extension e
       JOIN pg_namespace n ON e.extnamespace = n.oid
       WHERE n.nspname = $1
@@ -123,6 +148,18 @@ export async function getObjectDetails(args: {
   size?: string;
   definition?: string;
 }> {
+  // Validate required parameters
+  if (!args.schema) {
+    throw new Error('schema parameter is required');
+  }
+  if (!args.objectName) {
+    throw new Error('objectName parameter is required');
+  }
+
+  // Validate identifiers to prevent SQL injection
+  validateIdentifier(args.schema, 'schema');
+  validateIdentifier(args.objectName, 'objectName');
+
   const dbManager = getDbManager();
   const result: {
     columns?: ColumnInfo[];
@@ -133,7 +170,7 @@ export async function getObjectDetails(args: {
     definition?: string;
   } = {};
 
-  // Get columns
+  // Get columns - using parameterized query
   const columnsQuery = `
     SELECT
       column_name,
@@ -148,7 +185,7 @@ export async function getObjectDetails(args: {
   const columns = await dbManager.query<ColumnInfo>(columnsQuery, [args.schema, args.objectName]);
   result.columns = columns.rows;
 
-  // Get constraints
+  // Get constraints - using parameterized query
   const constraintsQuery = `
     SELECT
       tc.constraint_name,
@@ -170,7 +207,7 @@ export async function getObjectDetails(args: {
   const constraints = await dbManager.query<ConstraintInfo>(constraintsQuery, [args.schema, args.objectName]);
   result.constraints = constraints.rows;
 
-  // Get indexes
+  // Get indexes - using parameterized query
   const indexesQuery = `
     SELECT
       i.relname as index_name,
@@ -187,31 +224,35 @@ export async function getObjectDetails(args: {
   const indexes = await dbManager.query<IndexInfo>(indexesQuery, [args.schema, args.objectName]);
   result.indexes = indexes.rows;
 
-  // Get table size and row count (approximate)
+  // Get table size and row count using safe approach
   try {
     const sizeQuery = `
       SELECT
-        pg_size_pretty(pg_total_relation_size($1::regclass)) as size,
-        (SELECT reltuples::bigint FROM pg_class WHERE oid = $1::regclass) as row_count
+        pg_size_pretty(pg_total_relation_size(c.oid)) as size,
+        c.reltuples::bigint as row_count
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = $1 AND c.relname = $2
     `;
-    const fullName = `"${args.schema}"."${args.objectName}"`;
-    const sizeResult = await dbManager.query<{ size: string; row_count: number }>(sizeQuery, [fullName]);
+    const sizeResult = await dbManager.query<{ size: string; row_count: number }>(sizeQuery, [args.schema, args.objectName]);
     if (sizeResult.rows.length > 0) {
       result.size = sizeResult.rows[0].size;
       result.rowCount = sizeResult.rows[0].row_count;
     }
   } catch (error) {
-    // Size query might fail for views
+    // Size query might fail for views or non-existent objects
   }
 
-  // Get view definition if it's a view
+  // Get view definition if it's a view - using safe parameterized approach
   if (args.objectType === 'view') {
     try {
       const viewDefQuery = `
-        SELECT pg_get_viewdef($1::regclass, true) as definition
+        SELECT pg_get_viewdef(c.oid, true) as definition
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'v'
       `;
-      const fullName = `"${args.schema}"."${args.objectName}"`;
-      const viewDef = await dbManager.query<{ definition: string }>(viewDefQuery, [fullName]);
+      const viewDef = await dbManager.query<{ definition: string }>(viewDefQuery, [args.schema, args.objectName]);
       if (viewDef.rows.length > 0) {
         result.definition = viewDef.rows[0].definition;
       }
