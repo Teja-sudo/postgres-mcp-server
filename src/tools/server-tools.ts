@@ -1,5 +1,5 @@
 import { getDbManager } from '../db-manager.js';
-import { DatabaseInfo } from '../types.js';
+import { DatabaseInfo, ConnectionInfo } from '../types.js';
 
 interface ListServersResult {
   servers: {
@@ -7,10 +7,14 @@ interface ListServersResult {
     host: string;
     port: string;
     isConnected: boolean;
+    isDefault: boolean;
+    defaultDatabase?: string;
+    defaultSchema?: string;
     databases?: DatabaseInfo[];
   }[];
   currentServer: string | null;
   currentDatabase: string | null;
+  currentSchema: string | null;
 }
 
 export async function listServersAndDbs(args: {
@@ -35,6 +39,8 @@ export async function listServersAndDbs(args: {
 
   const servers: ListServersResult['servers'] = [];
 
+  const defaultServerName = dbManager.getDefaultServerName();
+
   for (const name of serverNames) {
     const config = serversConfig[name];
     const isConnected = currentState.currentServer === name;
@@ -43,7 +49,10 @@ export async function listServersAndDbs(args: {
       name,
       host: config.host,
       port: config.port || '5432',
-      isConnected
+      isConnected,
+      isDefault: config.isDefault === true || name === defaultServerName,
+      defaultDatabase: config.defaultDatabase,
+      defaultSchema: config.defaultSchema
     };
 
     // Fetch databases only if requested and connected to this server
@@ -77,27 +86,38 @@ export async function listServersAndDbs(args: {
   return {
     servers,
     currentServer: currentState.currentServer,
-    currentDatabase: currentState.currentDatabase
+    currentDatabase: currentState.currentDatabase,
+    currentSchema: currentState.currentSchema
   };
 }
 
 export async function switchServerDb(args: {
   server: string;
   database?: string;
-}): Promise<{ success: boolean; message: string; currentServer: string; currentDatabase: string }> {
+  schema?: string;
+}): Promise<{ success: boolean; message: string; currentServer: string; currentDatabase: string; currentSchema: string }> {
   const dbManager = getDbManager();
 
   try {
-    await dbManager.switchServer(args.server, args.database);
+    await dbManager.switchServer(args.server, args.database, args.schema);
     const state = dbManager.getCurrentState();
 
     return {
       success: true,
-      message: `Successfully connected to server '${args.server}'${args.database ? ` and database '${args.database}'` : ''}`,
+      message: `Successfully connected to server '${args.server}'${args.database ? `, database '${args.database}'` : ''}${args.schema ? `, schema '${args.schema}'` : ''}`,
       currentServer: state.currentServer!,
-      currentDatabase: state.currentDatabase!
+      currentDatabase: state.currentDatabase!,
+      currentSchema: state.currentSchema!
     };
   } catch (error) {
     throw new Error(`Failed to switch: ${error}`);
   }
+}
+
+/**
+ * Gets the current connection details including server, database, schema, and access mode.
+ */
+export async function getCurrentConnection(): Promise<ConnectionInfo> {
+  const dbManager = getDbManager();
+  return dbManager.getConnectionInfo();
 }

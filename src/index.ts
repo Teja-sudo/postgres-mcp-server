@@ -12,6 +12,7 @@ import { getDbManager, resetDbManager } from './db-manager.js';
 import {
   listServersAndDbs,
   switchServerDb,
+  getCurrentConnection,
   listSchemas,
   listObjects,
   getObjectDetails,
@@ -50,7 +51,7 @@ const tools: Tool[] = [
   },
   {
     name: 'switch_server_db',
-    description: 'Switch to a different PostgreSQL server and optionally a specific database. Must be called before using other database tools.',
+    description: 'Switch to a different PostgreSQL server and optionally a specific database and schema. Must be called before using other database tools. Uses server defaults if not specified.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -60,10 +61,22 @@ const tools: Tool[] = [
         },
         database: {
           type: 'string',
-          description: 'Name of the database to connect to (defaults to "postgres")'
+          description: 'Name of the database to connect to (uses server default or "postgres")'
+        },
+        schema: {
+          type: 'string',
+          description: 'Name of the default schema (uses server default or "public")'
         }
       },
       required: ['server']
+    }
+  },
+  {
+    name: 'get_current_connection',
+    description: 'Returns details about the current database connection including server, database, schema, host, port, and access mode (readonly/full).',
+    inputSchema: {
+      type: 'object',
+      properties: {}
     }
   },
   {
@@ -302,6 +315,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'switch_server_db':
         result = await switchServerDb(args as any);
+        break;
+
+      case 'get_current_connection':
+        result = await getCurrentConnection();
         break;
 
       case 'list_schemas':

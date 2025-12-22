@@ -3,6 +3,9 @@ export interface ServerConfig {
   port: string;
   username: string;
   password: string;
+  defaultDatabase?: string;
+  defaultSchema?: string;
+  isDefault?: boolean;
 }
 
 export interface ServersConfig {
@@ -12,6 +15,17 @@ export interface ServersConfig {
 export interface ConnectionState {
   currentServer: string | null;
   currentDatabase: string | null;
+  currentSchema: string | null;
+}
+
+export interface ConnectionInfo {
+  isConnected: boolean;
+  server: string | null;
+  database: string | null;
+  schema: string | null;
+  host: string | null;
+  port: string | null;
+  accessMode: 'full' | 'readonly';
 }
 
 export interface DatabaseInfo {

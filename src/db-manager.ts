@@ -3,12 +3,14 @@ import {
   ServerConfig,
   ServersConfig,
   ConnectionState,
+  ConnectionInfo,
   DatabaseInfo
 } from './types.js';
 import { isReadOnlySql } from './utils/validation.js';
 
 const DEFAULT_PORT = '5432';
 const DEFAULT_DATABASE = 'postgres';
+const DEFAULT_SCHEMA = 'public';
 const DEFAULT_QUERY_TIMEOUT_MS = 30000; // 30 seconds
 const MAX_QUERY_TIMEOUT_MS = 300000; // 5 minutes
 
@@ -36,7 +38,8 @@ export class DatabaseManager {
     this.serversConfig = this.loadServersConfig();
     this.connectionState = {
       currentServer: null,
-      currentDatabase: null
+      currentDatabase: null,
+      currentSchema: null
     };
     this.readOnlyMode = readOnlyMode;
     this.queryTimeoutMs = Math.min(queryTimeoutMs, MAX_QUERY_TIMEOUT_MS);
@@ -98,7 +101,18 @@ export class DatabaseManager {
     return this.currentPool !== null;
   }
 
-  public async switchServer(serverName: string, database?: string): Promise<void> {
+  public getDefaultServerName(): string | null {
+    for (const [name, config] of Object.entries(this.serversConfig)) {
+      if (config.isDefault) {
+        return name;
+      }
+    }
+    // If no default is set, return the first server
+    const names = this.getServerNames();
+    return names.length > 0 ? names[0] : null;
+  }
+
+  public async switchServer(serverName: string, database?: string, schema?: string): Promise<void> {
     const serverConfig = this.getServerConfig(serverName);
     if (!serverConfig) {
       throw new Error(`Server '${serverName}' not found in configuration`);
@@ -110,7 +124,8 @@ export class DatabaseManager {
       this.currentPool = null;
     }
 
-    const dbName = database || DEFAULT_DATABASE;
+    // Use provided database, server's default, or system default
+    const dbName = database || serverConfig.defaultDatabase || DEFAULT_DATABASE;
 
     // Validate database name
     if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(dbName)) {
@@ -140,10 +155,50 @@ export class DatabaseManager {
       client.release();
       this.connectionState.currentServer = serverName;
       this.connectionState.currentDatabase = dbName;
+      // Use provided schema, server's default, or system default
+      this.connectionState.currentSchema = schema || serverConfig.defaultSchema || DEFAULT_SCHEMA;
     } catch (error) {
       await this.currentPool.end();
       this.currentPool = null;
       throw new Error(`Failed to connect to server '${serverName}': ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  public setCurrentSchema(schema: string): void {
+    if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(schema)) {
+      throw new Error('Invalid schema name. Only alphanumeric characters and underscores are allowed.');
+    }
+    this.connectionState.currentSchema = schema;
+  }
+
+  public getConnectionInfo(): ConnectionInfo {
+    const serverConfig = this.connectionState.currentServer
+      ? this.getServerConfig(this.connectionState.currentServer)
+      : null;
+
+    return {
+      isConnected: this.isConnected(),
+      server: this.connectionState.currentServer,
+      database: this.connectionState.currentDatabase,
+      schema: this.connectionState.currentSchema,
+      host: serverConfig?.host || null,
+      port: serverConfig?.port || null,
+      accessMode: this.readOnlyMode ? 'readonly' : 'full'
+    };
+  }
+
+  public async connectToDefault(): Promise<boolean> {
+    const defaultServer = this.getDefaultServerName();
+    if (!defaultServer) {
+      return false;
+    }
+
+    try {
+      await this.switchServer(defaultServer);
+      return true;
+    } catch (error) {
+      console.error(`Failed to connect to default server: ${error}`);
+      return false;
     }
   }
 
@@ -210,6 +265,7 @@ export class DatabaseManager {
       this.currentPool = null;
       this.connectionState.currentServer = null;
       this.connectionState.currentDatabase = null;
+      this.connectionState.currentSchema = null;
     }
   }
 

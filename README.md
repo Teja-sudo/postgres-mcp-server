@@ -28,22 +28,38 @@ export POSTGRES_SERVERS='{
     "host": "pgbouncer-server-devdb.elb.us-east-1.amazonaws.com",
     "port": "5432",
     "username": "your_username",
-    "password": "your_password"
+    "password": "your_password",
+    "defaultDatabase": "myapp_dev",
+    "defaultSchema": "public",
+    "isDefault": true
   },
   "staging": {
     "host": "pgbouncer-server-stagingdb.elb.us-east-1.amazonaws.com",
     "port": "5432",
     "username": "your_username",
-    "password": "your_password"
+    "password": "your_password",
+    "defaultDatabase": "myapp_staging"
   },
   "production": {
     "host": "pgbouncer-server-proddb.elb.us-east-1.amazonaws.com",
     "port": "5432",
     "username": "your_username",
-    "password": "your_password"
+    "password": "your_password",
+    "defaultDatabase": "myapp_prod",
+    "defaultSchema": "app"
   }
 }'
 ```
+
+**Server Configuration Options:**
+
+- `host` (required): PostgreSQL server hostname
+- `port` (optional): Port number (default: "5432")
+- `username` (required): Database username
+- `password` (required): Database password
+- `defaultDatabase` (optional): Default database to connect to (default: "postgres")
+- `defaultSchema` (optional): Default schema to use (default: "public")
+- `isDefault` (optional): Mark this server as the default server to connect to
 
 #### POSTGRES_ACCESS_MODE (optional)
 
@@ -95,12 +111,29 @@ Lists all configured PostgreSQL servers and their databases.
 
 #### `switch_server_db`
 
-Switch to a different PostgreSQL server and optionally a specific database.
+Switch to a different PostgreSQL server and optionally a specific database and schema.
 
 **Parameters:**
 
 - `server` (required): Name of the server to connect to
-- `database` (optional): Name of the database to connect to
+- `database` (optional): Name of the database to connect to (uses server's defaultDatabase or "postgres")
+- `schema` (optional): Default schema to use (uses server's defaultSchema or "public")
+
+#### `get_current_connection`
+
+Returns details about the current database connection including server, database, schema, host, port, and access mode.
+
+**Parameters:** None
+
+**Returns:**
+
+- `isConnected`: Whether currently connected to a database
+- `server`: Current server name
+- `database`: Current database name
+- `schema`: Current schema name
+- `host`: Server hostname
+- `port`: Server port
+- `accessMode`: "readonly" or "full"
 
 ### Schema & Object Exploration
 
