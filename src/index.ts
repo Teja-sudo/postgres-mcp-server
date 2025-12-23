@@ -151,18 +151,33 @@ const tools: Tool[] = [
   },
   {
     name: 'execute_sql',
-    description: 'Executes SQL statements on the database. Read-only mode prevents write operations (INSERT, UPDATE, DELETE, etc.). Large outputs are written to a temp file and the file path is returned.',
+    description: 'Executes SQL statements on the database. Supports pagination with offset/maxRows. Returns execution time. Use params for parameterized queries (e.g., sql: "SELECT * FROM users WHERE id = $1", params: [123]). Read-only mode prevents write operations.',
     inputSchema: {
       type: 'object',
       properties: {
         sql: {
           type: 'string',
-          description: 'SQL statement to execute'
+          description: 'SQL statement to execute. Use $1, $2, etc. for parameterized queries.'
+        },
+        params: {
+          type: 'array',
+          description: 'Parameters for parameterized queries (e.g., [123, "value"]). Prevents SQL injection.',
+          items: {}
         },
         maxRows: {
           type: 'number',
-          description: 'Maximum rows to return directly (default: 1000). Larger results are written to file.',
+          description: 'Maximum rows to return (default: 1000, max: 100000). Use with offset for pagination.',
           default: 1000
+        },
+        offset: {
+          type: 'number',
+          description: 'Number of rows to skip (for pagination). Use with maxRows to paginate through large results.',
+          default: 0
+        },
+        allowLargeScript: {
+          type: 'boolean',
+          description: 'Set to true to bypass the 100KB SQL length limit for large deployment scripts.',
+          default: false
         }
       },
       required: ['sql']

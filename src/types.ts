@@ -112,4 +112,7 @@ export interface ExecuteSqlResult {
   fields: string[];
   outputFile?: string;
   truncated?: boolean;
+  executionTimeMs?: number;
+  offset?: number;
+  hasMore?: boolean;
 }

@@ -7,45 +7,88 @@ import { v4 as uuidv4 } from 'uuid';
 import { validateIdentifier, validateIndexType, isReadOnlySql, validatePositiveInteger } from '../utils/validation.js';
 
 const MAX_OUTPUT_CHARS = 50000; // Maximum characters before writing to file
-const MAX_ROWS_IN_RESPONSE = 1000; // Maximum rows to include in direct response
-const MAX_SQL_LENGTH = 100000; // Maximum SQL query length
+const MAX_ROWS_DEFAULT = 1000; // Default max rows in direct response
+const MAX_ROWS_LIMIT = 100000; // Absolute maximum rows
+const DEFAULT_SQL_LENGTH_LIMIT = 100000; // Default SQL query length limit (100KB)
+const MAX_PARAMS = 100; // Maximum number of query parameters
 
 export async function executeSql(args: {
   sql: string;
+  params?: any[];
   maxRows?: number;
+  offset?: number;
+  allowLargeScript?: boolean;
 }): Promise<ExecuteSqlResult> {
   // Validate SQL input
-  if (!args.sql || typeof args.sql !== 'string') {
-    throw new Error('sql parameter is required and must be a string');
+  if (args.sql === undefined || args.sql === null) {
+    throw new Error('sql parameter is required');
   }
 
-  if (args.sql.length > MAX_SQL_LENGTH) {
-    throw new Error(`SQL query exceeds maximum length of ${MAX_SQL_LENGTH} characters`);
+  if (typeof args.sql !== 'string') {
+    throw new Error('sql parameter must be a string');
+  }
+
+  const sql = args.sql.trim();
+  if (sql.length === 0) {
+    throw new Error('sql parameter cannot be empty');
+  }
+
+  // Only check length if allowLargeScript is not true
+  if (!args.allowLargeScript && sql.length > DEFAULT_SQL_LENGTH_LIMIT) {
+    throw new Error(`SQL query exceeds ${DEFAULT_SQL_LENGTH_LIMIT} characters. Use allowLargeScript=true for deployment scripts.`);
+  }
+
+  // Validate params if provided
+  if (args.params !== undefined) {
+    if (!Array.isArray(args.params)) {
+      throw new Error('params must be an array');
+    }
+    if (args.params.length > MAX_PARAMS) {
+      throw new Error(`Maximum ${MAX_PARAMS} parameters allowed`);
+    }
   }
 
   const dbManager = getDbManager();
-  const maxRows = validatePositiveInteger(args.maxRows, 'maxRows', 1, 100000) || MAX_ROWS_IN_RESPONSE;
+  const maxRows = validatePositiveInteger(args.maxRows, 'maxRows', 1, MAX_ROWS_LIMIT) || MAX_ROWS_DEFAULT;
+  const offset = args.offset !== undefined ? validatePositiveInteger(args.offset, 'offset', 0, Number.MAX_SAFE_INTEGER) : 0;
 
-  const result = await dbManager.query(args.sql);
+  // Record start time for execution timing
+  const startTime = process.hrtime.bigint();
+
+  // Execute query with optional parameters
+  const result = await dbManager.query(sql, args.params);
+
+  // Calculate execution time in milliseconds
+  const endTime = process.hrtime.bigint();
+  const executionTimeMs = Number(endTime - startTime) / 1_000_000;
 
   const fields = result.fields?.map(f => f.name) || [];
   const totalRows = result.rows.length;
 
-  // Check if output is too large - estimate size first without full serialization
-  const estimatedSize = totalRows * (fields.length * 50); // rough estimate
+  // Apply offset and limit to the results
+  const startIndex = Math.min(offset, totalRows);
+  const endIndex = Math.min(startIndex + maxRows, totalRows);
+  const paginatedRows = result.rows.slice(startIndex, endIndex);
+  const returnedRows = paginatedRows.length;
 
-  if (estimatedSize > MAX_OUTPUT_CHARS || totalRows > maxRows) {
-    // Write to temp file
+  // Calculate actual output size
+  const outputJson = JSON.stringify(paginatedRows);
+  const outputSize = outputJson.length;
+
+  // If output is still too large even after pagination, write to file
+  if (outputSize > MAX_OUTPUT_CHARS) {
     const tempDir = os.tmpdir();
     const fileName = `postgres-mcp-output-${uuidv4()}.json`;
     const filePath = path.join(tempDir, fileName);
 
     const outputData = {
       totalRows,
+      returnedRows,
+      offset: startIndex,
       fields,
-      rows: result.rows,
-      generatedAt: new Date().toISOString(),
-      // Don't include the query in output file for security
+      rows: paginatedRows,
+      executionTimeMs: Math.round(executionTimeMs * 100) / 100,
+      generatedAt: new Date().toISOString()
     };
 
     fs.writeFileSync(filePath, JSON.stringify(outputData, null, 2), { mode: 0o600 });
@@ -55,14 +98,20 @@ export async function executeSql(args: {
       rowCount: totalRows,
       fields,
       outputFile: filePath,
-      truncated: true
+      truncated: true,
+      executionTimeMs: Math.round(executionTimeMs * 100) / 100,
+      offset: startIndex,
+      hasMore: endIndex < totalRows
     };
   }
 
   return {
-    rows: result.rows,
+    rows: paginatedRows,
     rowCount: totalRows,
-    fields
+    fields,
+    executionTimeMs: Math.round(executionTimeMs * 100) / 100,
+    offset: startIndex,
+    hasMore: endIndex < totalRows
   };
 }
 
@@ -82,8 +131,8 @@ export async function explainQuery(args: {
     throw new Error('sql parameter is required and must be a string');
   }
 
-  if (args.sql.length > MAX_SQL_LENGTH) {
-    throw new Error(`SQL query exceeds maximum length of ${MAX_SQL_LENGTH} characters`);
+  if (args.sql.length > DEFAULT_SQL_LENGTH_LIMIT) {
+    throw new Error(`SQL query exceeds maximum length of ${DEFAULT_SQL_LENGTH_LIMIT} characters`);
   }
 
   // SECURITY: Block EXPLAIN ANALYZE on write queries to prevent bypassing read-only mode

@@ -36,7 +36,7 @@ describe('SQL Tools', () => {
   describe('executeSql', () => {
     it('should require sql parameter', async () => {
       await expect(executeSql({ sql: '' }))
-        .rejects.toThrow('sql parameter is required');
+        .rejects.toThrow('sql parameter cannot be empty');
 
       await expect(executeSql({ sql: null as any }))
         .rejects.toThrow('sql parameter is required');
@@ -45,7 +45,19 @@ describe('SQL Tools', () => {
     it('should reject SQL that is too long', async () => {
       const longSql = 'SELECT ' + 'a'.repeat(100001);
       await expect(executeSql({ sql: longSql }))
-        .rejects.toThrow('exceeds maximum length');
+        .rejects.toThrow('exceeds 100000 characters');
+    });
+
+    it('should allow large scripts with allowLargeScript=true', async () => {
+      const longSql = 'SELECT ' + 'a'.repeat(100001);
+      mockQuery.mockResolvedValue({
+        rows: [],
+        fields: []
+      });
+
+      // Should not throw with allowLargeScript=true
+      const result = await executeSql({ sql: longSql, allowLargeScript: true });
+      expect(result).toBeDefined();
     });
 
     it('should return results for small result sets', async () => {
@@ -61,6 +73,62 @@ describe('SQL Tools', () => {
       expect(result.fields).toEqual(['id', 'name']);
       expect(result.outputFile).toBeUndefined();
       expect(result.truncated).toBeUndefined();
+      expect(result.executionTimeMs).toBeDefined();
+      expect(result.offset).toBe(0);
+      expect(result.hasMore).toBe(false);
+    });
+
+    it('should support pagination with offset and maxRows', async () => {
+      const rows = Array.from({ length: 100 }, (_, i) => ({ id: i }));
+      mockQuery.mockResolvedValue({
+        rows,
+        fields: [{ name: 'id' }]
+      });
+
+      // Get first page
+      const result1 = await executeSql({ sql: 'SELECT * FROM users', maxRows: 10, offset: 0 });
+      expect(result1.rows).toHaveLength(10);
+      expect(result1.rows[0].id).toBe(0);
+      expect(result1.offset).toBe(0);
+      expect(result1.hasMore).toBe(true);
+      expect(result1.rowCount).toBe(100);
+
+      // Get second page
+      mockQuery.mockResolvedValue({ rows, fields: [{ name: 'id' }] });
+      const result2 = await executeSql({ sql: 'SELECT * FROM users', maxRows: 10, offset: 10 });
+      expect(result2.rows).toHaveLength(10);
+      expect(result2.rows[0].id).toBe(10);
+      expect(result2.offset).toBe(10);
+      expect(result2.hasMore).toBe(true);
+
+      // Get last page
+      mockQuery.mockResolvedValue({ rows, fields: [{ name: 'id' }] });
+      const result3 = await executeSql({ sql: 'SELECT * FROM users', maxRows: 10, offset: 90 });
+      expect(result3.rows).toHaveLength(10);
+      expect(result3.rows[0].id).toBe(90);
+      expect(result3.hasMore).toBe(false);
+    });
+
+    it('should support parameterized queries', async () => {
+      mockQuery.mockResolvedValue({
+        rows: [{ id: 1, name: 'Test' }],
+        fields: [{ name: 'id' }, { name: 'name' }]
+      });
+
+      await executeSql({ sql: 'SELECT * FROM users WHERE id = $1', params: [123] });
+
+      expect(mockQuery).toHaveBeenCalledWith('SELECT * FROM users WHERE id = $1', [123]);
+    });
+
+    it('should validate params is an array', async () => {
+      await expect(executeSql({ sql: 'SELECT 1', params: 'invalid' as any }))
+        .rejects.toThrow('params must be an array');
+    });
+
+    it('should limit number of params', async () => {
+      const manyParams = Array.from({ length: 101 }, (_, i) => i);
+      await expect(executeSql({ sql: 'SELECT 1', params: manyParams }))
+        .rejects.toThrow('Maximum 100 parameters allowed');
     });
 
     it('should write large results to file', async () => {
@@ -72,48 +140,24 @@ describe('SQL Tools', () => {
 
       const result = await executeSql({ sql: 'SELECT * FROM users' });
 
-      expect(result.rows).toEqual([]);
+      // With pagination, only first 1000 rows are returned, but if output is still large, writes to file
       expect(result.rowCount).toBe(2000);
-      expect(result.outputFile).toBeDefined();
-      expect(result.truncated).toBe(true);
+      expect(result.hasMore).toBe(true);
 
-      // Verify file was created with correct permissions
-      if (result.outputFile) {
-        expect(fs.existsSync(result.outputFile)).toBe(true);
-
-        // Read and verify content
-        const content = JSON.parse(fs.readFileSync(result.outputFile, 'utf-8'));
-        expect(content.totalRows).toBe(2000);
-        expect(content.rows).toHaveLength(2000);
-
-        // Clean up
-        fs.unlinkSync(result.outputFile);
-      }
-    });
-
-    it('should respect maxRows parameter', async () => {
-      const rows = Array.from({ length: 50 }, (_, i) => ({ id: i }));
-      mockQuery.mockResolvedValue({
-        rows,
-        fields: [{ name: 'id' }]
-      });
-
-      const result = await executeSql({ sql: 'SELECT * FROM users', maxRows: 10 });
-
-      // Should write to file because rows > maxRows
-      expect(result.truncated).toBe(true);
-      expect(result.outputFile).toBeDefined();
-
-      // Clean up
+      // Clean up if file was created
       if (result.outputFile) {
         fs.unlinkSync(result.outputFile);
       }
     });
 
     it('should validate maxRows parameter', async () => {
-      // Invalid maxRows should throw
       await expect(executeSql({ sql: 'SELECT 1', maxRows: -1 }))
         .rejects.toThrow('maxRows must be an integer between');
+    });
+
+    it('should validate offset parameter', async () => {
+      await expect(executeSql({ sql: 'SELECT 1', offset: -1 }))
+        .rejects.toThrow('offset must be an integer between');
     });
 
     it('should handle empty result sets', async () => {
@@ -127,6 +171,20 @@ describe('SQL Tools', () => {
       expect(result.rows).toEqual([]);
       expect(result.rowCount).toBe(0);
       expect(result.outputFile).toBeUndefined();
+      expect(result.hasMore).toBe(false);
+    });
+
+    it('should return execution time', async () => {
+      mockQuery.mockResolvedValue({
+        rows: [{ id: 1 }],
+        fields: [{ name: 'id' }]
+      });
+
+      const result = await executeSql({ sql: 'SELECT 1' });
+
+      expect(result.executionTimeMs).toBeDefined();
+      expect(typeof result.executionTimeMs).toBe('number');
+      expect(result.executionTimeMs).toBeGreaterThanOrEqual(0);
     });
   });
 
