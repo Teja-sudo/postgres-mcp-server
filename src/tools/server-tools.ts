@@ -1,130 +1,29 @@
 import { getDbManager } from '../db-manager.js';
 import { DatabaseInfo, ConnectionInfo } from '../types.js';
 
+// Simple server info without databases
+interface ServerInfo {
+  name: string;
+  host: string;
+  port: string;
+  isConnected: boolean;
+  isDefault: boolean;
+  defaultDatabase?: string;
+  defaultSchema?: string;
+}
+
 interface ListServersResult {
-  servers: {
-    name: string;
-    host: string;
-    port: string;
-    isConnected: boolean;
-    isDefault: boolean;
-    defaultDatabase?: string;
-    defaultSchema?: string;
-    databases?: DatabaseInfo[];
-    databaseError?: string;
-  }[];
+  servers: ServerInfo[];
   currentServer: string | null;
   currentDatabase: string | null;
   currentSchema: string | null;
 }
 
-export async function listServersAndDbs(args: {
-  serverFilter?: string;
-  databaseFilter?: string;
-  includeSystemDbs?: boolean;
-  fetchDatabases?: boolean;
-  searchAllServers?: boolean;
-}): Promise<ListServersResult> {
-  const dbManager = getDbManager();
-  const serversConfig = dbManager.getServersConfig();
-  const currentState = dbManager.getCurrentState();
-
-  let serverNames = Object.keys(serversConfig);
-
-  // Apply server filter if provided
-  if (args.serverFilter) {
-    const filterLower = args.serverFilter.toLowerCase();
-    serverNames = serverNames.filter(name =>
-      name.toLowerCase().includes(filterLower) ||
-      serversConfig[name].host.toLowerCase().includes(filterLower)
-    );
-  }
-
-  const servers: ListServersResult['servers'] = [];
-  const defaultServerName = dbManager.getDefaultServerName();
-  const systemDbs = ['template0', 'template1'];
-
-  for (const name of serverNames) {
-    const config = serversConfig[name];
-    const isConnected = currentState.currentServer === name;
-
-    const serverInfo: ListServersResult['servers'][0] = {
-      name,
-      host: config.host,
-      port: config.port || '5432',
-      isConnected,
-      isDefault: config.isDefault === true || name === defaultServerName,
-      defaultDatabase: config.defaultDatabase,
-      defaultSchema: config.defaultSchema
-    };
-
-    // Fetch databases if requested
-    if (args.fetchDatabases) {
-      // Fetch from current connection
-      if (isConnected) {
-        try {
-          let databases = await dbManager.listDatabases();
-
-          // Filter system databases unless explicitly included
-          if (!args.includeSystemDbs) {
-            databases = databases.filter(db => !systemDbs.includes(db.name));
-          }
-
-          // Apply database filter
-          if (args.databaseFilter) {
-            const filterLower = args.databaseFilter.toLowerCase();
-            databases = databases.filter(db =>
-              db.name.toLowerCase().includes(filterLower)
-            );
-          }
-
-          serverInfo.databases = databases;
-        } catch (error) {
-          serverInfo.databaseError = error instanceof Error ? error.message : 'Failed to fetch databases';
-        }
-      }
-      // Fetch from non-connected servers if searchAllServers is true
-      else if (args.searchAllServers) {
-        try {
-          // Temporarily connect to this server to list databases
-          const tempDbManager = await createTempConnection(name, config);
-          if (tempDbManager) {
-            try {
-              let databases = await tempDbManager.listDatabases();
-
-              // Filter system databases unless explicitly included
-              if (!args.includeSystemDbs) {
-                databases = databases.filter((db: DatabaseInfo) => !systemDbs.includes(db.name));
-              }
-
-              // Apply database filter
-              if (args.databaseFilter) {
-                const filterLower = args.databaseFilter.toLowerCase();
-                databases = databases.filter((db: DatabaseInfo) =>
-                  db.name.toLowerCase().includes(filterLower)
-                );
-              }
-
-              serverInfo.databases = databases;
-            } finally {
-              await tempDbManager.close();
-            }
-          }
-        } catch (error) {
-          serverInfo.databaseError = error instanceof Error ? error.message : 'Failed to connect';
-        }
-      }
-    }
-
-    servers.push(serverInfo);
-  }
-
-  return {
-    servers,
-    currentServer: currentState.currentServer,
-    currentDatabase: currentState.currentDatabase,
-    currentSchema: currentState.currentSchema
-  };
+// Database listing result
+interface ListDatabasesResult {
+  serverName: string;
+  databases: DatabaseInfo[];
+  currentDatabase: string | null;
 }
 
 /**
@@ -190,6 +89,126 @@ function getSslConfigForTemp(ssl: any): boolean | object | undefined {
     return ssl;
   }
   return undefined;
+}
+
+/**
+ * Lists all configured PostgreSQL servers (without database details).
+ * This is a lightweight operation that doesn't require database connections.
+ */
+export async function listServers(args: {
+  filter?: string;
+}): Promise<ListServersResult> {
+  const dbManager = getDbManager();
+  const serversConfig = dbManager.getServersConfig();
+  const currentState = dbManager.getCurrentState();
+
+  let serverNames = Object.keys(serversConfig);
+
+  // Apply filter if provided
+  if (args.filter) {
+    const filterLower = args.filter.toLowerCase();
+    serverNames = serverNames.filter(name =>
+      name.toLowerCase().includes(filterLower) ||
+      serversConfig[name].host.toLowerCase().includes(filterLower)
+    );
+  }
+
+  const servers: ServerInfo[] = [];
+  const defaultServerName = dbManager.getDefaultServerName();
+
+  for (const name of serverNames) {
+    const config = serversConfig[name];
+    const isConnected = currentState.currentServer === name;
+
+    servers.push({
+      name,
+      host: config.host,
+      port: config.port || '5432',
+      isConnected,
+      isDefault: config.isDefault === true || name === defaultServerName,
+      defaultDatabase: config.defaultDatabase,
+      defaultSchema: config.defaultSchema
+    });
+  }
+
+  return {
+    servers,
+    currentServer: currentState.currentServer,
+    currentDatabase: currentState.currentDatabase,
+    currentSchema: currentState.currentSchema
+  };
+}
+
+/**
+ * Lists databases in a specific server.
+ * If not connected to the specified server, creates a temporary connection.
+ *
+ * @param serverName - Required. The server name to list databases from.
+ * @param filter - Optional. Filter databases by name.
+ * @param includeSystemDbs - Optional. Include template0 and template1.
+ * @param maxResults - Optional. Limit number of results (default 50, max 200).
+ */
+export async function listDatabases(args: {
+  serverName: string;
+  filter?: string;
+  includeSystemDbs?: boolean;
+  maxResults?: number;
+}): Promise<ListDatabasesResult> {
+  if (!args.serverName || typeof args.serverName !== 'string') {
+    throw new Error('serverName is required. Use list_servers to see available servers.');
+  }
+
+  const dbManager = getDbManager();
+  const serversConfig = dbManager.getServersConfig();
+  const currentState = dbManager.getCurrentState();
+
+  // Validate server exists
+  if (!serversConfig[args.serverName]) {
+    const availableServers = Object.keys(serversConfig).join(', ');
+    throw new Error(`Server '${args.serverName}' not found. Available servers: ${availableServers}`);
+  }
+
+  const systemDbs = ['template0', 'template1'];
+  const maxResults = Math.min(args.maxResults || 50, 200);
+
+  let databases: DatabaseInfo[];
+
+  // If connected to this server, use existing connection
+  if (currentState.currentServer === args.serverName) {
+    databases = await dbManager.listDatabases();
+  } else {
+    // Create temporary connection to the server
+    const config = serversConfig[args.serverName];
+    const tempDbManager = await createTempConnection(args.serverName, config);
+
+    try {
+      databases = await tempDbManager.listDatabases();
+    } finally {
+      await tempDbManager.close();
+    }
+  }
+
+  // Filter system databases unless explicitly included
+  if (!args.includeSystemDbs) {
+    databases = databases.filter(db => !systemDbs.includes(db.name));
+  }
+
+  // Apply name filter
+  if (args.filter) {
+    const filterLower = args.filter.toLowerCase();
+    databases = databases.filter(db =>
+      db.name.toLowerCase().includes(filterLower)
+    );
+  }
+
+  // Limit results
+  databases = databases.slice(0, maxResults);
+
+  return {
+    serverName: args.serverName,
+    databases,
+    currentDatabase: currentState.currentServer === args.serverName ? currentState.currentDatabase : null
+  };
 }
 
 export async function switchServerDb(args: {

@@ -1,6 +1,6 @@
 {
   "name": "@tejasanik/postgres-mcp-server",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "A Model Context Protocol (MCP) server for PostgreSQL database management and analysis",
   "type": "module",
   "main": "dist/index.js",
@@ -31,7 +31,8 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
     "pg": "^8.13.1",
-    "uuid": "^11.0.3"
+    "uuid": "^11.0.3",
+    "zod": "^4.2.1"
   },
   "devDependencies": {
     "@types/jest": "^29.5.14",

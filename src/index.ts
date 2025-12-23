@@ -1,16 +1,13 @@
 #!/usr/bin/env node
 
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-  Tool,
-} from '@modelcontextprotocol/sdk/types.js';
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { z } from "zod";
 
-import { getDbManager, resetDbManager } from './db-manager.js';
+import { resetDbManager } from "./db-manager.js";
 import {
-  listServersAndDbs,
+  listServers,
+  listDatabases,
   switchServerDb,
   getCurrentConnection,
   listSchemas,
@@ -21,297 +18,14 @@ import {
   getTopQueries,
   analyzeWorkloadIndexes,
   analyzeQueryIndexes,
-  analyzeDbHealth
-} from './tools/index.js';
+  analyzeDbHealth,
+} from "./tools/index.js";
 
-// Tool definitions
-const tools: Tool[] = [
+// Create MCP server using the new high-level API
+const server = new McpServer(
   {
-    name: 'list_servers_and_dbs',
-    description: 'Lists all configured PostgreSQL servers and their databases. Use fetchDatabases=true to list databases. Use searchAllServers=true to fetch databases from all servers (not just the connected one).',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        serverFilter: {
-          type: 'string',
-          description: 'Filter servers by name or host (case-insensitive partial match)'
-        },
-        databaseFilter: {
-          type: 'string',
-          description: 'Filter databases by name (case-insensitive partial match)'
-        },
-        includeSystemDbs: {
-          type: 'boolean',
-          description: 'Include system databases (template0, template1)',
-          default: false
-        },
-        fetchDatabases: {
-          type: 'boolean',
-          description: 'Fetch list of databases from servers',
-          default: false
-        },
-        searchAllServers: {
-          type: 'boolean',
-          description: 'When true, fetch databases from all configured servers (temporarily connects to each). When false, only fetch from currently connected server.',
-          default: false
-        }
-      }
-    }
-  },
-  {
-    name: 'switch_server_db',
-    description: 'Switch to a different PostgreSQL server and optionally a specific database and schema. Must be called before using other database tools. Uses server defaults if not specified.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        server: {
-          type: 'string',
-          description: 'Name of the server to connect to (from POSTGRES_SERVERS config)'
-        },
-        database: {
-          type: 'string',
-          description: 'Name of the database to connect to (uses server default or "postgres")'
-        },
-        schema: {
-          type: 'string',
-          description: 'Name of the default schema (uses server default or "public")'
-        }
-      },
-      required: ['server']
-    }
-  },
-  {
-    name: 'get_current_connection',
-    description: 'Returns details about the current database connection including server, database, schema, host, port, and access mode (readonly/full).',
-    inputSchema: {
-      type: 'object',
-      properties: {}
-    }
-  },
-  {
-    name: 'list_schemas',
-    description: 'Lists all database schemas available in the current PostgreSQL database.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        includeSystemSchemas: {
-          type: 'boolean',
-          description: 'Include system schemas (pg_catalog, information_schema, etc.)',
-          default: false
-        }
-      }
-    }
-  },
-  {
-    name: 'list_objects',
-    description: 'Lists database objects (tables, views, sequences, extensions) within a specified schema.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        schema: {
-          type: 'string',
-          description: 'Schema name to list objects from'
-        },
-        objectType: {
-          type: 'string',
-          enum: ['table', 'view', 'sequence', 'extension', 'all'],
-          description: 'Type of objects to list',
-          default: 'all'
-        },
-        filter: {
-          type: 'string',
-          description: 'Filter objects by name (case-insensitive partial match)'
-        }
-      },
-      required: ['schema']
-    }
-  },
-  {
-    name: 'get_object_details',
-    description: 'Provides detailed information about a specific database object including columns, constraints, indexes, size, and row count.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        schema: {
-          type: 'string',
-          description: 'Schema name containing the object'
-        },
-        objectName: {
-          type: 'string',
-          description: 'Name of the object to get details for'
-        },
-        objectType: {
-          type: 'string',
-          enum: ['table', 'view', 'sequence'],
-          description: 'Type of the object'
-        }
-      },
-      required: ['schema', 'objectName']
-    }
-  },
-  {
-    name: 'execute_sql',
-    description: 'Executes SQL statements on the database. Supports pagination with offset/maxRows. Returns execution time. Use params for parameterized queries (e.g., sql: "SELECT * FROM users WHERE id = $1", params: [123]). Read-only mode prevents write operations.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        sql: {
-          type: 'string',
-          description: 'SQL statement to execute. Use $1, $2, etc. for parameterized queries.'
-        },
-        params: {
-          type: 'array',
-          description: 'Parameters for parameterized queries (e.g., [123, "value"]). Prevents SQL injection.',
-          items: {}
-        },
-        maxRows: {
-          type: 'number',
-          description: 'Maximum rows to return (default: 1000, max: 100000). Use with offset for pagination.',
-          default: 1000
-        },
-        offset: {
-          type: 'number',
-          description: 'Number of rows to skip (for pagination). Use with maxRows to paginate through large results.',
-          default: 0
-        },
-        allowLargeScript: {
-          type: 'boolean',
-          description: 'Set to true to bypass the 100KB SQL length limit for large deployment scripts.',
-          default: false
-        }
-      },
-      required: ['sql']
-    }
-  },
-  {
-    name: 'explain_query',
-    description: 'Gets the execution plan for a SQL query, showing how PostgreSQL will process it. Can simulate hypothetical indexes if hypopg extension is installed.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        sql: {
-          type: 'string',
-          description: 'SQL query to explain'
-        },
-        analyze: {
-          type: 'boolean',
-          description: 'Actually execute the query to get real timing (default: false). Only allowed for SELECT queries.',
-          default: false
-        },
-        buffers: {
-          type: 'boolean',
-          description: 'Include buffer usage statistics',
-          default: false
-        },
-        format: {
-          type: 'string',
-          enum: ['text', 'json', 'yaml', 'xml'],
-          description: 'Output format for the plan',
-          default: 'json'
-        },
-        hypotheticalIndexes: {
-          type: 'array',
-          description: 'Hypothetical indexes to simulate (requires hypopg extension)',
-          items: {
-            type: 'object',
-            properties: {
-              table: {
-                type: 'string',
-                description: 'Table name for the hypothetical index'
-              },
-              columns: {
-                type: 'array',
-                items: { type: 'string' },
-                description: 'Columns to include in the index'
-              },
-              indexType: {
-                type: 'string',
-                description: 'Index type (btree, hash, gist, etc.)',
-                default: 'btree'
-              }
-            },
-            required: ['table', 'columns']
-          }
-        }
-      },
-      required: ['sql']
-    }
-  },
-  {
-    name: 'get_top_queries',
-    description: 'Reports the slowest SQL queries based on total execution time using pg_stat_statements data. Requires pg_stat_statements extension.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        limit: {
-          type: 'number',
-          description: 'Number of queries to return (1-100)',
-          default: 10
-        },
-        orderBy: {
-          type: 'string',
-          enum: ['total_time', 'mean_time', 'calls'],
-          description: 'How to order the results',
-          default: 'total_time'
-        },
-        minCalls: {
-          type: 'number',
-          description: 'Minimum number of calls to include a query',
-          default: 1
-        }
-      }
-    }
-  },
-  {
-    name: 'analyze_workload_indexes',
-    description: 'Analyzes the database workload (using pg_stat_statements) to identify resource-intensive queries and recommends optimal indexes for them.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        topQueriesCount: {
-          type: 'number',
-          description: 'Number of top queries to analyze (1-50)',
-          default: 20
-        },
-        includeHypothetical: {
-          type: 'boolean',
-          description: 'Include hypothetical index analysis (requires hypopg)',
-          default: false
-        }
-      }
-    }
-  },
-  {
-    name: 'analyze_query_indexes',
-    description: 'Analyzes specific SQL queries (up to 10) and recommends optimal indexes for them.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        queries: {
-          type: 'array',
-          items: { type: 'string' },
-          description: 'List of SQL queries to analyze (max 10)',
-          maxItems: 10
-        }
-      },
-      required: ['queries']
-    }
-  },
-  {
-    name: 'analyze_db_health',
-    description: 'Performs comprehensive database health checks including: buffer cache hit rates, connection health, constraint validation, index health (duplicate/unused/invalid), sequence limits, and vacuum health.',
-    inputSchema: {
-      type: 'object',
-      properties: {}
-    }
-  }
-];
-
-// Create MCP server
-const server = new Server(
-  {
-    name: 'postgres-mcp-server',
-    version: '1.0.0',
+    name: "postgres-mcp-server",
+    version: "1.6.0",
   },
   {
     capabilities: {
@@ -320,143 +34,371 @@ const server = new Server(
   }
 );
 
-// Handle list_tools request
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return { tools };
-});
+// Register tools with improved descriptions
 
-// Handle tool calls
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
-
-  try {
-    let result: any;
-
-    switch (name) {
-      case 'list_servers_and_dbs':
-        result = await listServersAndDbs(args as any);
-        break;
-
-      case 'switch_server_db':
-        result = await switchServerDb(args as any);
-        break;
-
-      case 'get_current_connection':
-        result = await getCurrentConnection();
-        break;
-
-      case 'list_schemas':
-        result = await listSchemas(args as any);
-        break;
-
-      case 'list_objects':
-        result = await listObjects(args as any);
-        break;
-
-      case 'get_object_details':
-        result = await getObjectDetails(args as any);
-        break;
-
-      case 'execute_sql':
-        result = await executeSql(args as any);
-        // Special handling for large output
-        if (result.outputFile) {
-          return {
-            content: [
-              {
-                type: 'text',
-                text: JSON.stringify({
-                  message: `Output too large (${result.rowCount} rows). Results written to file.`,
-                  outputFile: result.outputFile,
-                  rowCount: result.rowCount,
-                  fields: result.fields,
-                  hint: 'Read the file optimally using offset/limit or run the query with filters to reduce output.'
-                }, null, 2)
-              }
-            ]
-          };
-        }
-        break;
-
-      case 'explain_query':
-        result = await explainQuery(args as any);
-        break;
-
-      case 'get_top_queries':
-        result = await getTopQueries(args as any);
-        break;
-
-      case 'analyze_workload_indexes':
-        result = await analyzeWorkloadIndexes(args as any);
-        break;
-
-      case 'analyze_query_indexes':
-        result = await analyzeQueryIndexes(args as any);
-        break;
-
-      case 'analyze_db_health':
-        result = await analyzeDbHealth();
-        break;
-
-      default:
-        throw new Error(`Unknown tool: ${name}`);
-    }
-
-    return {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify(result, null, 2)
-        }
-      ]
-    };
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    return {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify({ error: errorMessage }, null, 2)
-        }
-      ],
-      isError: true
-    };
+server.registerTool(
+  "list_servers",
+  {
+    description:
+      "List all configured PostgreSQL servers. Call this FIRST to discover available server names before using list_databases or switch_server_db. Returns server names, hosts, ports, and connection status.",
+    inputSchema: z.object({
+      filter: z
+        .string()
+        .optional()
+        .describe("Filter servers by name or host (case-insensitive partial match)"),
+    }),
+  },
+  async (args) => {
+    const result = await listServers(args);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
-});
+);
+
+server.registerTool(
+  "list_databases",
+  {
+    description:
+      "List databases in a specific PostgreSQL server. REQUIRES serverName parameter - use list_servers first to get valid server names. Do NOT guess server names.",
+    inputSchema: z.object({
+      serverName: z
+        .string()
+        .describe("REQUIRED: Server name from list_servers. Do NOT use database names here."),
+      filter: z
+        .string()
+        .optional()
+        .describe("Filter databases by name (case-insensitive partial match)"),
+      includeSystemDbs: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Include system databases (template0, template1)"),
+      maxResults: z
+        .number()
+        .optional()
+        .default(50)
+        .describe("Maximum databases to return (default: 50, max: 200)"),
+    }),
+  },
+  async (args) => {
+    const result = await listDatabases(args);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "switch_server_db",
+  {
+    description:
+      "Connect to a PostgreSQL server and database. MUST be called before executing queries. Use list_servers to find server names, list_databases to find database names.",
+    inputSchema: z.object({
+      server: z.string().describe("Server name from list_servers (NOT the host)"),
+      database: z
+        .string()
+        .optional()
+        .describe("Database name from list_databases (defaults to server's default or 'postgres')"),
+      schema: z
+        .string()
+        .optional()
+        .describe("Schema name (defaults to 'public')"),
+    }),
+  },
+  async (args) => {
+    const result = await switchServerDb(args);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "get_current_connection",
+  {
+    description:
+      "Get current connection status. Returns server, database, schema, host, port, and access mode (readonly/full). Call this to verify your connection before running queries.",
+    inputSchema: z.object({}),
+  },
+  async () => {
+    const result = await getCurrentConnection();
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "list_schemas",
+  {
+    description:
+      "List all schemas in the current database. Requires active connection (use switch_server_db first).",
+    inputSchema: z.object({
+      includeSystemSchemas: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Include system schemas (pg_catalog, information_schema, etc.)"),
+    }),
+  },
+  async (args) => {
+    const result = await listSchemas(args);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "list_objects",
+  {
+    description:
+      "List tables, views, sequences, or extensions in a schema. Requires active connection.",
+    inputSchema: z.object({
+      schema: z.string().describe("Schema name (e.g., 'public')"),
+      objectType: z
+        .enum(["table", "view", "sequence", "extension", "all"])
+        .optional()
+        .default("all")
+        .describe("Type of objects to list"),
+      filter: z
+        .string()
+        .optional()
+        .describe("Filter objects by name (case-insensitive partial match)"),
+    }),
+  },
+  async (args) => {
+    const result = await listObjects(args);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "get_object_details",
+  {
+    description:
+      "Get detailed info about a table/view/sequence: columns, data types, constraints, indexes, size, row count. Use this to understand table structure before writing queries.",
+    inputSchema: z.object({
+      schema: z.string().describe("Schema name containing the object"),
+      objectName: z.string().describe("Name of the table, view, or sequence"),
+      objectType: z
+        .enum(["table", "view", "sequence"])
+        .optional()
+        .describe("Object type (auto-detected if not specified)"),
+    }),
+  },
+  async (args) => {
+    const result = await getObjectDetails(args);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "execute_sql",
+  {
+    description:
+      "Execute SQL queries. Supports SELECT, INSERT, UPDATE, DELETE (if not in readonly mode). Use $1, $2 placeholders with params array to prevent SQL injection. Returns rows, execution time, and pagination info.",
+    inputSchema: z.object({
+      sql: z
+        .string()
+        .describe("SQL statement. Use $1, $2, etc. for parameterized queries."),
+      params: z
+        .array(z.any())
+        .optional()
+        .describe("Parameters for $1, $2, etc. placeholders (e.g., [123, 'value'])"),
+      maxRows: z
+        .number()
+        .optional()
+        .default(1000)
+        .describe("Max rows to return (default: 1000, max: 100000)"),
+      offset: z
+        .number()
+        .optional()
+        .default(0)
+        .describe("Skip rows for pagination"),
+      allowLargeScript: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Bypass 100KB SQL limit for deployment scripts"),
+    }),
+  },
+  async (args) => {
+    const result = await executeSql(args);
+    // Special handling for large output
+    if (result.outputFile) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                message: `Output too large (${result.rowCount} rows). Results written to file.`,
+                outputFile: result.outputFile,
+                rowCount: result.rowCount,
+                fields: result.fields,
+                hint: "Use offset/maxRows to paginate, or add WHERE clauses to reduce results.",
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "explain_query",
+  {
+    description:
+      "Show PostgreSQL's execution plan for a query. Use this to understand query performance and identify missing indexes. analyze=true runs the query to get actual timings (SELECT only).",
+    inputSchema: z.object({
+      sql: z.string().describe("SQL query to explain"),
+      analyze: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Execute query for real timing (SELECT only, blocked for writes)"),
+      buffers: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Include buffer/cache statistics"),
+      format: z
+        .enum(["text", "json", "yaml", "xml"])
+        .optional()
+        .default("json")
+        .describe("Output format"),
+      hypotheticalIndexes: z
+        .array(
+          z.object({
+            table: z.string().describe("Table name"),
+            columns: z.array(z.string()).describe("Columns for the index"),
+            indexType: z.string().optional().default("btree").describe("Index type"),
+          })
+        )
+        .optional()
+        .describe("Test hypothetical indexes (requires hypopg extension)"),
+    }),
+  },
+  async (args) => {
+    const result = await explainQuery(args);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "get_top_queries",
+  {
+    description:
+      "Find slowest queries from pg_stat_statements. Requires pg_stat_statements extension enabled. Use this to identify performance bottlenecks.",
+    inputSchema: z.object({
+      limit: z
+        .number()
+        .optional()
+        .default(10)
+        .describe("Number of queries to return (1-100)"),
+      orderBy: z
+        .enum(["total_time", "mean_time", "calls"])
+        .optional()
+        .default("total_time")
+        .describe("Sort by total time, average time, or call count"),
+      minCalls: z
+        .number()
+        .optional()
+        .default(1)
+        .describe("Minimum call count to include"),
+    }),
+  },
+  async (args) => {
+    const result = await getTopQueries(args);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "analyze_workload_indexes",
+  {
+    description:
+      "Analyze database workload and recommend indexes. Uses pg_stat_statements to find slow queries and suggests indexes to improve them.",
+    inputSchema: z.object({
+      topQueriesCount: z
+        .number()
+        .optional()
+        .default(20)
+        .describe("Number of top queries to analyze (1-50)"),
+      includeHypothetical: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Test recommendations with hypothetical indexes (requires hypopg)"),
+    }),
+  },
+  async (args) => {
+    const result = await analyzeWorkloadIndexes(args);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "analyze_query_indexes",
+  {
+    description:
+      "Recommend indexes for specific SQL queries. Provide up to 10 SELECT queries and get index recommendations.",
+    inputSchema: z.object({
+      queries: z
+        .array(z.string())
+        .max(10)
+        .describe("SQL SELECT queries to analyze (max 10)"),
+    }),
+  },
+  async (args) => {
+    const result = await analyzeQueryIndexes(args);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "analyze_db_health",
+  {
+    description:
+      "Run comprehensive database health checks: cache hit rates, connection usage, index health (invalid/unused/duplicate), vacuum status, sequence limits, unvalidated constraints. Returns issues with severity levels.",
+    inputSchema: z.object({}),
+  },
+  async () => {
+    const result = await analyzeDbHealth();
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
 
 // Graceful shutdown handling
 async function shutdown(): Promise<void> {
-  console.error('Shutting down PostgreSQL MCP Server...');
+  console.error("Shutting down PostgreSQL MCP Server...");
   try {
     resetDbManager();
+    await server.close();
   } catch (error) {
-    console.error('Error during shutdown:', error);
+    console.error("Error during shutdown:", error);
   }
   process.exit(0);
 }
 
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
-process.on('SIGHUP', shutdown);
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
+process.on("SIGHUP", shutdown);
 
 // Handle uncaught errors
-process.on('uncaughtException', (error) => {
-  console.error('Uncaught exception:', error);
+process.on("uncaughtException", (error) => {
+  console.error("Uncaught exception:", error);
   shutdown();
 });
 
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled rejection at:', promise, 'reason:', reason);
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("Unhandled rejection at:", promise, "reason:", reason);
 });
 
 // Start server
 async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error('PostgreSQL MCP Server started');
+  console.error("PostgreSQL MCP Server started");
 }
 
 main().catch((error) => {
-  console.error('Fatal error:', error);
+  console.error("Fatal error:", error);
   process.exit(1);
 });

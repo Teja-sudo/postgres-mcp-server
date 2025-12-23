@@ -189,17 +189,37 @@ claude mcp add-json postgres_dbs --scope user '{
 
 ### Server & Database Management
 
-#### `list_servers_and_dbs`
+#### `list_servers`
 
-Lists all configured PostgreSQL servers and their databases.
+Lists all configured PostgreSQL servers. Returns server names, hosts, ports, and connection status. Use this first to discover available servers.
 
 **Parameters:**
 
-- `serverFilter` (optional): Filter servers by name or host (case-insensitive partial match)
-- `databaseFilter` (optional): Filter databases by name (case-insensitive partial match)
-- `includeSystemDbs` (optional): Include system databases (template0, template1)
-- `fetchDatabases` (optional): Fetch list of databases from servers
-- `searchAllServers` (optional): When true, fetches databases from all configured servers (temporarily connects to each). When false, only fetches from the currently connected server.
+- `filter` (optional): Filter servers by name or host (case-insensitive partial match)
+
+**Returns:**
+
+- `servers`: Array of server information (name, host, port, isConnected, isDefault)
+- `currentServer`: Currently connected server name (or null)
+- `currentDatabase`: Currently connected database (or null)
+- `currentSchema`: Current schema (or null)
+
+#### `list_databases`
+
+Lists databases in a specific PostgreSQL server. Always provide the server name to avoid confusion.
+
+**Parameters:**
+
+- `serverName` (required): Name of the server to list databases from. Use `list_servers` to see available servers.
+- `filter` (optional): Filter databases by name (case-insensitive partial match)
+- `includeSystemDbs` (optional): Include system databases (template0, template1). Default: false
+- `maxResults` (optional): Maximum number of databases to return (default: 50, max: 200)
+
+**Returns:**
+
+- `serverName`: The server name that was queried
+- `databases`: Array of database information (name, owner, encoding, size)
+- `currentDatabase`: Currently connected database on this server (or null)
 
 #### `switch_server_db`
 
@@ -261,12 +281,25 @@ Provides detailed information about a database object including columns, constra
 
 #### `execute_sql`
 
-Executes SQL statements on the database. Read-only mode prevents write operations.
+Executes SQL statements on the database. Supports pagination and parameterized queries. Read-only mode prevents write operations.
 
 **Parameters:**
 
-- `sql` (required): SQL statement to execute
-- `maxRows` (optional): Maximum rows to return directly (default: 1000)
+- `sql` (required): SQL statement to execute. Use `$1`, `$2`, etc. for parameterized queries.
+- `params` (optional): Array of parameters for parameterized queries (e.g., `[123, "value"]`). Prevents SQL injection.
+- `maxRows` (optional): Maximum rows to return (default: 1000, max: 100000). Use with `offset` for pagination.
+- `offset` (optional): Number of rows to skip for pagination (default: 0).
+- `allowLargeScript` (optional): Set to true to bypass the 100KB SQL length limit for deployment scripts.
+
+**Returns:**
+
+- `rows`: Result rows (paginated)
+- `rowCount`: Total number of rows in the result
+- `fields`: Column names
+- `executionTimeMs`: Query execution time in milliseconds
+- `offset`: Current offset
+- `hasMore`: Whether more rows are available
+- `outputFile`: (Only if output is too large) Path to temp file with full results
 
 **Note:** Large outputs are automatically written to a temp file, and the file path is returned. This prevents token wastage when dealing with large result sets.
 
@@ -333,9 +366,9 @@ Performs comprehensive database health checks including:
 ### Connect to a Server and List Databases
 
 ```
-1. Use list_servers_and_dbs to see available servers
-2. Use switch_server_db with server="dev" to connect
-3. Use list_servers_and_dbs with fetchDatabases=true to see databases
+1. Use list_servers to see available servers
+2. Use list_databases with serverName="dev" to see databases in the dev server
+3. Use switch_server_db with server="dev", database="myapp" to connect
 ```
 
 ### Explore Database Schema

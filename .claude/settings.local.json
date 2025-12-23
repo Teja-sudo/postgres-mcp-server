@@ -8,7 +8,9 @@
       "Bash(git push:*)",
       "Bash(git add:*)",
       "Bash(git rm:*)",
-      "Bash(npm test:*)"
+      "Bash(npm test:*)",
+      "Bash(cat:*)",
+      "Bash(npm install:*)"
     ]
   }
 }

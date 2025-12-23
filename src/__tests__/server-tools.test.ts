@@ -1,6 +1,16 @@
 import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
-import { listServersAndDbs, switchServerDb } from '../tools/server-tools.js';
+import { listServers, listDatabases, switchServerDb } from '../tools/server-tools.js';
 import { resetDbManager } from '../db-manager.js';
+
+interface ServerInfo {
+  name: string;
+  host: string;
+  port: string;
+  isConnected: boolean;
+  isDefault: boolean;
+  defaultDatabase?: string;
+  defaultSchema?: string;
+}
 
 describe('Server Tools', () => {
   beforeEach(() => {
@@ -13,9 +23,9 @@ describe('Server Tools', () => {
     resetDbManager();
   });
 
-  describe('listServersAndDbs', () => {
+  describe('listServers', () => {
     it('should return empty list when no servers configured', async () => {
-      const result = await listServersAndDbs({});
+      const result = await listServers({});
 
       expect(result.servers).toEqual([]);
       expect(result.currentServer).toBeNull();
@@ -29,12 +39,12 @@ describe('Server Tools', () => {
         prod: { host: 'prod.example.com', port: '5432', username: 'user', password: 'pass' }
       });
 
-      const result = await listServersAndDbs({});
+      const result = await listServers({});
 
       expect(result.servers).toHaveLength(3);
-      expect(result.servers.map(s => s.name)).toContain('dev');
-      expect(result.servers.map(s => s.name)).toContain('staging');
-      expect(result.servers.map(s => s.name)).toContain('prod');
+      expect(result.servers.map((s: ServerInfo) => s.name)).toContain('dev');
+      expect(result.servers.map((s: ServerInfo) => s.name)).toContain('staging');
+      expect(result.servers.map((s: ServerInfo) => s.name)).toContain('prod');
     });
 
     it('should filter servers by name', async () => {
@@ -44,12 +54,12 @@ describe('Server Tools', () => {
         prod: { host: 'prod.example.com', port: '5432', username: 'user', password: 'pass' }
       });
 
-      const result = await listServersAndDbs({ serverFilter: 'dev' });
+      const result = await listServers({ filter: 'dev' });
 
       expect(result.servers).toHaveLength(2);
-      expect(result.servers.map(s => s.name)).toContain('dev');
-      expect(result.servers.map(s => s.name)).toContain('dev_backup');
-      expect(result.servers.map(s => s.name)).not.toContain('prod');
+      expect(result.servers.map((s: ServerInfo) => s.name)).toContain('dev');
+      expect(result.servers.map((s: ServerInfo) => s.name)).toContain('dev_backup');
+      expect(result.servers.map((s: ServerInfo) => s.name)).not.toContain('prod');
     });
 
     it('should filter servers by host', async () => {
@@ -59,7 +69,7 @@ describe('Server Tools', () => {
         server3: { host: 'eu.example.com', port: '5432', username: 'user', password: 'pass' }
       });
 
-      const result = await listServersAndDbs({ serverFilter: 'us-' });
+      const result = await listServers({ filter: 'us-' });
 
       expect(result.servers).toHaveLength(2);
     });
@@ -69,7 +79,7 @@ describe('Server Tools', () => {
         dev: { host: 'localhost', port: '5432', username: 'user', password: 'pass' }
       });
 
-      const result = await listServersAndDbs({});
+      const result = await listServers({});
 
       expect(result.servers[0].isConnected).toBe(false);
     });
@@ -79,9 +89,39 @@ describe('Server Tools', () => {
         dev: { host: 'localhost', username: 'user', password: 'pass' }
       });
 
-      const result = await listServersAndDbs({});
+      const result = await listServers({});
 
       expect(result.servers[0].port).toBe('5432');
+    });
+  });
+
+  describe('listDatabases', () => {
+    it('should require serverName parameter', async () => {
+      process.env.POSTGRES_SERVERS = JSON.stringify({
+        dev: { host: 'localhost', port: '5432', username: 'user', password: 'pass' }
+      });
+
+      await expect(listDatabases({ serverName: '' }))
+        .rejects.toThrow('serverName is required');
+    });
+
+    it('should throw when server not found', async () => {
+      process.env.POSTGRES_SERVERS = JSON.stringify({
+        dev: { host: 'localhost', port: '5432', username: 'user', password: 'pass' }
+      });
+
+      await expect(listDatabases({ serverName: 'nonexistent' }))
+        .rejects.toThrow("Server 'nonexistent' not found");
+    });
+
+    it('should include available servers in error message', async () => {
+      process.env.POSTGRES_SERVERS = JSON.stringify({
+        dev: { host: 'localhost', port: '5432', username: 'user', password: 'pass' },
+        prod: { host: 'prod.example.com', port: '5432', username: 'user', password: 'pass' }
+      });
+
+      await expect(listDatabases({ serverName: 'nonexistent' }))
+        .rejects.toThrow('Available servers: dev, prod');
     });
   });
 

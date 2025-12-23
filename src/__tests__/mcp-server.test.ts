@@ -15,8 +15,10 @@ import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
 describe('MCP Server Tool Definitions', () => {
   describe('Tool Definitions', () => {
     const expectedTools = [
-      'list_servers_and_dbs',
+      'list_servers',
+      'list_databases',
       'switch_server_db',
+      'get_current_connection',
       'list_schemas',
       'list_objects',
       'get_object_details',
@@ -29,7 +31,7 @@ describe('MCP Server Tool Definitions', () => {
     ];
 
     it('should define all expected tools', () => {
-      expect(expectedTools).toHaveLength(11);
+      expect(expectedTools).toHaveLength(13);
     });
 
     it('should have proper input schemas for required parameters', () => {
@@ -104,17 +106,32 @@ describe('Environment Configuration', () => {
 });
 
 describe('Response Format Expectations', () => {
-  it('should expect list_servers_and_dbs response format', () => {
+  it('should expect list_servers response format', () => {
     const expectedFormat = {
       servers: [
-        { name: 'string', host: 'string', port: 'string', isConnected: 'boolean' }
+        { name: 'string', host: 'string', port: 'string', isConnected: 'boolean', isDefault: 'boolean' }
       ],
       currentServer: 'string|null',
-      currentDatabase: 'string|null'
+      currentDatabase: 'string|null',
+      currentSchema: 'string|null'
     };
 
     expect(expectedFormat).toHaveProperty('servers');
     expect(expectedFormat).toHaveProperty('currentServer');
+    expect(expectedFormat).toHaveProperty('currentDatabase');
+  });
+
+  it('should expect list_databases response format', () => {
+    const expectedFormat = {
+      serverName: 'string',
+      databases: [
+        { name: 'string', owner: 'string', encoding: 'string', size: 'string' }
+      ],
+      currentDatabase: 'string|null'
+    };
+
+    expect(expectedFormat).toHaveProperty('serverName');
+    expect(expectedFormat).toHaveProperty('databases');
     expect(expectedFormat).toHaveProperty('currentDatabase');
   });
 
