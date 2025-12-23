@@ -18,14 +18,68 @@ npx postgres-mcp-server
 
 ### Environment Variables
 
-#### POSTGRES_SERVERS (required)
+You can configure servers using either **individual environment variables** (recommended) or a **JSON string** (legacy).
 
-Set the `POSTGRES_SERVERS` environment variable with a JSON object containing your server configurations:
+#### Option 1: Individual Environment Variables (Recommended)
+
+Configure each server using `PG_*` prefixed variables with a numeric or named suffix:
+
+```bash
+# Server 1 - Development
+export PG_NAME_1="dev"
+export PG_HOST_1="dev.example.com"
+export PG_PORT_1="5432"
+export PG_USERNAME_1="dev_user"
+export PG_PASSWORD_1="dev_password"
+export PG_DATABASE_1="myapp_dev"
+export PG_SCHEMA_1="public"
+export PG_SSL_1="true"
+export PG_DEFAULT_1="true"
+
+# Server 2 - Staging
+export PG_NAME_2="staging"
+export PG_HOST_2="staging.example.com"
+export PG_PORT_2="5432"
+export PG_USERNAME_2="staging_user"
+export PG_PASSWORD_2="staging_password"
+export PG_DATABASE_2="myapp_staging"
+export PG_SSL_2="require"
+
+# Server 3 - Production
+export PG_NAME_3="production"
+export PG_HOST_3="prod.example.com"
+export PG_PORT_3="5432"
+export PG_USERNAME_3="prod_user"
+export PG_PASSWORD_3="prod_password"
+export PG_DATABASE_3="myapp_prod"
+export PG_SCHEMA_3="app"
+export PG_SSL_3="true"
+```
+
+**Environment Variable Reference:**
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `PG_NAME_{n}` | Yes | Server name (used to identify the server) |
+| `PG_HOST_{n}` | Yes | PostgreSQL server hostname |
+| `PG_PORT_{n}` | No | Port number (default: "5432") |
+| `PG_USERNAME_{n}` | Yes | Database username |
+| `PG_PASSWORD_{n}` | No | Database password |
+| `PG_DATABASE_{n}` | No | Default database (default: "postgres") |
+| `PG_SCHEMA_{n}` | No | Default schema (default: "public") |
+| `PG_SSL_{n}` | No | SSL mode: `true`, `false`, `require`, `prefer`, `allow`, `disable` |
+| `PG_DEFAULT_{n}` | No | Set to `true` to make this the default server |
+
+**Note:** The suffix `{n}` can be any string (e.g., `_1`, `_2`, `_DEV`, `_PROD`). The system detects servers by looking for `PG_NAME_*` variables.
+
+#### Option 2: JSON Configuration (Legacy)
+
+Set the `POSTGRES_SERVERS` environment variable with a JSON object:
 
 ```bash
 export POSTGRES_SERVERS='{
   "dev": {
-    "host": "***.amazonaws.com",
+    "host": "dev.example.com",
     "port": "5432",
     "username": "your_username",
     "password": "your_password",
@@ -35,26 +89,17 @@ export POSTGRES_SERVERS='{
     "ssl": true
   },
   "staging": {
-    "host": "***.amazonaws.com",
+    "host": "staging.example.com",
     "port": "5432",
     "username": "your_username",
     "password": "your_password",
     "defaultDatabase": "myapp_staging",
     "ssl": "require"
-  },
-  "production": {
-    "host": "***.amazonaws.com",
-    "port": "5432",
-    "username": "your_username",
-    "password": "your_password",
-    "defaultDatabase": "myapp_prod",
-    "defaultSchema": "app",
-    "ssl": { "rejectUnauthorized": false }
   }
 }'
 ```
 
-**Server Configuration Options:**
+**JSON Configuration Options:**
 
 - `host` (required): PostgreSQL server hostname
 - `port` (optional): Port number (default: "5432")
@@ -63,12 +108,14 @@ export POSTGRES_SERVERS='{
 - `defaultDatabase` (optional): Default database to connect to (default: "postgres")
 - `defaultSchema` (optional): Default schema to use (default: "public")
 - `isDefault` (optional): Mark this server as the default server to connect to
-- `ssl` (optional): SSL/TLS connection configuration. Options:
+- `ssl` (optional): SSL/TLS connection configuration:
   - `true` or `"require"`: Enable SSL (recommended for cloud databases)
   - `"prefer"`: Use SSL if available
   - `"allow"`: Try non-SSL first, then SSL
   - `false` or `"disable"`: Disable SSL
-  - Object with options: `{ "rejectUnauthorized": false, "ca": "...", "cert": "...", "key": "..." }`
+  - Object: `{ "rejectUnauthorized": false, "ca": "...", "cert": "...", "key": "..." }`
+
+**Note:** If both formats are used, individual `PG_*` variables take precedence over `POSTGRES_SERVERS`.
 
 #### POSTGRES_ACCESS_MODE (optional)
 
@@ -96,7 +143,14 @@ Add the server to your Claude Desktop MCP configuration (`claude_desktop_config.
       "command": "npx",
       "args": ["@tejasanik/postgres-mcp-server"],
       "env": {
-        "POSTGRES_SERVERS": "{\"dev\":{\"host\":\"your-host.com\",\"port\":\"5432\",\"username\":\"user\",\"password\":\"pass\",\"ssl\":true}}",
+        "PG_NAME_1": "dev",
+        "PG_HOST_1": "your-host.com",
+        "PG_PORT_1": "5432",
+        "PG_USERNAME_1": "user",
+        "PG_PASSWORD_1": "pass",
+        "PG_DATABASE_1": "mydb",
+        "PG_SSL_1": "true",
+        "PG_DEFAULT_1": "true",
         "POSTGRES_ACCESS_MODE": "readonly"
       }
     }
@@ -113,7 +167,19 @@ claude mcp add-json postgres_dbs --scope user '{
   "command": "npx",
   "args": ["@tejasanik/postgres-mcp-server", "-y"],
   "env": {
-    "POSTGRES_SERVERS": "{\"dev\":{\"host\":\"your-host.com\",\"port\":\"5432\",\"username\":\"user\",\"password\":\"pass\",\"ssl\":true,\"isDefault\":true},\"staging\":{\"host\":\"staging-host.com\",\"port\":\"5432\",\"username\":\"user\",\"password\":\"pass\",\"ssl\":true}}",
+    "PG_NAME_1": "dev",
+    "PG_HOST_1": "dev.example.com",
+    "PG_PORT_1": "5432",
+    "PG_USERNAME_1": "user",
+    "PG_PASSWORD_1": "pass",
+    "PG_DATABASE_1": "mydb",
+    "PG_SSL_1": "true",
+    "PG_DEFAULT_1": "true",
+    "PG_NAME_2": "staging",
+    "PG_HOST_2": "staging.example.com",
+    "PG_USERNAME_2": "user",
+    "PG_PASSWORD_2": "pass",
+    "PG_SSL_2": "true",
     "POSTGRES_ACCESS_MODE": "readonly"
   }
 }'

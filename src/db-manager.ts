@@ -51,6 +51,119 @@ function getAccessModeFromEnv(): boolean {
   return false;
 }
 
+/**
+ * Parses SSL configuration from environment variable string.
+ * Accepts: "true", "false", "require", "prefer", "allow", "disable", or JSON object
+ */
+function parseSslFromEnv(sslValue: string | undefined): ServerConfig['ssl'] {
+  if (!sslValue) return undefined;
+
+  const lower = sslValue.toLowerCase().trim();
+  if (lower === 'true' || lower === '1') return true;
+  if (lower === 'false' || lower === '0') return false;
+  if (lower === 'require' || lower === 'prefer' || lower === 'allow' || lower === 'disable') {
+    return lower as 'require' | 'prefer' | 'allow' | 'disable';
+  }
+
+  // Try parsing as JSON object
+  try {
+    const parsed = JSON.parse(sslValue);
+    if (typeof parsed === 'object') return parsed;
+  } catch {
+    // Not valid JSON, ignore
+  }
+
+  return undefined;
+}
+
+/**
+ * Loads server configurations from individual PG_* environment variables.
+ * Pattern: PG_NAME_1, PG_HOST_1, PG_PORT_1, PG_USERNAME_1, PG_PASSWORD_1,
+ *          PG_DATABASE_1, PG_SCHEMA_1, PG_SSL_1, PG_DEFAULT_1
+ */
+function loadServersFromEnvVars(): ServersConfig {
+  const servers: ServersConfig = {};
+  const suffixes = new Set<string>();
+
+  // Find all unique suffixes (e.g., _1, _2, _DEV, _PROD)
+  for (const key of Object.keys(process.env)) {
+    if (key.startsWith('PG_NAME_')) {
+      const suffix = key.substring('PG_NAME'.length); // includes the underscore
+      suffixes.add(suffix);
+    }
+  }
+
+  // Build server configs from each suffix
+  for (const suffix of suffixes) {
+    const name = process.env[`PG_NAME${suffix}`];
+    const host = process.env[`PG_HOST${suffix}`];
+    const username = process.env[`PG_USERNAME${suffix}`];
+    const password = process.env[`PG_PASSWORD${suffix}`];
+
+    // Name and host are required
+    if (!name || !host) {
+      console.error(`Warning: PG_NAME${suffix} or PG_HOST${suffix} missing, skipping server config`);
+      continue;
+    }
+
+    // Username and password are required
+    if (!username) {
+      console.error(`Warning: PG_USERNAME${suffix} missing for server '${name}', skipping`);
+      continue;
+    }
+
+    const config: ServerConfig = {
+      host,
+      port: process.env[`PG_PORT${suffix}`] || DEFAULT_PORT,
+      username,
+      password: password || '',
+      defaultDatabase: process.env[`PG_DATABASE${suffix}`],
+      defaultSchema: process.env[`PG_SCHEMA${suffix}`],
+      isDefault: process.env[`PG_DEFAULT${suffix}`]?.toLowerCase() === 'true',
+      ssl: parseSslFromEnv(process.env[`PG_SSL${suffix}`])
+    };
+
+    servers[name] = config;
+  }
+
+  return servers;
+}
+
+/**
+ * Loads server configurations from POSTGRES_SERVERS JSON environment variable.
+ * (Legacy format for backward compatibility)
+ */
+function loadServersFromJson(): ServersConfig {
+  const configEnv = process.env.POSTGRES_SERVERS;
+  if (!configEnv) {
+    return {};
+  }
+
+  try {
+    const parsed = JSON.parse(configEnv);
+
+    // Validate the structure
+    if (typeof parsed !== 'object' || parsed === null) {
+      throw new Error('POSTGRES_SERVERS must be a JSON object');
+    }
+
+    for (const [name, config] of Object.entries(parsed)) {
+      if (!config || typeof config !== 'object') {
+        throw new Error(`Server '${name}' configuration is invalid`);
+      }
+      const serverConfig = config as any;
+      if (!serverConfig.host || typeof serverConfig.host !== 'string') {
+        throw new Error(`Server '${name}' must have a valid 'host' string`);
+      }
+    }
+
+    return parsed as ServersConfig;
+  } catch (error) {
+    console.error('Error parsing POSTGRES_SERVERS:', error);
+    return {};
+  }
+}
+
 export class DatabaseManager {
   private serversConfig: ServersConfig;
   private connectionState: ConnectionState;
@@ -70,35 +183,18 @@ export class DatabaseManager {
   }
 
   private loadServersConfig(): ServersConfig {
-    const configEnv = process.env.POSTGRES_SERVERS;
-    if (!configEnv) {
-      console.error('Warning: POSTGRES_SERVERS environment variable not set. Using empty config.');
-      return {};
+    // Load from both sources - PG_* env vars take precedence over POSTGRES_SERVERS JSON
+    const jsonServers = loadServersFromJson();
+    const envServers = loadServersFromEnvVars();
+
+    // Merge: env vars override JSON config
+    const merged = { ...jsonServers, ...envServers };
+
+    if (Object.keys(merged).length === 0) {
+      console.error('Warning: No server configuration found. Set PG_* environment variables or POSTGRES_SERVERS.');
     }
 
-    try {
-      const parsed = JSON.parse(configEnv);
-
-      // Validate the structure
-      if (typeof parsed !== 'object' || parsed === null) {
-        throw new Error('POSTGRES_SERVERS must be a JSON object');
-      }
-
-      for (const [name, config] of Object.entries(parsed)) {
-        if (!config || typeof config !== 'object') {
-          throw new Error(`Server '${name}' configuration is invalid`);
-        }
-        const serverConfig = config as any;
-        if (!serverConfig.host || typeof serverConfig.host !== 'string') {
-          throw new Error(`Server '${name}' must have a valid 'host' string`);
-        }
-      }
-
-      return parsed as ServersConfig;
-    } catch (error) {
-      console.error('Error parsing POSTGRES_SERVERS:', error);
-      return {};
-    }
+    return merged;
   }
 
   public getServersConfig(): ServersConfig {

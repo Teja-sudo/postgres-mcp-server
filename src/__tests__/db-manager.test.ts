@@ -1,16 +1,27 @@
 import { jest, describe, it, expect, beforeEach, afterEach } from '@jest/globals';
 import { DatabaseManager, getDbManager, resetDbManager } from '../db-manager.js';
 
+// Helper to clear all PG_* environment variables
+function clearPgEnvVars() {
+  for (const key of Object.keys(process.env)) {
+    if (key.startsWith('PG_')) {
+      delete process.env[key];
+    }
+  }
+}
+
 describe('DatabaseManager', () => {
   beforeEach(() => {
     // Reset the singleton and environment
     resetDbManager();
     delete process.env.POSTGRES_SERVERS;
     delete process.env.POSTGRES_ACCESS_MODE;
+    clearPgEnvVars();
   });
 
   afterEach(() => {
     resetDbManager();
+    clearPgEnvVars();
   });
 
   describe('constructor and configuration', () => {
@@ -53,6 +64,142 @@ describe('DatabaseManager', () => {
       });
       const manager = new DatabaseManager();
       expect(manager.getServerConfig('nonexistent')).toBeNull();
+    });
+  });
+
+  describe('PG_* environment variable configuration', () => {
+    it('should parse servers from PG_* env vars', () => {
+      process.env.PG_NAME_1 = 'dev';
+      process.env.PG_HOST_1 = 'localhost';
+      process.env.PG_PORT_1 = '5432';
+      process.env.PG_USERNAME_1 = 'user';
+      process.env.PG_PASSWORD_1 = 'pass';
+      process.env.PG_DATABASE_1 = 'mydb';
+      process.env.PG_SCHEMA_1 = 'public';
+      process.env.PG_SSL_1 = 'true';
+      process.env.PG_DEFAULT_1 = 'true';
+
+      const manager = new DatabaseManager();
+      expect(manager.getServerNames()).toContain('dev');
+
+      const config = manager.getServerConfig('dev');
+      expect(config).toEqual({
+        host: 'localhost',
+        port: '5432',
+        username: 'user',
+        password: 'pass',
+        defaultDatabase: 'mydb',
+        defaultSchema: 'public',
+        ssl: true,
+        isDefault: true
+      });
+    });
+
+    it('should parse multiple servers from PG_* env vars', () => {
+      process.env.PG_NAME_1 = 'dev';
+      process.env.PG_HOST_1 = 'localhost';
+      process.env.PG_USERNAME_1 = 'dev_user';
+      process.env.PG_PASSWORD_1 = 'dev_pass';
+
+      process.env.PG_NAME_2 = 'prod';
+      process.env.PG_HOST_2 = 'prod.example.com';
+      process.env.PG_USERNAME_2 = 'prod_user';
+      process.env.PG_PASSWORD_2 = 'prod_pass';
+      process.env.PG_SSL_2 = 'require';
+
+      const manager = new DatabaseManager();
+      expect(manager.getServerNames()).toContain('dev');
+      expect(manager.getServerNames()).toContain('prod');
+
+      expect(manager.getServerConfig('dev')?.host).toBe('localhost');
+      expect(manager.getServerConfig('prod')?.host).toBe('prod.example.com');
+      expect(manager.getServerConfig('prod')?.ssl).toBe('require');
+    });
+
+    it('should use default port when not specified', () => {
+      process.env.PG_NAME_1 = 'dev';
+      process.env.PG_HOST_1 = 'localhost';
+      process.env.PG_USERNAME_1 = 'user';
+
+      const manager = new DatabaseManager();
+      expect(manager.getServerConfig('dev')?.port).toBe('5432');
+    });
+
+    it('should skip servers missing required fields', () => {
+      // Missing PG_HOST_1
+      process.env.PG_NAME_1 = 'incomplete';
+      process.env.PG_USERNAME_1 = 'user';
+
+      const manager = new DatabaseManager();
+      expect(manager.getServerNames()).not.toContain('incomplete');
+    });
+
+    it('should skip servers missing username', () => {
+      process.env.PG_NAME_1 = 'nouser';
+      process.env.PG_HOST_1 = 'localhost';
+      // Missing PG_USERNAME_1
+
+      const manager = new DatabaseManager();
+      expect(manager.getServerNames()).not.toContain('nouser');
+    });
+
+    it('should parse SSL options correctly', () => {
+      process.env.PG_NAME_1 = 'ssl_true';
+      process.env.PG_HOST_1 = 'host1';
+      process.env.PG_USERNAME_1 = 'user';
+      process.env.PG_SSL_1 = 'true';
+
+      process.env.PG_NAME_2 = 'ssl_false';
+      process.env.PG_HOST_2 = 'host2';
+      process.env.PG_USERNAME_2 = 'user';
+      process.env.PG_SSL_2 = 'false';
+
+      process.env.PG_NAME_3 = 'ssl_require';
+      process.env.PG_HOST_3 = 'host3';
+      process.env.PG_USERNAME_3 = 'user';
+      process.env.PG_SSL_3 = 'require';
+
+      const manager = new DatabaseManager();
+      expect(manager.getServerConfig('ssl_true')?.ssl).toBe(true);
+      expect(manager.getServerConfig('ssl_false')?.ssl).toBe(false);
+      expect(manager.getServerConfig('ssl_require')?.ssl).toBe('require');
+    });
+
+    it('should allow named suffixes like _DEV, _PROD', () => {
+      process.env.PG_NAME_DEV = 'development';
+      process.env.PG_HOST_DEV = 'dev.example.com';
+      process.env.PG_USERNAME_DEV = 'dev_user';
+
+      process.env.PG_NAME_PROD = 'production';
+      process.env.PG_HOST_PROD = 'prod.example.com';
+      process.env.PG_USERNAME_PROD = 'prod_user';
+
+      const manager = new DatabaseManager();
+      expect(manager.getServerNames()).toContain('development');
+      expect(manager.getServerNames()).toContain('production');
+    });
+
+    it('should merge PG_* vars with POSTGRES_SERVERS (PG_* takes precedence)', () => {
+      // JSON config
+      process.env.POSTGRES_SERVERS = JSON.stringify({
+        dev: { host: 'json-host', port: '5432', username: 'json-user', password: 'json-pass' },
+        staging: { host: 'staging-host', port: '5432', username: 'staging-user', password: 'staging-pass' }
+      });
+
+      // PG_* config (should override 'dev')
+      process.env.PG_NAME_1 = 'dev';
+      process.env.PG_HOST_1 = 'env-host';
+      process.env.PG_USERNAME_1 = 'env-user';
+      process.env.PG_PASSWORD_1 = 'env-pass';
+
+      const manager = new DatabaseManager();
+
+      // dev should come from PG_* (takes precedence)
+      expect(manager.getServerConfig('dev')?.host).toBe('env-host');
+      expect(manager.getServerConfig('dev')?.username).toBe('env-user');
+
+      // staging should still come from JSON
+      expect(manager.getServerConfig('staging')?.host).toBe('staging-host');
     });
   });
 
