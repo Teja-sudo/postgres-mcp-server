@@ -58,17 +58,17 @@ export PG_SSL_3="true"
 
 **Environment Variable Reference:**
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `PG_NAME_{n}` | Yes | Server name (used to identify the server) |
-| `PG_HOST_{n}` | Yes | PostgreSQL server hostname |
-| `PG_PORT_{n}` | No | Port number (default: "5432") |
-| `PG_USERNAME_{n}` | Yes | Database username |
-| `PG_PASSWORD_{n}` | No | Database password |
-| `PG_DATABASE_{n}` | No | Default database (default: "postgres") |
-| `PG_SCHEMA_{n}` | No | Default schema (default: "public") |
-| `PG_SSL_{n}` | No | SSL mode: `true`, `false`, `require`, `prefer`, `allow`, `disable` |
-| `PG_DEFAULT_{n}` | No | Set to `true` to make this the default server |
+| Variable          | Required | Description                                                        |
+| ----------------- | -------- | ------------------------------------------------------------------ |
+| `PG_NAME_{n}`     | Yes      | Server name (used to identify the server)                          |
+| `PG_HOST_{n}`     | Yes      | PostgreSQL server hostname                                         |
+| `PG_PORT_{n}`     | No       | Port number (default: "5432")                                      |
+| `PG_USERNAME_{n}` | Yes      | Database username                                                  |
+| `PG_PASSWORD_{n}` | No       | Database password                                                  |
+| `PG_DATABASE_{n}` | No       | Default database (default: "postgres")                             |
+| `PG_SCHEMA_{n}`   | No       | Default schema (default: "public")                                 |
+| `PG_SSL_{n}`      | No       | SSL mode: `true`, `false`, `require`, `prefer`, `allow`, `disable` |
+| `PG_DEFAULT_{n}`  | No       | Set to `true` to make this the default server                      |
 
 **Note:** The suffix `{n}` can be any string (e.g., `_1`, `_2`, `_DEV`, `_PROD`). The system detects servers by looking for `PG_NAME_*` variables.
 
@@ -165,7 +165,7 @@ Add the server using the Claude Code CLI:
 ```bash
 claude mcp add-json postgres_dbs --scope user '{
   "command": "npx",
-  "args": ["@tejasanik/postgres-mcp-server", "-y"],
+  "args": ["-y","@tejasanik/postgres-mcp-server"],
   "env": {
     "PG_NAME_1": "dev",
     "PG_HOST_1": "dev.example.com",
