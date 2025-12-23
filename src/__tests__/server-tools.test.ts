@@ -44,7 +44,7 @@ describe('Server Tools', () => {
         prod: { host: 'prod.example.com', port: '5432', username: 'user', password: 'pass' }
       });
 
-      const result = await listServersAndDbs({ filter: 'dev' });
+      const result = await listServersAndDbs({ serverFilter: 'dev' });
 
       expect(result.servers).toHaveLength(2);
       expect(result.servers.map(s => s.name)).toContain('dev');
@@ -59,7 +59,7 @@ describe('Server Tools', () => {
         server3: { host: 'eu.example.com', port: '5432', username: 'user', password: 'pass' }
       });
 
-      const result = await listServersAndDbs({ filter: 'us-' });
+      const result = await listServersAndDbs({ serverFilter: 'us-' });
 
       expect(result.servers).toHaveLength(2);
     });

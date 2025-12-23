@@ -195,9 +195,11 @@ Lists all configured PostgreSQL servers and their databases.
 
 **Parameters:**
 
-- `filter` (optional): Filter servers and databases by name
+- `serverFilter` (optional): Filter servers by name or host (case-insensitive partial match)
+- `databaseFilter` (optional): Filter databases by name (case-insensitive partial match)
 - `includeSystemDbs` (optional): Include system databases (template0, template1)
-- `fetchDatabases` (optional): Fetch list of databases from connected server
+- `fetchDatabases` (optional): Fetch list of databases from servers
+- `searchAllServers` (optional): When true, fetches databases from all configured servers (temporarily connects to each). When false, only fetches from the currently connected server.
 
 #### `switch_server_db`
 

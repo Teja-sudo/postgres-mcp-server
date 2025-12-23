@@ -60,14 +60,14 @@ export async function listObjects(args: {
   if (objectType === 'all' || objectType === 'table') {
     const tablesQuery = `
       SELECT
-        table_name as name,
+        tablename as name,
         'table' as type,
         tableowner as owner,
         schemaname as schema
       FROM pg_catalog.pg_tables
       WHERE schemaname = $1
-      ${args.filter ? "AND table_name ILIKE '%' || $2 || '%'" : ''}
-      ORDER BY table_name
+      ${args.filter ? "AND tablename ILIKE '%' || $2 || '%'" : ''}
+      ORDER BY tablename
     `;
     const params = args.filter ? [args.schema, args.filter] : [args.schema];
     const tables = await dbManager.query<TableInfo>(tablesQuery, params);

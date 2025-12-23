@@ -28,13 +28,17 @@ import {
 const tools: Tool[] = [
   {
     name: 'list_servers_and_dbs',
-    description: 'Lists all configured PostgreSQL servers and their databases. Can filter servers and databases by name. Use fetchDatabases=true to list databases (requires connecting to the server first).',
+    description: 'Lists all configured PostgreSQL servers and their databases. Use fetchDatabases=true to list databases. Use searchAllServers=true to fetch databases from all servers (not just the connected one).',
     inputSchema: {
       type: 'object',
       properties: {
-        filter: {
+        serverFilter: {
           type: 'string',
-          description: 'Filter servers and databases by name (case-insensitive partial match)'
+          description: 'Filter servers by name or host (case-insensitive partial match)'
+        },
+        databaseFilter: {
+          type: 'string',
+          description: 'Filter databases by name (case-insensitive partial match)'
         },
         includeSystemDbs: {
           type: 'boolean',
@@ -43,7 +47,12 @@ const tools: Tool[] = [
         },
         fetchDatabases: {
           type: 'boolean',
-          description: 'Fetch list of databases from connected server',
+          description: 'Fetch list of databases from servers',
+          default: false
+        },
+        searchAllServers: {
+          type: 'boolean',
+          description: 'When true, fetch databases from all configured servers (temporarily connects to each). When false, only fetch from currently connected server.',
           default: false
         }
       }
