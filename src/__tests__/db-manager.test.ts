@@ -281,8 +281,10 @@ describe('DatabaseManager', () => {
       const manager = new DatabaseManager();
 
       await expect(manager.switchServer('dev', 'invalid;db')).rejects.toThrow('Invalid database name');
-      await expect(manager.switchServer('dev', 'db--name')).rejects.toThrow('Invalid database name');
-      await expect(manager.switchServer('dev', '123db')).rejects.toThrow('Invalid database name');
+      await expect(manager.switchServer('dev', 'db--name')).rejects.toThrow('Invalid database name'); // SQL comment
+      await expect(manager.switchServer('dev', '123db')).rejects.toThrow('Invalid database name'); // starts with digit
+      await expect(manager.switchServer('dev', "db'name")).rejects.toThrow('Invalid database name'); // quote
+      // Note: 'GraphQL-Intro-DB' with single hyphens is valid and allowed
     });
 
     it('should throw when querying without connection', async () => {

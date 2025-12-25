@@ -247,9 +247,10 @@ export class DatabaseManager {
     // Use provided database, server's default, or system default
     const dbName = database || serverConfig.defaultDatabase || DEFAULT_DATABASE;
 
-    // Validate database name
-    if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(dbName)) {
-      throw new Error('Invalid database name. Only alphanumeric characters and underscores are allowed.');
+    // Validate database name - allow alphanumeric, underscores, hyphens, but block SQL injection
+    // PostgreSQL allows hyphens in database names when quoted (pg library handles this)
+    if (!/^[a-zA-Z_][a-zA-Z0-9_-]*$/.test(dbName) || /--|;|'|"|`/.test(dbName)) {
+      throw new Error('Invalid database name. Allowed: letters, digits, underscores, hyphens. Cannot contain SQL characters (;, --, quotes).');
     }
 
     const sslConfig = getSslConfig(serverConfig.ssl);
