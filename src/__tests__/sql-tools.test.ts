@@ -357,8 +357,8 @@ describe('SQL Tools', () => {
 
   describe('executeSqlFile', () => {
     let mockClient: { query: MockFn; release: MockFn };
-    const testDir = '/tmp/postgres-mcp-test';
-    const testFile = `${testDir}/test.sql`;
+    let testDir: string;
+    let testFile: string;
 
     beforeEach(() => {
       mockClient = {
@@ -367,16 +367,22 @@ describe('SQL Tools', () => {
       };
       mockGetClient.mockResolvedValue(mockClient);
 
-      // Create test directory
-      if (!fs.existsSync(testDir)) {
-        fs.mkdirSync(testDir, { recursive: true });
-      }
+      // Create unique test directory for each test run
+      testDir = fs.mkdtempSync('/tmp/postgres-mcp-test-');
+      testFile = `${testDir}/test.sql`;
     });
 
     afterEach(() => {
-      // Clean up test files
-      if (fs.existsSync(testFile)) {
-        fs.unlinkSync(testFile);
+      // Clean up test files and directory
+      try {
+        if (fs.existsSync(testFile)) {
+          fs.unlinkSync(testFile);
+        }
+        if (fs.existsSync(testDir)) {
+          fs.rmdirSync(testDir);
+        }
+      } catch (e) {
+        // Ignore cleanup errors
       }
     });
 

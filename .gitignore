@@ -6,3 +6,4 @@ dist/
 *.tgz
 .DS_Store
 package-lock.json
+.claude/settings.local.json
