@@ -29,8 +29,6 @@ export interface ConnectionInfo {
   server: string | null;
   database: string | null;
   schema: string | null;
-  host: string | null;
-  port: string | null;
   accessMode: 'full' | 'readonly';
 }
 

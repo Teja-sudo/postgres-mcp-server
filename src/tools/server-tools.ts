@@ -1,11 +1,9 @@
 import { getDbManager } from '../db-manager.js';
 import { DatabaseInfo, ConnectionInfo } from '../types.js';
 
-// Simple server info without databases
+// Simple server info without databases (host/port hidden for security)
 interface ServerInfo {
   name: string;
-  host: string;
-  port: string;
   isConnected: boolean;
   isDefault: boolean;
   defaultDatabase?: string;
@@ -104,12 +102,11 @@ export async function listServers(args: {
 
   let serverNames = Object.keys(serversConfig);
 
-  // Apply filter if provided
+  // Apply filter if provided (filter by server name only)
   if (args.filter) {
     const filterLower = args.filter.toLowerCase();
     serverNames = serverNames.filter(name =>
-      name.toLowerCase().includes(filterLower) ||
-      serversConfig[name].host.toLowerCase().includes(filterLower)
+      name.toLowerCase().includes(filterLower)
     );
   }
 
@@ -122,8 +119,6 @@ export async function listServers(args: {
 
     servers.push({
       name,
-      host: config.host,
-      port: config.port || '5432',
       isConnected,
       isDefault: config.isDefault === true || name === defaultServerName,
       defaultDatabase: config.defaultDatabase,

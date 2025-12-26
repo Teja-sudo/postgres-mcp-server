@@ -1,37 +1,37 @@
-import { Pool, PoolClient, QueryResult, QueryResultRow } from 'pg';
+import { Pool, PoolClient, QueryResult, QueryResultRow } from "pg";
 import {
   ServerConfig,
   ServersConfig,
   ConnectionState,
   ConnectionInfo,
-  DatabaseInfo
-} from './types.js';
-import { isReadOnlySql } from './utils/validation.js';
+  DatabaseInfo,
+} from "./types.js";
+import { isReadOnlySql } from "./utils/validation.js";
 
-const DEFAULT_PORT = '5432';
-const DEFAULT_DATABASE = 'postgres';
-const DEFAULT_SCHEMA = 'public';
+const DEFAULT_PORT = "5432";
+const DEFAULT_DATABASE = "postgres";
+const DEFAULT_SCHEMA = "public";
 const DEFAULT_QUERY_TIMEOUT_MS = 30000; // 30 seconds
 const MAX_QUERY_TIMEOUT_MS = 300000; // 5 minutes
 
 /**
  * Converts the ServerConfig ssl option to pg Pool ssl config format.
  */
-function getSslConfig(ssl: ServerConfig['ssl']): boolean | object | undefined {
-  if (ssl === undefined || ssl === false || ssl === 'disable') {
+function getSslConfig(ssl: ServerConfig["ssl"]): boolean | object | undefined {
+  if (ssl === undefined || ssl === false || ssl === "disable") {
     return undefined;
   }
 
-  if (ssl === true || ssl === 'require') {
+  if (ssl === true || ssl === "require") {
     // Most cloud providers need rejectUnauthorized: false for self-signed certs
     return { rejectUnauthorized: false };
   }
 
-  if (ssl === 'prefer' || ssl === 'allow') {
+  if (ssl === "prefer" || ssl === "allow") {
     return { rejectUnauthorized: false };
   }
 
-  if (typeof ssl === 'object') {
+  if (typeof ssl === "object") {
     return ssl;
   }
 
@@ -44,7 +44,7 @@ function getSslConfig(ssl: ServerConfig['ssl']): boolean | object | undefined {
  */
 function getAccessModeFromEnv(): boolean {
   const mode = process.env.POSTGRES_ACCESS_MODE?.toLowerCase().trim();
-  if (mode === 'readonly' || mode === 'read-only' || mode === 'ro') {
+  if (mode === "readonly" || mode === "read-only" || mode === "ro") {
     return true; // read-only mode
   }
   // Default is 'full' access (read-only = false)
@@ -55,20 +55,25 @@ function getAccessModeFromEnv(): boolean {
  * Parses SSL configuration from environment variable string.
  * Accepts: "true", "false", "require", "prefer", "allow", "disable", or JSON object
  */
-function parseSslFromEnv(sslValue: string | undefined): ServerConfig['ssl'] {
+function parseSslFromEnv(sslValue: string | undefined): ServerConfig["ssl"] {
   if (!sslValue) return undefined;
 
   const lower = sslValue.toLowerCase().trim();
-  if (lower === 'true' || lower === '1') return true;
-  if (lower === 'false' || lower === '0') return false;
-  if (lower === 'require' || lower === 'prefer' || lower === 'allow' || lower === 'disable') {
-    return lower as 'require' | 'prefer' | 'allow' | 'disable';
+  if (lower === "true" || lower === "1") return true;
+  if (lower === "false" || lower === "0") return false;
+  if (
+    lower === "require" ||
+    lower === "prefer" ||
+    lower === "allow" ||
+    lower === "disable"
+  ) {
+    return lower as "require" | "prefer" | "allow" | "disable";
   }
 
   // Try parsing as JSON object
   try {
     const parsed = JSON.parse(sslValue);
-    if (typeof parsed === 'object') return parsed;
+    if (typeof parsed === "object") return parsed;
   } catch {
     // Not valid JSON, ignore
   }
@@ -87,8 +92,8 @@ function loadServersFromEnvVars(): ServersConfig {
 
   // Find all unique suffixes (e.g., _1, _2, _DEV, _PROD)
   for (const key of Object.keys(process.env)) {
-    if (key.startsWith('PG_NAME_')) {
-      const suffix = key.substring('PG_NAME'.length); // includes the underscore
+    if (key.startsWith("PG_NAME_")) {
+      const suffix = key.substring("PG_NAME".length); // includes the underscore
       suffixes.add(suffix);
     }
   }
@@ -102,13 +107,17 @@ function loadServersFromEnvVars(): ServersConfig {
 
     // Name and host are required
     if (!name || !host) {
-      console.error(`Warning: PG_NAME${suffix} or PG_HOST${suffix} missing, skipping server config`);
+      console.error(
+        `Warning: PG_NAME${suffix} or PG_HOST${suffix} missing, skipping server config`
+      );
       continue;
     }
 
     // Username and password are required
     if (!username) {
-      console.error(`Warning: PG_USERNAME${suffix} missing for server '${name}', skipping`);
+      console.error(
+        `Warning: PG_USERNAME${suffix} missing for server '${name}', skipping`
+      );
       continue;
     }
 
@@ -116,11 +125,11 @@ function loadServersFromEnvVars(): ServersConfig {
       host,
       port: process.env[`PG_PORT${suffix}`] || DEFAULT_PORT,
       username,
-      password: password || '',
+      password: password || "",
       defaultDatabase: process.env[`PG_DATABASE${suffix}`],
       defaultSchema: process.env[`PG_SCHEMA${suffix}`],
-      isDefault: process.env[`PG_DEFAULT${suffix}`]?.toLowerCase() === 'true',
-      ssl: parseSslFromEnv(process.env[`PG_SSL${suffix}`])
+      isDefault: process.env[`PG_DEFAULT${suffix}`]?.toLowerCase() === "true",
+      ssl: parseSslFromEnv(process.env[`PG_SSL${suffix}`]),
     };
 
     servers[name] = config;
@@ -143,23 +152,23 @@ function loadServersFromJson(): ServersConfig {
     const parsed = JSON.parse(configEnv);
 
     // Validate the structure
-    if (typeof parsed !== 'object' || parsed === null) {
-      throw new Error('POSTGRES_SERVERS must be a JSON object');
+    if (typeof parsed !== "object" || parsed === null) {
+      throw new Error("POSTGRES_SERVERS must be a JSON object");
     }
 
     for (const [name, config] of Object.entries(parsed)) {
-      if (!config || typeof config !== 'object') {
+      if (!config || typeof config !== "object") {
         throw new Error(`Server '${name}' configuration is invalid`);
       }
       const serverConfig = config as any;
-      if (!serverConfig.host || typeof serverConfig.host !== 'string') {
+      if (!serverConfig.host || typeof serverConfig.host !== "string") {
         throw new Error(`Server '${name}' must have a valid 'host' string`);
       }
     }
 
     return parsed as ServersConfig;
   } catch (error) {
-    console.error('Error parsing POSTGRES_SERVERS:', error);
+    console.error("Error parsing POSTGRES_SERVERS:", error);
     return {};
   }
 }
@@ -171,12 +180,15 @@ export class DatabaseManager {
   private readOnlyMode: boolean;
   private queryTimeoutMs: number;
 
-  constructor(readOnlyMode: boolean = true, queryTimeoutMs: number = DEFAULT_QUERY_TIMEOUT_MS) {
+  constructor(
+    readOnlyMode: boolean = true,
+    queryTimeoutMs: number = DEFAULT_QUERY_TIMEOUT_MS
+  ) {
     this.serversConfig = this.loadServersConfig();
     this.connectionState = {
       currentServer: null,
       currentDatabase: null,
-      currentSchema: null
+      currentSchema: null,
     };
     this.readOnlyMode = readOnlyMode;
     this.queryTimeoutMs = Math.min(queryTimeoutMs, MAX_QUERY_TIMEOUT_MS);
@@ -191,7 +203,9 @@ export class DatabaseManager {
     const merged = { ...jsonServers, ...envServers };
 
     if (Object.keys(merged).length === 0) {
-      console.error('Warning: No server configuration found. Set PG_* environment variables or POSTGRES_SERVERS.');
+      console.error(
+        "Warning: No server configuration found. Set PG_* environment variables or POSTGRES_SERVERS."
+      );
     }
 
     return merged;
@@ -232,7 +246,11 @@ export class DatabaseManager {
     return names.length > 0 ? names[0] : null;
   }
 
-  public async switchServer(serverName: string, database?: string, schema?: string): Promise<void> {
+  public async switchServer(
+    serverName: string,
+    database?: string,
+    schema?: string
+  ): Promise<void> {
     const serverConfig = this.getServerConfig(serverName);
     if (!serverConfig) {
       throw new Error(`Server '${serverName}' not found in configuration`);
@@ -249,8 +267,13 @@ export class DatabaseManager {
 
     // Validate database name - allow alphanumeric, underscores, hyphens, but block SQL injection
     // PostgreSQL allows hyphens in database names when quoted (pg library handles this)
-    if (!/^[a-zA-Z_][a-zA-Z0-9_-]*$/.test(dbName) || /--|;|'|"|`/.test(dbName)) {
-      throw new Error('Invalid database name. Allowed: letters, digits, underscores, hyphens. Cannot contain SQL characters (;, --, quotes).');
+    if (
+      !/^[a-zA-Z_][a-zA-Z0-9_-]*$/.test(dbName) ||
+      /--|;|'|"|`/.test(dbName)
+    ) {
+      throw new Error(
+        "Invalid database name. Allowed: letters, digits, underscores, hyphens. Cannot contain SQL characters (;, --, quotes)."
+      );
     }
 
     const sslConfig = getSslConfig(serverConfig.ssl);
@@ -265,12 +288,12 @@ export class DatabaseManager {
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 10000,
       statement_timeout: this.queryTimeoutMs,
-      ...(sslConfig && { ssl: sslConfig })
+      ...(sslConfig && { ssl: sslConfig }),
     });
 
     // Handle pool errors
-    this.currentPool.on('error', (err) => {
-      console.error('Unexpected pool error:', err);
+    this.currentPool.on("error", (err) => {
+      console.error("Unexpected pool error:", err);
     });
 
     // Test connection
@@ -280,34 +303,35 @@ export class DatabaseManager {
       this.connectionState.currentServer = serverName;
       this.connectionState.currentDatabase = dbName;
       // Use provided schema, server's default, or system default
-      this.connectionState.currentSchema = schema || serverConfig.defaultSchema || DEFAULT_SCHEMA;
+      this.connectionState.currentSchema =
+        schema || serverConfig.defaultSchema || DEFAULT_SCHEMA;
     } catch (error) {
       await this.currentPool.end();
       this.currentPool = null;
-      throw new Error(`Failed to connect to server '${serverName}': ${error instanceof Error ? error.message : String(error)}`);
+      throw new Error(
+        `Failed to connect to server '${serverName}': ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
     }
   }
 
   public setCurrentSchema(schema: string): void {
     if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(schema)) {
-      throw new Error('Invalid schema name. Only alphanumeric characters and underscores are allowed.');
+      throw new Error(
+        "Invalid schema name. Only alphanumeric characters and underscores are allowed."
+      );
     }
     this.connectionState.currentSchema = schema;
   }
 
   public getConnectionInfo(): ConnectionInfo {
-    const serverConfig = this.connectionState.currentServer
-      ? this.getServerConfig(this.connectionState.currentServer)
-      : null;
-
     return {
       isConnected: this.isConnected(),
       server: this.connectionState.currentServer,
       database: this.connectionState.currentDatabase,
       schema: this.connectionState.currentSchema,
-      host: serverConfig?.host || null,
-      port: serverConfig?.port || null,
-      accessMode: this.readOnlyMode ? 'readonly' : 'full'
+      accessMode: this.readOnlyMode ? "readonly" : "full",
     };
   }
 
@@ -328,7 +352,7 @@ export class DatabaseManager {
 
   public async switchDatabase(database: string): Promise<void> {
     if (!this.connectionState.currentServer) {
-      throw new Error('No server selected. Please switch to a server first.');
+      throw new Error("No server selected. Please switch to a server first.");
     }
 
     await this.switchServer(this.connectionState.currentServer, database);
@@ -348,13 +372,18 @@ export class DatabaseManager {
     return result.rows;
   }
 
-  public async query<T extends QueryResultRow = any>(sql: string, params?: any[]): Promise<QueryResult<T>> {
+  public async query<T extends QueryResultRow = any>(
+    sql: string,
+    params?: any[]
+  ): Promise<QueryResult<T>> {
     if (!this.currentPool) {
-      throw new Error('No database connection. Please switch to a server and database first.');
+      throw new Error(
+        "No database connection. Please switch to a server and database first."
+      );
     }
 
-    if (!sql || typeof sql !== 'string') {
-      throw new Error('SQL query is required and must be a string');
+    if (!sql || typeof sql !== "string") {
+      throw new Error("SQL query is required and must be a string");
     }
 
     // Check for read-only mode violations using improved validation
@@ -378,7 +407,9 @@ export class DatabaseManager {
 
   public async getClient(): Promise<PoolClient> {
     if (!this.currentPool) {
-      throw new Error('No database connection. Please switch to a server and database first.');
+      throw new Error(
+        "No database connection. Please switch to a server and database first."
+      );
     }
     return this.currentPool.connect();
   }
@@ -393,6 +424,119 @@ export class DatabaseManager {
     }
   }
 
+  /**
+   * Invalidates the current connection without clearing the connection state.
+   * This allows for automatic reconnection using the stored server/database/schema.
+   */
+  public async invalidateConnection(): Promise<void> {
+    if (this.currentPool) {
+      try {
+        await this.currentPool.end();
+      } catch (error) {
+        console.error("Error closing pool during invalidation:", error);
+      }
+      this.currentPool = null;
+    }
+  }
+
+  /**
+   * Reconnects to the current server/database/schema.
+   * Uses the stored connection state to re-establish the connection.
+   * @returns true if reconnection was successful, false otherwise
+   */
+  public async reconnect(): Promise<boolean> {
+    const { currentServer, currentDatabase, currentSchema } =
+      this.connectionState;
+
+    if (!currentServer) {
+      console.error("Cannot reconnect: no server was previously connected");
+      return false;
+    }
+
+    try {
+      // Invalidate first to ensure clean state
+      await this.invalidateConnection();
+
+      // Reconnect with stored state
+      await this.switchServer(
+        currentServer,
+        currentDatabase || undefined,
+        currentSchema || undefined
+      );
+      console.error(
+        `Reconnected to server '${currentServer}', database '${currentDatabase}'`
+      );
+      return true;
+    } catch (error) {
+      console.error(
+        `Failed to reconnect: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Checks if an error indicates a stale/broken connection that should trigger reconnection.
+   */
+  public static isConnectionError(error: any): boolean {
+    if (!error) return false;
+
+    const errorMessage = error.message || String(error);
+    const errorCode = error.code || "";
+
+    // Common connection error patterns
+    const connectionErrorPatterns = [
+      "Connection terminated",
+      "connection terminated",
+      "ECONNRESET",
+      "ECONNREFUSED",
+      "ETIMEDOUT",
+      "EPIPE",
+      "read ECONNRESET",
+      "write ECONNRESET",
+      "Client has encountered a connection error",
+      "Connection lost",
+      "Connection refused",
+      "server closed the connection unexpectedly",
+      "terminating connection due to administrator command",
+      "SSL connection has been closed unexpectedly",
+      "could not connect to server",
+      "the database system is starting up",
+      "the database system is shutting down",
+      "no connection to the server",
+      "server conn crashed",
+      "database removed",
+    ];
+
+    // Check error codes
+    const connectionErrorCodes = [
+      "57P01", // admin_shutdown
+      "57P02", // crash_shutdown
+      "57P03", // cannot_connect_now
+      "08000", // connection_exception
+      "08003", // connection_does_not_exist
+      "08006", // connection_failure
+      "08001", // sqlclient_unable_to_establish_sqlconnection
+      "08004", // sqlserver_rejected_establishment_of_sqlconnection
+    ];
+
+    // Check if error message matches any pattern
+    for (const pattern of connectionErrorPatterns) {
+      if (errorMessage.toLowerCase().includes(pattern.toLowerCase())) {
+        return true;
+      }
+    }
+
+    // Check if error code matches
+    if (connectionErrorCodes.includes(errorCode)) {
+      return true;
+    }
+
+    return false;
+  }
+
   public isReadOnly(): boolean {
     return this.readOnlyMode;
   }
@@ -402,7 +546,10 @@ export class DatabaseManager {
   }
 
   public setQueryTimeout(timeoutMs: number): void {
-    this.queryTimeoutMs = Math.min(Math.max(1000, timeoutMs), MAX_QUERY_TIMEOUT_MS);
+    this.queryTimeoutMs = Math.min(
+      Math.max(1000, timeoutMs),
+      MAX_QUERY_TIMEOUT_MS
+    );
   }
 }
 
@@ -419,7 +566,9 @@ export function getDbManager(): DatabaseManager {
   if (!dbManager) {
     const readOnlyMode = getAccessModeFromEnv();
     dbManager = new DatabaseManager(readOnlyMode);
-    console.error(`PostgreSQL MCP: Access mode = ${readOnlyMode ? 'readonly' : 'full'}`);
+    console.error(
+      `PostgreSQL MCP: Access mode = ${readOnlyMode ? "readonly" : "full"}`
+    );
   }
   return dbManager;
 }

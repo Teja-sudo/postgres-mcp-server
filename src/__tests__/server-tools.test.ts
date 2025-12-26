@@ -4,8 +4,6 @@ import { resetDbManager } from '../db-manager.js';
 
 interface ServerInfo {
   name: string;
-  host: string;
-  port: string;
   isConnected: boolean;
   isDefault: boolean;
   defaultDatabase?: string;
@@ -62,18 +60,6 @@ describe('Server Tools', () => {
       expect(result.servers.map((s: ServerInfo) => s.name)).not.toContain('prod');
     });
 
-    it('should filter servers by host', async () => {
-      process.env.POSTGRES_SERVERS = JSON.stringify({
-        server1: { host: 'us-east.example.com', port: '5432', username: 'user', password: 'pass' },
-        server2: { host: 'us-west.example.com', port: '5432', username: 'user', password: 'pass' },
-        server3: { host: 'eu.example.com', port: '5432', username: 'user', password: 'pass' }
-      });
-
-      const result = await listServers({ filter: 'us-' });
-
-      expect(result.servers).toHaveLength(2);
-    });
-
     it('should show server connection status', async () => {
       process.env.POSTGRES_SERVERS = JSON.stringify({
         dev: { host: 'localhost', port: '5432', username: 'user', password: 'pass' }
@@ -84,14 +70,18 @@ describe('Server Tools', () => {
       expect(result.servers[0].isConnected).toBe(false);
     });
 
-    it('should use default port when not specified', async () => {
+    it('should not expose host or port in response', async () => {
       process.env.POSTGRES_SERVERS = JSON.stringify({
-        dev: { host: 'localhost', username: 'user', password: 'pass' }
+        dev: { host: 'secret.example.com', port: '5432', username: 'user', password: 'pass' }
       });
 
       const result = await listServers({});
 
-      expect(result.servers[0].port).toBe('5432');
+      // Verify host and port are not exposed
+      expect(result.servers[0]).not.toHaveProperty('host');
+      expect(result.servers[0]).not.toHaveProperty('port');
+      expect(result.servers[0]).toHaveProperty('name');
+      expect(result.servers[0]).toHaveProperty('isConnected');
     });
   });
 

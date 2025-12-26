@@ -14,19 +14,32 @@ import {
   listObjects,
   getObjectDetails,
   executeSql,
+  executeSqlFile,
   explainQuery,
   getTopQueries,
   analyzeWorkloadIndexes,
   analyzeQueryIndexes,
   analyzeDbHealth,
 } from "./tools/index.js";
-import { maskResponseData } from "./utils/index.js";
+import { withConnectionRetry } from "./utils/index.js";
+
+// Wrap tools that require active database connection with auto-retry logic
+const listSchemasWithRetry = withConnectionRetry(listSchemas);
+const listObjectsWithRetry = withConnectionRetry(listObjects);
+const getObjectDetailsWithRetry = withConnectionRetry(getObjectDetails);
+const executeSqlWithRetry = withConnectionRetry(executeSql);
+const executeSqlFileWithRetry = withConnectionRetry(executeSqlFile);
+const explainQueryWithRetry = withConnectionRetry(explainQuery);
+const getTopQueriesWithRetry = withConnectionRetry(getTopQueries);
+const analyzeWorkloadIndexesWithRetry = withConnectionRetry(analyzeWorkloadIndexes);
+const analyzeQueryIndexesWithRetry = withConnectionRetry(analyzeQueryIndexes);
+const analyzeDbHealthWithRetry = withConnectionRetry(async () => analyzeDbHealth());
 
 // Create MCP server using the new high-level API
 const server = new McpServer(
   {
     name: "postgres-mcp-server",
-    version: "1.6.0",
+    version: "1.7.0",
   },
   {
     capabilities: {
@@ -41,17 +54,17 @@ server.registerTool(
   "list_servers",
   {
     description:
-      "List all configured PostgreSQL servers. Call this FIRST to discover available server names before using list_databases or switch_server_db. Returns server names, hosts, ports, and connection status.",
+      "List all configured PostgreSQL servers. Call this FIRST to discover available server names before using list_databases or switch_server_db. Returns server names and connection status.",
     inputSchema: z.object({
       filter: z
         .string()
         .optional()
-        .describe("Filter servers by name or host (case-insensitive partial match)"),
+        .describe("Filter servers by name (case-insensitive partial match)"),
     }),
   },
   async (args) => {
     const result = await listServers(args);
-    return { content: [{ type: "text", text: JSON.stringify(maskResponseData(result), null, 2) }] };
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );
 
@@ -113,12 +126,12 @@ server.registerTool(
   "get_current_connection",
   {
     description:
-      "Get current connection status. Returns server, database, schema, host, port, and access mode (readonly/full). Call this to verify your connection before running queries.",
+      "Get current connection status. Returns server name, database, schema, and access mode (readonly/full). Call this to verify your connection before running queries.",
     inputSchema: z.object({}),
   },
   async () => {
     const result = await getCurrentConnection();
-    return { content: [{ type: "text", text: JSON.stringify(maskResponseData(result), null, 2) }] };
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );
 
@@ -136,7 +149,7 @@ server.registerTool(
     }),
   },
   async (args) => {
-    const result = await listSchemas(args);
+    const result = await listSchemasWithRetry(args);
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );
@@ -160,7 +173,7 @@ server.registerTool(
     }),
   },
   async (args) => {
-    const result = await listObjects(args);
+    const result = await listObjectsWithRetry(args);
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );
@@ -180,7 +193,7 @@ server.registerTool(
     }),
   },
   async (args) => {
-    const result = await getObjectDetails(args);
+    const result = await getObjectDetailsWithRetry(args);
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );
@@ -216,7 +229,7 @@ server.registerTool(
     }),
   },
   async (args) => {
-    const result = await executeSql(args);
+    const result = await executeSqlWithRetry(args);
     // Special handling for large output
     if (result.outputFile) {
       return {
@@ -238,6 +251,33 @@ server.registerTool(
         ],
       };
     }
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "execute_sql_file",
+  {
+    description:
+      "Execute a .sql file from the filesystem. Useful for running migration scripts, schema changes, or data imports. Supports transaction mode for atomic execution. Max file size: 50MB. Returns detailed error info when stopOnError=false.",
+    inputSchema: z.object({
+      filePath: z
+        .string()
+        .describe("Absolute or relative path to the .sql file to execute"),
+      useTransaction: z
+        .boolean()
+        .optional()
+        .default(true)
+        .describe("Wrap execution in a transaction (default: true). If any statement fails, all changes are rolled back."),
+      stopOnError: z
+        .boolean()
+        .optional()
+        .default(true)
+        .describe("Stop execution on first error (default: true). If false, continues with remaining statements."),
+    }),
+  },
+  async (args) => {
+    const result = await executeSqlFileWithRetry(args);
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );
@@ -277,7 +317,7 @@ server.registerTool(
     }),
   },
   async (args) => {
-    const result = await explainQuery(args);
+    const result = await explainQueryWithRetry(args);
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );
@@ -306,7 +346,7 @@ server.registerTool(
     }),
   },
   async (args) => {
-    const result = await getTopQueries(args);
+    const result = await getTopQueriesWithRetry(args);
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );
@@ -330,7 +370,7 @@ server.registerTool(
     }),
   },
   async (args) => {
-    const result = await analyzeWorkloadIndexes(args);
+    const result = await analyzeWorkloadIndexesWithRetry(args);
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );
@@ -348,7 +388,7 @@ server.registerTool(
     }),
   },
   async (args) => {
-    const result = await analyzeQueryIndexes(args);
+    const result = await analyzeQueryIndexesWithRetry(args);
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );
@@ -361,7 +401,7 @@ server.registerTool(
     inputSchema: z.object({}),
   },
   async () => {
-    const result = await analyzeDbHealth();
+    const result = await analyzeDbHealthWithRetry();
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );

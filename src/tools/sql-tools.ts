@@ -11,6 +11,7 @@ const MAX_ROWS_DEFAULT = 1000; // Default max rows in direct response
 const MAX_ROWS_LIMIT = 100000; // Absolute maximum rows
 const DEFAULT_SQL_LENGTH_LIMIT = 100000; // Default SQL query length limit (100KB)
 const MAX_PARAMS = 100; // Maximum number of query parameters
+const MAX_SQL_FILE_SIZE = 50 * 1024 * 1024; // Maximum SQL file size (50MB)
 
 export async function executeSql(args: {
   sql: string;
@@ -251,4 +252,297 @@ export async function explainQuery(args: {
   } finally {
     client.release();
   }
+}
+
+/**
+ * Individual statement error when stopOnError is false
+ */
+export interface StatementError {
+  statementIndex: number;
+  sql: string;
+  error: string;
+}
+
+/**
+ * Result of executing a SQL file
+ */
+export interface ExecuteSqlFileResult {
+  success: boolean;
+  filePath: string;
+  fileSize: number;
+  totalStatements: number;
+  statementsExecuted: number;
+  statementsFailed: number;
+  executionTimeMs: number;
+  rowsAffected?: number;
+  error?: string;
+  errors?: StatementError[];
+  rollback?: boolean;
+}
+
+/**
+ * Execute a SQL file from the filesystem.
+ * Supports transaction mode for atomic execution.
+ */
+export async function executeSqlFile(args: {
+  filePath: string;
+  useTransaction?: boolean;
+  stopOnError?: boolean;
+}): Promise<ExecuteSqlFileResult> {
+  // Validate file path
+  if (!args.filePath || typeof args.filePath !== 'string') {
+    throw new Error('filePath parameter is required');
+  }
+
+  const filePath = args.filePath.trim();
+
+  // Security: Validate file extension
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext !== '.sql') {
+    throw new Error('Only .sql files are allowed');
+  }
+
+  // Security: Prevent path traversal attacks
+  const resolvedPath = path.resolve(filePath);
+
+  // Check file exists
+  if (!fs.existsSync(resolvedPath)) {
+    throw new Error(`File not found: ${filePath}`);
+  }
+
+  // Check file stats
+  const stats = fs.statSync(resolvedPath);
+  if (!stats.isFile()) {
+    throw new Error(`Not a file: ${filePath}`);
+  }
+
+  if (stats.size > MAX_SQL_FILE_SIZE) {
+    throw new Error(`File too large. Maximum size is ${MAX_SQL_FILE_SIZE / (1024 * 1024)}MB`);
+  }
+
+  if (stats.size === 0) {
+    throw new Error('File is empty');
+  }
+
+  // Read file content
+  const sqlContent = fs.readFileSync(resolvedPath, 'utf-8');
+
+  const dbManager = getDbManager();
+  const useTransaction = args.useTransaction !== false; // Default to true
+  const stopOnError = args.stopOnError !== false; // Default to true
+
+  const startTime = process.hrtime.bigint();
+  const client = await dbManager.getClient();
+
+  let statementsExecuted = 0;
+  let statementsFailed = 0;
+  let totalRowsAffected = 0;
+  let rolledBack = false;
+  const collectedErrors: StatementError[] = [];
+
+  // Split SQL into statements first to get total count
+  const statements = splitSqlStatements(sqlContent);
+  const executableStatements = statements.filter(s => {
+    const trimmed = s.trim();
+    return trimmed && !trimmed.startsWith('--');
+  });
+  const totalStatements = executableStatements.length;
+
+  try {
+    if (useTransaction) {
+      await client.query('BEGIN');
+    }
+
+    let statementIndex = 0;
+    for (const statement of statements) {
+      const trimmed = statement.trim();
+      if (!trimmed || trimmed.startsWith('--')) {
+        continue; // Skip empty statements and comments
+      }
+
+      statementIndex++;
+
+      try {
+        const result = await client.query(trimmed);
+        statementsExecuted++;
+        if (result.rowCount !== null) {
+          totalRowsAffected += result.rowCount;
+        }
+      } catch (error) {
+        statementsFailed++;
+        const errorMessage = error instanceof Error ? error.message : String(error);
+
+        if (stopOnError) {
+          if (useTransaction) {
+            await client.query('ROLLBACK');
+            rolledBack = true;
+          }
+          // Add the error to collection before throwing
+          collectedErrors.push({
+            statementIndex,
+            sql: trimmed.length > 200 ? trimmed.substring(0, 200) + '...' : trimmed,
+            error: errorMessage
+          });
+          throw error;
+        }
+
+        // If stopOnError is false, collect error and continue
+        collectedErrors.push({
+          statementIndex,
+          sql: trimmed.length > 200 ? trimmed.substring(0, 200) + '...' : trimmed,
+          error: errorMessage
+        });
+        console.error(`Warning: Statement ${statementIndex} failed: ${errorMessage}`);
+      }
+    }
+
+    if (useTransaction && !rolledBack) {
+      await client.query('COMMIT');
+    }
+
+    const endTime = process.hrtime.bigint();
+    const executionTimeMs = Number(endTime - startTime) / 1_000_000;
+
+    const result: ExecuteSqlFileResult = {
+      success: statementsFailed === 0,
+      filePath: resolvedPath,
+      fileSize: stats.size,
+      totalStatements,
+      statementsExecuted,
+      statementsFailed,
+      executionTimeMs: Math.round(executionTimeMs * 100) / 100,
+      rowsAffected: totalRowsAffected
+    };
+
+    // Include errors array if there were any failures (when stopOnError=false)
+    if (collectedErrors.length > 0) {
+      result.errors = collectedErrors;
+    }
+
+    return result;
+
+  } catch (error) {
+    const endTime = process.hrtime.bigint();
+    const executionTimeMs = Number(endTime - startTime) / 1_000_000;
+
+    const result: ExecuteSqlFileResult = {
+      success: false,
+      filePath: resolvedPath,
+      fileSize: stats.size,
+      totalStatements,
+      statementsExecuted,
+      statementsFailed,
+      executionTimeMs: Math.round(executionTimeMs * 100) / 100,
+      rowsAffected: totalRowsAffected,
+      error: error instanceof Error ? error.message : String(error),
+      rollback: rolledBack
+    };
+
+    if (collectedErrors.length > 0) {
+      result.errors = collectedErrors;
+    }
+
+    return result;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Split SQL content into individual statements.
+ * Handles basic cases like semicolons, comments, and string literals.
+ */
+function splitSqlStatements(sql: string): string[] {
+  const statements: string[] = [];
+  let current = '';
+  let inString = false;
+  let stringChar = '';
+  let inLineComment = false;
+  let inBlockComment = false;
+  let i = 0;
+
+  while (i < sql.length) {
+    const char = sql[i];
+    const nextChar = sql[i + 1] || '';
+
+    // Handle line comments
+    if (!inString && !inBlockComment && char === '-' && nextChar === '-') {
+      inLineComment = true;
+      current += char;
+      i++;
+      continue;
+    }
+
+    if (inLineComment && (char === '\n' || char === '\r')) {
+      inLineComment = false;
+      current += char;
+      i++;
+      continue;
+    }
+
+    // Handle block comments
+    if (!inString && !inLineComment && char === '/' && nextChar === '*') {
+      inBlockComment = true;
+      current += char + nextChar;
+      i += 2;
+      continue;
+    }
+
+    if (inBlockComment && char === '*' && nextChar === '/') {
+      inBlockComment = false;
+      current += char + nextChar;
+      i += 2;
+      continue;
+    }
+
+    // Handle string literals
+    if (!inLineComment && !inBlockComment && (char === "'" || char === '"')) {
+      if (!inString) {
+        inString = true;
+        stringChar = char;
+      } else if (char === stringChar) {
+        // Check for escaped quote (doubled)
+        if (nextChar === stringChar) {
+          current += char + nextChar;
+          i += 2;
+          continue;
+        }
+        inString = false;
+        stringChar = '';
+      }
+    }
+
+    // Handle dollar-quoted strings (PostgreSQL specific)
+    if (!inString && !inLineComment && !inBlockComment && char === '$') {
+      const dollarMatch = sql.slice(i).match(/^(\$[a-zA-Z0-9_]*\$)/);
+      if (dollarMatch) {
+        const dollarTag = dollarMatch[1];
+        const endIndex = sql.indexOf(dollarTag, i + dollarTag.length);
+        if (endIndex !== -1) {
+          current += sql.slice(i, endIndex + dollarTag.length);
+          i = endIndex + dollarTag.length;
+          continue;
+        }
+      }
+    }
+
+    // Handle statement separator
+    if (!inString && !inLineComment && !inBlockComment && char === ';') {
+      current += char;
+      statements.push(current.trim());
+      current = '';
+      i++;
+      continue;
+    }
+
+    current += char;
+    i++;
+  }
+
+  // Add remaining content if any
+  if (current.trim()) {
+    statements.push(current.trim());
+  }
+
+  return statements.filter(s => s.length > 0);
 }

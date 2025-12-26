@@ -199,10 +199,12 @@ Lists all configured PostgreSQL servers. Returns server names, hosts, ports, and
 
 **Returns:**
 
-- `servers`: Array of server information (name, host, port, isConnected, isDefault)
+- `servers`: Array of server information (name, isConnected, isDefault, defaultDatabase, defaultSchema)
 - `currentServer`: Currently connected server name (or null)
 - `currentDatabase`: Currently connected database (or null)
 - `currentSchema`: Current schema (or null)
+
+**Note:** Host and port are intentionally hidden from responses for security.
 
 #### `list_databases`
 
@@ -233,7 +235,7 @@ Switch to a different PostgreSQL server and optionally a specific database and s
 
 #### `get_current_connection`
 
-Returns details about the current database connection including server, database, schema, host, port, and access mode.
+Returns details about the current database connection including server, database, schema, and access mode.
 
 **Parameters:** None
 
@@ -243,8 +245,6 @@ Returns details about the current database connection including server, database
 - `server`: Current server name
 - `database`: Current database name
 - `schema`: Current schema name
-- `host`: Server hostname
-- `port`: Server port
 - `accessMode`: "readonly" or "full"
 
 ### Schema & Object Exploration
@@ -302,6 +302,34 @@ Executes SQL statements on the database. Supports pagination and parameterized q
 - `outputFile`: (Only if output is too large) Path to temp file with full results
 
 **Note:** Large outputs are automatically written to a temp file, and the file path is returned. This prevents token wastage when dealing with large result sets.
+
+#### `execute_sql_file`
+
+Executes a `.sql` file from the filesystem. Useful for running migration scripts, schema changes, or data imports.
+
+**Parameters:**
+
+- `filePath` (required): Absolute or relative path to the `.sql` file to execute
+- `useTransaction` (optional): Wrap execution in a transaction (default: true). If any statement fails, all changes are rolled back.
+- `stopOnError` (optional): Stop execution on first error (default: true). If false, continues with remaining statements and collects all errors.
+
+**Returns:**
+
+- `success`: Whether all statements executed successfully
+- `filePath`: Resolved file path
+- `fileSize`: File size in bytes
+- `totalStatements`: Total executable statements in the file
+- `statementsExecuted`: Number of successfully executed statements
+- `statementsFailed`: Number of failed statements
+- `executionTimeMs`: Total execution time in milliseconds
+- `rowsAffected`: Total rows affected by all statements
+- `errors`: (When stopOnError=false) Array of error details:
+  - `statementIndex`: Which statement failed (1-based)
+  - `sql`: The failing SQL (truncated to 200 chars)
+  - `error`: Error message
+- `rollback`: Whether a rollback was performed
+
+**Limits:** Max file size: 50MB. Supports PostgreSQL-specific syntax including dollar-quoted strings and block comments.
 
 #### `explain_query`
 
@@ -395,6 +423,37 @@ Performs comprehensive database health checks including:
 3. Take action on recommendations
 ```
 
+### Execute SQL Migration File
+
+```
+1. Use execute_sql_file with filePath="/path/to/migration.sql"
+2. By default, runs in a transaction - all changes rolled back on error
+3. Set stopOnError=false to continue on errors and get a full report
+4. Set useTransaction=false for DDL statements that can't run in transactions
+```
+
+## Features
+
+### Auto-Reconnect on Connection Errors
+
+The server automatically handles stale database connections. When a connection error occurs (e.g., server went inactive, connection reset, timeout), the server will:
+
+1. Detect the connection error
+2. Invalidate the stale connection
+3. Automatically reconnect using the stored server/database/schema
+4. Retry the operation once
+
+This is particularly useful for:
+- Staging/development servers that go idle
+- Cloud databases with connection timeouts
+- Network interruptions
+
+Supported error patterns include: `Connection terminated`, `ECONNRESET`, `ETIMEDOUT`, `server closed the connection unexpectedly`, and PostgreSQL error codes like `57P01` (admin_shutdown), `08003` (connection_does_not_exist), etc.
+
+### Hidden Connection Details
+
+Host URLs, ports, and credentials are never exposed in tool responses. Only server names (aliases) are visible, preventing accidental exposure of infrastructure details.
+
 ## Security
 
 - **Access Mode**: By default, the server runs in **full access mode**. Set `POSTGRES_ACCESS_MODE=readonly` to prevent write operations (INSERT, UPDATE, DELETE, DROP, etc.). Recommended for production environments.
@@ -402,6 +461,7 @@ Performs comprehensive database health checks including:
 - **Query Timeout**: Default 30-second timeout prevents runaway queries.
 - **Credentials**: Managed via environment variables and never logged or exposed through the MCP interface.
 - **File Permissions**: Large output files are created with restricted permissions (0600).
+- **Hidden Infrastructure**: Host URLs, ports, and passwords are never included in tool responses.
 
 ## Requirements
 
