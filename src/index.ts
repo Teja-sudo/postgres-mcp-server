@@ -20,6 +20,7 @@ import {
   analyzeQueryIndexes,
   analyzeDbHealth,
 } from "./tools/index.js";
+import { maskResponseData } from "./utils/index.js";
 
 // Create MCP server using the new high-level API
 const server = new McpServer(
@@ -50,7 +51,7 @@ server.registerTool(
   },
   async (args) => {
     const result = await listServers(args);
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    return { content: [{ type: "text", text: JSON.stringify(maskResponseData(result), null, 2) }] };
   }
 );
 
@@ -117,7 +118,7 @@ server.registerTool(
   },
   async () => {
     const result = await getCurrentConnection();
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    return { content: [{ type: "text", text: JSON.stringify(maskResponseData(result), null, 2) }] };
   }
 );
 
