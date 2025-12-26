@@ -356,8 +356,15 @@ export async function executeSqlFile(args: {
     let statementIndex = 0;
     for (const statement of statements) {
       const trimmed = statement.trim();
-      if (!trimmed || trimmed.startsWith('--')) {
-        continue; // Skip empty statements and comments
+      // Skip empty statements
+      if (!trimmed) {
+        continue;
+      }
+
+      // Skip pure comment-only statements (just -- comments with no SQL after)
+      const withoutComments = stripLeadingComments(trimmed);
+      if (!withoutComments) {
+        continue;
       }
 
       statementIndex++;
@@ -446,6 +453,41 @@ export async function executeSqlFile(args: {
   } finally {
     client.release();
   }
+}
+
+/**
+ * Strips leading line comments and block comments from SQL to check if there's actual SQL.
+ * Returns empty string if the entire content is just comments.
+ */
+function stripLeadingComments(sql: string): string {
+  let result = sql.trim();
+
+  while (result.length > 0) {
+    // Strip leading line comments
+    if (result.startsWith('--')) {
+      const newlineIndex = result.indexOf('\n');
+      if (newlineIndex === -1) {
+        return ''; // Entire string is a line comment
+      }
+      result = result.substring(newlineIndex + 1).trim();
+      continue;
+    }
+
+    // Strip leading block comments
+    if (result.startsWith('/*')) {
+      const endIndex = result.indexOf('*/');
+      if (endIndex === -1) {
+        return ''; // Unclosed block comment
+      }
+      result = result.substring(endIndex + 2).trim();
+      continue;
+    }
+
+    // No more leading comments
+    break;
+  }
+
+  return result;
 }
 
 /**

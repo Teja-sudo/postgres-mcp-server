@@ -20,11 +20,13 @@ jest.unstable_mockModule('../db-manager.js', () => ({
 // Dynamic import after mock
 let executeSql: any;
 let explainQuery: any;
+let executeSqlFile: any;
 
 beforeAll(async () => {
   const module = await import('../tools/sql-tools.js');
   executeSql = module.executeSql;
   explainQuery = module.explainQuery;
+  executeSqlFile = module.executeSqlFile;
 });
 
 describe('SQL Tools', () => {
@@ -350,6 +352,202 @@ describe('SQL Tools', () => {
         );
         expect(hypopgCall).toBeDefined();
       });
+    });
+  });
+
+  describe('executeSqlFile', () => {
+    let mockClient: { query: MockFn; release: MockFn };
+    const testDir = '/tmp/postgres-mcp-test';
+    const testFile = `${testDir}/test.sql`;
+
+    beforeEach(() => {
+      mockClient = {
+        query: jest.fn<MockFn>(),
+        release: jest.fn<MockFn>()
+      };
+      mockGetClient.mockResolvedValue(mockClient);
+
+      // Create test directory
+      if (!fs.existsSync(testDir)) {
+        fs.mkdirSync(testDir, { recursive: true });
+      }
+    });
+
+    afterEach(() => {
+      // Clean up test files
+      if (fs.existsSync(testFile)) {
+        fs.unlinkSync(testFile);
+      }
+    });
+
+    it('should require filePath parameter', async () => {
+      await expect(executeSqlFile({ filePath: '' }))
+        .rejects.toThrow('filePath parameter is required');
+    });
+
+    it('should only allow .sql files', async () => {
+      await expect(executeSqlFile({ filePath: '/path/to/file.txt' }))
+        .rejects.toThrow('Only .sql files are allowed');
+
+      await expect(executeSqlFile({ filePath: '/path/to/file.js' }))
+        .rejects.toThrow('Only .sql files are allowed');
+    });
+
+    it('should throw if file does not exist', async () => {
+      await expect(executeSqlFile({ filePath: '/nonexistent/path/file.sql' }))
+        .rejects.toThrow('File not found');
+    });
+
+    it('should throw if file is empty', async () => {
+      fs.writeFileSync(testFile, '');
+
+      await expect(executeSqlFile({ filePath: testFile }))
+        .rejects.toThrow('File is empty');
+    });
+
+    it('should execute single statement successfully', async () => {
+      fs.writeFileSync(testFile, 'SELECT 1;');
+      mockClient.query
+        .mockResolvedValueOnce({}) // BEGIN
+        .mockResolvedValueOnce({ rowCount: 1 }) // SELECT 1
+        .mockResolvedValueOnce({}); // COMMIT
+
+      const result = await executeSqlFile({ filePath: testFile });
+
+      expect(result.success).toBe(true);
+      expect(result.statementsExecuted).toBe(1);
+      expect(result.statementsFailed).toBe(0);
+      expect(result.executionTimeMs).toBeGreaterThanOrEqual(0);
+      expect(mockClient.release).toHaveBeenCalled();
+    });
+
+    it('should execute multiple statements', async () => {
+      fs.writeFileSync(testFile, 'SELECT 1; SELECT 2; SELECT 3;');
+      mockClient.query
+        .mockResolvedValueOnce({}) // BEGIN
+        .mockResolvedValueOnce({ rowCount: 1 }) // SELECT 1
+        .mockResolvedValueOnce({ rowCount: 1 }) // SELECT 2
+        .mockResolvedValueOnce({ rowCount: 1 }) // SELECT 3
+        .mockResolvedValueOnce({}); // COMMIT
+
+      const result = await executeSqlFile({ filePath: testFile });
+
+      expect(result.success).toBe(true);
+      expect(result.statementsExecuted).toBe(3);
+      expect(result.totalStatements).toBe(3);
+    });
+
+    it('should rollback on error with useTransaction=true', async () => {
+      fs.writeFileSync(testFile, 'SELECT 1; INVALID SQL; SELECT 3;');
+      mockClient.query
+        .mockResolvedValueOnce({}) // BEGIN
+        .mockResolvedValueOnce({ rowCount: 1 }) // SELECT 1
+        .mockRejectedValueOnce(new Error('syntax error')) // INVALID SQL
+        .mockResolvedValueOnce({}); // ROLLBACK
+
+      const result = await executeSqlFile({ filePath: testFile });
+
+      expect(result.success).toBe(false);
+      expect(result.statementsExecuted).toBe(1);
+      expect(result.statementsFailed).toBe(1);
+      expect(result.error).toContain('syntax error');
+      expect(result.rollback).toBe(true);
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].statementIndex).toBe(2);
+    });
+
+    it('should continue on error with stopOnError=false', async () => {
+      fs.writeFileSync(testFile, 'SELECT 1; INVALID SQL; SELECT 3;');
+      mockClient.query
+        .mockResolvedValueOnce({}) // BEGIN
+        .mockResolvedValueOnce({ rowCount: 1 }) // SELECT 1
+        .mockRejectedValueOnce(new Error('syntax error')) // INVALID SQL
+        .mockResolvedValueOnce({ rowCount: 1 }) // SELECT 3
+        .mockResolvedValueOnce({}); // COMMIT
+
+      const result = await executeSqlFile({ filePath: testFile, stopOnError: false });
+
+      expect(result.success).toBe(false); // Not success because there was a failure
+      expect(result.statementsExecuted).toBe(2);
+      expect(result.statementsFailed).toBe(1);
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].statementIndex).toBe(2);
+      expect(result.errors[0].error).toContain('syntax error');
+    });
+
+    it('should skip transaction with useTransaction=false', async () => {
+      fs.writeFileSync(testFile, 'SELECT 1;');
+      mockClient.query.mockResolvedValue({ rowCount: 1 });
+
+      await executeSqlFile({ filePath: testFile, useTransaction: false });
+
+      // Verify no BEGIN/COMMIT calls
+      const calls = mockClient.query.mock.calls.map((c: unknown[]) => c[0]);
+      expect(calls).not.toContain('BEGIN');
+      expect(calls).not.toContain('COMMIT');
+    });
+
+    it('should handle comments correctly', async () => {
+      fs.writeFileSync(testFile, `
+        -- This is a comment
+        SELECT 1;
+        /* Block comment */
+        SELECT 2;
+      `);
+      mockClient.query
+        .mockResolvedValueOnce({}) // BEGIN
+        .mockResolvedValueOnce({ rowCount: 1 }) // SELECT 1
+        .mockResolvedValueOnce({ rowCount: 1 }) // SELECT 2
+        .mockResolvedValueOnce({}); // COMMIT
+
+      const result = await executeSqlFile({ filePath: testFile });
+
+      expect(result.success).toBe(true);
+      expect(result.statementsExecuted).toBe(2);
+    });
+
+    it('should handle dollar-quoted strings', async () => {
+      fs.writeFileSync(testFile, `
+        SELECT $tag$This has a ; semicolon$tag$;
+        SELECT 2;
+      `);
+      mockClient.query
+        .mockResolvedValueOnce({}) // BEGIN
+        .mockResolvedValueOnce({ rowCount: 1 }) // First SELECT
+        .mockResolvedValueOnce({ rowCount: 1 }) // SELECT 2
+        .mockResolvedValueOnce({}); // COMMIT
+
+      const result = await executeSqlFile({ filePath: testFile });
+
+      expect(result.success).toBe(true);
+      expect(result.statementsExecuted).toBe(2);
+    });
+
+    it('should return file info in result', async () => {
+      const content = 'SELECT 1;';
+      fs.writeFileSync(testFile, content);
+      mockClient.query
+        .mockResolvedValueOnce({}) // BEGIN
+        .mockResolvedValueOnce({ rowCount: 1 }) // SELECT 1
+        .mockResolvedValueOnce({}); // COMMIT
+
+      const result = await executeSqlFile({ filePath: testFile });
+
+      expect(result.filePath).toContain('test.sql');
+      expect(result.fileSize).toBe(content.length);
+    });
+
+    it('should release client even on error', async () => {
+      fs.writeFileSync(testFile, 'SELECT 1;');
+      mockClient.query.mockRejectedValue(new Error('Connection error'));
+
+      try {
+        await executeSqlFile({ filePath: testFile });
+      } catch (e) {
+        // Expected
+      }
+
+      expect(mockClient.release).toHaveBeenCalled();
     });
   });
 });
