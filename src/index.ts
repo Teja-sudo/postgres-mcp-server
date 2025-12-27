@@ -22,6 +22,12 @@ import {
   analyzeDbHealth,
   mutationPreview,
   batchExecute,
+  beginTransaction,
+  commitTransaction,
+  rollbackTransaction,
+  getConnectionContext,
+  getTransactionInfo,
+  listActiveTransactions,
 } from "./tools/index.js";
 import { withConnectionRetry } from "./utils/index.js";
 
@@ -38,12 +44,27 @@ const analyzeQueryIndexesWithRetry = withConnectionRetry(analyzeQueryIndexes);
 const analyzeDbHealthWithRetry = withConnectionRetry(async () => analyzeDbHealth());
 const mutationPreviewWithRetry = withConnectionRetry(mutationPreview);
 const batchExecuteWithRetry = withConnectionRetry(batchExecute);
+const beginTransactionWithRetry = withConnectionRetry(beginTransaction);
+const commitTransactionWithRetry = withConnectionRetry(commitTransaction);
+const rollbackTransactionWithRetry = withConnectionRetry(rollbackTransaction);
+const getTransactionInfoWithRetry = withConnectionRetry(getTransactionInfo);
+const listActiveTransactionsWithRetry = withConnectionRetry(listActiveTransactions);
+
+/**
+ * Helper to add connection context to any result
+ */
+function withContext<T>(result: T): T & { connection: ReturnType<typeof getConnectionContext> } {
+  return {
+    ...result,
+    connection: getConnectionContext()
+  };
+}
 
 // Create MCP server using the new high-level API
 const server = new McpServer(
   {
     name: "postgres-mcp-server",
-    version: "1.8.0",
+    version: "1.9.0",
   },
   {
     capabilities: {
@@ -206,15 +227,15 @@ server.registerTool(
   "execute_sql",
   {
     description:
-      "Execute SQL queries. Supports SELECT, INSERT, UPDATE, DELETE (if not in readonly mode). Use $1, $2 placeholders with params array to prevent SQL injection. Returns rows, execution time, and pagination info. Use includeSchemaHint for table context.",
+      "Execute SQL queries. Supports SELECT, INSERT, UPDATE, DELETE (if not in readonly mode). Use $1, $2 placeholders with params array to prevent SQL injection. Use allowMultipleStatements to run multiple statements separated by semicolons. Use transactionId to run within a transaction.",
     inputSchema: z.object({
       sql: z
         .string()
-        .describe("SQL statement. Use $1, $2, etc. for parameterized queries."),
+        .describe("SQL statement(s). Use $1, $2, etc. for parameterized queries."),
       params: z
         .array(z.any())
         .optional()
-        .describe("Parameters for $1, $2, etc. placeholders (e.g., [123, 'value'])"),
+        .describe("Parameters for $1, $2, etc. placeholders (e.g., [123, 'value']). Not supported with allowMultipleStatements."),
       maxRows: z
         .number()
         .optional()
@@ -234,25 +255,34 @@ server.registerTool(
         .boolean()
         .optional()
         .default(false)
-        .describe("Include schema info (columns, PKs, FKs) for tables in the query. Helps understand table structure."),
+        .describe("Include schema info (columns, PKs, FKs) for tables in the query."),
+      allowMultipleStatements: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Allow multiple SQL statements separated by semicolons. Returns results for each statement."),
+      transactionId: z
+        .string()
+        .optional()
+        .describe("Execute within an active transaction. Get this from begin_transaction."),
     }),
   },
   async (args) => {
     const result = await executeSqlWithRetry(args);
-    // Special handling for large output
-    if (result.outputFile) {
+    // Special handling for large output (single statement mode)
+    if ('outputFile' in result && result.outputFile) {
       return {
         content: [
           {
             type: "text",
             text: JSON.stringify(
-              {
+              withContext({
                 message: `Output too large (${result.rowCount} rows). Results written to file.`,
                 outputFile: result.outputFile,
                 rowCount: result.rowCount,
                 fields: result.fields,
                 hint: "Use offset/maxRows to paginate, or add WHERE clauses to reduce results.",
-              },
+              }),
               null,
               2
             ),
@@ -260,7 +290,7 @@ server.registerTool(
         ],
       };
     }
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    return { content: [{ type: "text", text: JSON.stringify(withContext(result), null, 2) }] };
   }
 );
 
@@ -287,7 +317,7 @@ server.registerTool(
   },
   async (args) => {
     const result = await executeSqlFileWithRetry(args);
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    return { content: [{ type: "text", text: JSON.stringify(withContext(result), null, 2) }] };
   }
 );
 
@@ -309,7 +339,7 @@ server.registerTool(
   },
   async (args) => {
     const result = await mutationPreviewWithRetry(args);
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    return { content: [{ type: "text", text: JSON.stringify(withContext(result), null, 2) }] };
   }
 );
 
@@ -337,7 +367,89 @@ server.registerTool(
   },
   async (args) => {
     const result = await batchExecuteWithRetry(args);
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    return { content: [{ type: "text", text: JSON.stringify(withContext(result), null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "begin_transaction",
+  {
+    description:
+      "Start a new database transaction. Returns a transactionId to use with execute_sql, commit_transaction, or rollback_transaction. Transactions allow atomic execution of multiple statements.",
+    inputSchema: z.object({
+      name: z
+        .string()
+        .optional()
+        .describe("Optional human-readable name for the transaction to help identify it later"),
+    }),
+  },
+  async (args) => {
+    const result = await beginTransactionWithRetry(args);
+    return { content: [{ type: "text", text: JSON.stringify(withContext(result), null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "commit_transaction",
+  {
+    description:
+      "Commit an active transaction, making all changes permanent.",
+    inputSchema: z.object({
+      transactionId: z
+        .string()
+        .describe("The transaction ID returned by begin_transaction"),
+    }),
+  },
+  async (args) => {
+    const result = await commitTransactionWithRetry(args);
+    return { content: [{ type: "text", text: JSON.stringify(withContext(result), null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "rollback_transaction",
+  {
+    description:
+      "Rollback an active transaction, undoing all changes made within it.",
+    inputSchema: z.object({
+      transactionId: z
+        .string()
+        .describe("The transaction ID returned by begin_transaction"),
+    }),
+  },
+  async (args) => {
+    const result = await rollbackTransactionWithRetry(args);
+    return { content: [{ type: "text", text: JSON.stringify(withContext(result), null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "get_transaction_info",
+  {
+    description:
+      "Get information about an active transaction, including its name, server, database, and when it started.",
+    inputSchema: z.object({
+      transactionId: z
+        .string()
+        .describe("The transaction ID returned by begin_transaction"),
+    }),
+  },
+  async (args) => {
+    const result = await getTransactionInfoWithRetry(args);
+    return { content: [{ type: "text", text: JSON.stringify(withContext(result), null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "list_transactions",
+  {
+    description:
+      "List all active transactions. Returns transaction details including name, server, database, and start time.",
+    inputSchema: z.object({}),
+  },
+  async () => {
+    const result = await listActiveTransactionsWithRetry();
+    return { content: [{ type: "text", text: JSON.stringify(withContext(result), null, 2) }] };
   }
 );
 

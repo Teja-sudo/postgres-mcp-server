@@ -7,7 +7,13 @@ import {
   MutationPreviewResult,
   BatchQuery,
   BatchQueryResult,
-  BatchExecuteResult
+  BatchExecuteResult,
+  ConnectionContext,
+  ParsedStatement,
+  MultiStatementResult,
+  ExecuteSqlMultiResult,
+  TransactionResult,
+  TransactionInfo,
 } from '../types.js';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -29,7 +35,9 @@ export async function executeSql(args: {
   offset?: number;
   allowLargeScript?: boolean;
   includeSchemaHint?: boolean;
-}): Promise<ExecuteSqlResult> {
+  allowMultipleStatements?: boolean;
+  transactionId?: string;
+}): Promise<ExecuteSqlResult | ExecuteSqlMultiResult> {
   // Validate SQL input
   if (args.sql === undefined || args.sql === null) {
     throw new Error('sql parameter is required');
@@ -49,8 +57,8 @@ export async function executeSql(args: {
     throw new Error(`SQL query exceeds ${DEFAULT_SQL_LENGTH_LIMIT} characters. Use allowLargeScript=true for deployment scripts.`);
   }
 
-  // Validate params if provided
-  if (args.params !== undefined) {
+  // Validate params if provided (only for single statement)
+  if (args.params !== undefined && !args.allowMultipleStatements) {
     if (!Array.isArray(args.params)) {
       throw new Error('params must be an array');
     }
@@ -59,15 +67,36 @@ export async function executeSql(args: {
     }
   }
 
+  // Params not supported with multiple statements
+  if (args.allowMultipleStatements && args.params && args.params.length > 0) {
+    throw new Error('params not supported with allowMultipleStatements. Use separate execute_sql calls for parameterized queries.');
+  }
+
   const dbManager = getDbManager();
   const maxRows = validatePositiveInteger(args.maxRows, 'maxRows', 1, MAX_ROWS_LIMIT) || MAX_ROWS_DEFAULT;
   const offset = args.offset !== undefined ? validatePositiveInteger(args.offset, 'offset', 0, Number.MAX_SAFE_INTEGER) : 0;
 
+  // Get schema hints if requested
+  let schemaHint: SchemaHint | undefined;
+  if (args.includeSchemaHint) {
+    schemaHint = await getSchemaHintForSql(sql);
+  }
+
+  // Handle multi-statement execution
+  if (args.allowMultipleStatements) {
+    return executeMultipleStatements(sql, schemaHint, args.transactionId);
+  }
+
   // Record start time for execution timing
   const startTime = process.hrtime.bigint();
 
-  // Execute query with optional parameters
-  const result = await dbManager.query(sql, args.params);
+  // Execute query with optional parameters (supports transaction)
+  let result;
+  if (args.transactionId) {
+    result = await dbManager.queryInTransaction(args.transactionId, sql, args.params);
+  } else {
+    result = await dbManager.query(sql, args.params);
+  }
 
   // Calculate execution time in milliseconds
   const endTime = process.hrtime.bigint();
@@ -81,12 +110,6 @@ export async function executeSql(args: {
   const fields = result.fields?.map(f => f.name) || [];
   const rows = result.rows || [];
   const totalRows = rows.length;
-
-  // Get schema hints if requested
-  let schemaHint: SchemaHint | undefined;
-  if (args.includeSchemaHint) {
-    schemaHint = await getSchemaHintForSql(sql);
-  }
 
   // Apply offset and limit to the results
   const startIndex = Math.min(offset, totalRows);
@@ -136,6 +159,75 @@ export async function executeSql(args: {
     executionTimeMs: Math.round(executionTimeMs * 100) / 100,
     offset: startIndex,
     hasMore: endIndex < totalRows,
+    ...(schemaHint && { schemaHint })
+  };
+}
+
+/**
+ * Execute multiple SQL statements and return results for each
+ */
+async function executeMultipleStatements(
+  sql: string,
+  schemaHint?: SchemaHint,
+  transactionId?: string
+): Promise<ExecuteSqlMultiResult> {
+  const dbManager = getDbManager();
+  const startTime = process.hrtime.bigint();
+
+  // Parse statements with line numbers
+  const parsedStatements = splitSqlStatementsWithLineNumbers(sql);
+
+  // Filter out empty statements and comments-only
+  const executableStatements = parsedStatements.filter(stmt => {
+    const trimmed = stmt.sql.trim();
+    if (!trimmed) return false;
+    const withoutComments = stripLeadingComments(trimmed);
+    return withoutComments.length > 0;
+  });
+
+  const results: MultiStatementResult[] = [];
+  let successCount = 0;
+  let failureCount = 0;
+
+  for (let i = 0; i < executableStatements.length; i++) {
+    const stmt = executableStatements[i];
+    const stmtResult: MultiStatementResult = {
+      statementIndex: i + 1,
+      sql: stmt.sql.length > 200 ? stmt.sql.substring(0, 200) + '...' : stmt.sql,
+      lineNumber: stmt.lineNumber,
+      success: false,
+    };
+
+    try {
+      let result;
+      if (transactionId) {
+        result = await dbManager.queryInTransaction(transactionId, stmt.sql);
+      } else {
+        result = await dbManager.query(stmt.sql);
+      }
+
+      stmtResult.success = true;
+      stmtResult.rows = result.rows?.slice(0, 100); // Limit rows per statement
+      stmtResult.rowCount = result.rowCount ?? result.rows?.length ?? 0;
+      successCount++;
+    } catch (error) {
+      stmtResult.success = false;
+      stmtResult.error = error instanceof Error ? error.message : String(error);
+      failureCount++;
+    }
+
+    results.push(stmtResult);
+  }
+
+  const endTime = process.hrtime.bigint();
+  const executionTimeMs = Number(endTime - startTime) / 1_000_000;
+
+  return {
+    results,
+    totalStatements: executableStatements.length,
+    successCount,
+    failureCount,
+    executionTimeMs: Math.round(executionTimeMs * 100) / 100,
     ...(schemaHint && { schemaHint })
   };
 }
@@ -283,6 +375,7 @@ export async function explainQuery(args: {
  */
 export interface StatementError {
   statementIndex: number;
+  lineNumber: number;
   sql: string;
   error: string;
 }
@@ -364,11 +457,13 @@ export async function executeSqlFile(args: {
   let rolledBack = false;
   const collectedErrors: StatementError[] = [];
 
-  // Split SQL into statements first to get total count
-  const statements = splitSqlStatements(sqlContent);
-  const executableStatements = statements.filter(s => {
-    const trimmed = s.trim();
-    return trimmed && !trimmed.startsWith('--');
+  // Split SQL into statements with line number tracking
+  const parsedStatements = splitSqlStatementsWithLineNumbers(sqlContent);
+  const executableStatements = parsedStatements.filter(stmt => {
+    const trimmed = stmt.sql.trim();
+    if (!trimmed) return false;
+    const withoutComments = stripLeadingComments(trimmed);
+    return withoutComments.length > 0;
   });
   const totalStatements = executableStatements.length;
 
@@ -377,21 +472,9 @@ export async function executeSqlFile(args: {
       await client.query('BEGIN');
     }
 
-    let statementIndex = 0;
-    for (const statement of statements) {
-      const trimmed = statement.trim();
-      // Skip empty statements
-      if (!trimmed) {
-        continue;
-      }
-
-      // Skip pure comment-only statements (just -- comments with no SQL after)
-      const withoutComments = stripLeadingComments(trimmed);
-      if (!withoutComments) {
-        continue;
-      }
-
-      statementIndex++;
+    for (let statementIndex = 0; statementIndex < executableStatements.length; statementIndex++) {
+      const stmt = executableStatements[statementIndex];
+      const trimmed = stmt.sql.trim();
 
       try {
         const result = await client.query(trimmed);
@@ -410,7 +493,8 @@ export async function executeSqlFile(args: {
           }
           // Add the error to collection before throwing
           collectedErrors.push({
-            statementIndex,
+            statementIndex: statementIndex + 1,
+            lineNumber: stmt.lineNumber,
             sql: trimmed.length > 200 ? trimmed.substring(0, 200) + '...' : trimmed,
             error: errorMessage
           });
@@ -419,11 +503,12 @@ export async function executeSqlFile(args: {
 
         // If stopOnError is false, collect error and continue
         collectedErrors.push({
-          statementIndex,
+          statementIndex: statementIndex + 1,
+          lineNumber: stmt.lineNumber,
           sql: trimmed.length > 200 ? trimmed.substring(0, 200) + '...' : trimmed,
           error: errorMessage
         });
-        console.error(`Warning: Statement ${statementIndex} failed: ${errorMessage}`);
+        console.error(`Warning: Statement ${statementIndex + 1} at line ${stmt.lineNumber} failed: ${errorMessage}`);
       }
     }
 
@@ -515,12 +600,14 @@ function stripLeadingComments(sql: string): string {
 }
 
 /**
- * Split SQL content into individual statements.
- * Handles basic cases like semicolons, comments, and string literals.
+ * Split SQL content into individual statements with line number tracking.
+ * Returns ParsedStatement objects with SQL and line number info.
  */
-function splitSqlStatements(sql: string): string[] {
-  const statements: string[] = [];
+function splitSqlStatementsWithLineNumbers(sql: string): ParsedStatement[] {
+  const statements: ParsedStatement[] = [];
   let current = '';
+  let currentLineNumber = 1;
+  let statementStartLine = 1;
   let inString = false;
   let stringChar = '';
   let inLineComment = false;
@@ -530,6 +617,16 @@ function splitSqlStatements(sql: string): string[] {
   while (i < sql.length) {
     const char = sql[i];
     const nextChar = sql[i + 1] || '';
+
+    // Track line numbers
+    if (char === '\n') {
+      currentLineNumber++;
+    }
+
+    // If starting a new statement (current is empty/whitespace), record line number
+    if (current.trim() === '' && char.trim() !== '') {
+      statementStartLine = currentLineNumber;
+    }
 
     // Handle line comments
     if (!inString && !inBlockComment && char === '-' && nextChar === '-') {
@@ -567,7 +664,6 @@ function splitSqlStatements(sql: string): string[] {
         inString = true;
         stringChar = char;
       } else if (char === stringChar) {
-        // Check for escaped quote (doubled)
         if (nextChar === stringChar) {
           current += char + nextChar;
           i += 2;
@@ -585,7 +681,11 @@ function splitSqlStatements(sql: string): string[] {
         const dollarTag = dollarMatch[1];
         const endIndex = sql.indexOf(dollarTag, i + dollarTag.length);
         if (endIndex !== -1) {
-          current += sql.slice(i, endIndex + dollarTag.length);
+          const dollarContent = sql.slice(i, endIndex + dollarTag.length);
+          // Count newlines in dollar-quoted content
+          const newlines = (dollarContent.match(/\n/g) || []).length;
+          currentLineNumber += newlines;
+          current += dollarContent;
           i = endIndex + dollarTag.length;
           continue;
         }
@@ -595,8 +695,12 @@ function splitSqlStatements(sql: string): string[] {
     // Handle statement separator
     if (!inString && !inLineComment && !inBlockComment && char === ';') {
       current += char;
-      statements.push(current.trim());
+      const trimmed = current.trim();
+      if (trimmed) {
+        statements.push({ sql: trimmed, lineNumber: statementStartLine });
+      }
       current = '';
+      statementStartLine = currentLineNumber;
       i++;
       continue;
     }
@@ -606,11 +710,12 @@ function splitSqlStatements(sql: string): string[] {
   }
 
   // Add remaining content if any
-  if (current.trim()) {
-    statements.push(current.trim());
+  const trimmed = current.trim();
+  if (trimmed) {
+    statements.push({ sql: trimmed, lineNumber: statementStartLine });
   }
 
-  return statements.filter(s => s.length > 0);
+  return statements;
 }
 
 /**
@@ -983,4 +1088,102 @@ export async function batchExecute(args: {
     totalExecutionTimeMs: Math.round(totalExecutionTimeMs * 100) / 100,
     results
   };
+}
+
+/**
+ * Begin a new transaction. Returns a transactionId to use with subsequent queries.
+ */
+export async function beginTransaction(args?: {
+  name?: string;
+}): Promise<TransactionResult & { transactionId: string; name?: string }> {
+  const dbManager = getDbManager();
+  const info = await dbManager.beginTransaction(args?.name);
+
+  return {
+    transactionId: info.transactionId,
+    name: info.name,
+    status: 'started',
+    message: `Transaction${info.name ? ` "${info.name}"` : ''} started. Use transactionId "${info.transactionId}" with execute_sql or commit/rollback.`
+  };
+}
+
+/**
+ * Get information about an active transaction.
+ */
+export async function getTransactionInfo(args: {
+  transactionId: string;
+}): Promise<TransactionInfo | { error: string }> {
+  if (!args.transactionId) {
+    throw new Error('transactionId parameter is required');
+  }
+
+  const dbManager = getDbManager();
+  const info = dbManager.getTransactionInfo(args.transactionId);
+
+  if (!info) {
+    return { error: `Transaction not found: ${args.transactionId}` };
+  }
+
+  return info;
+}
+
+/**
+ * List all active transactions.
+ */
+export async function listActiveTransactions(): Promise<{ transactions: TransactionInfo[]; count: number }> {
+  const dbManager = getDbManager();
+  const transactions = dbManager.listActiveTransactions();
+
+  return {
+    transactions,
+    count: transactions.length
+  };
+}
+
+/**
+ * Commit an active transaction.
+ */
+export async function commitTransaction(args: {
+  transactionId: string;
+}): Promise<TransactionResult> {
+  if (!args.transactionId || typeof args.transactionId !== 'string') {
+    throw new Error('transactionId is required');
+  }
+
+  const dbManager = getDbManager();
+  await dbManager.commitTransaction(args.transactionId);
+
+  return {
+    transactionId: args.transactionId,
+    status: 'committed',
+    message: 'Transaction committed successfully.'
+  };
+}
+
+/**
+ * Rollback an active transaction.
+ */
+export async function rollbackTransaction(args: {
+  transactionId: string;
+}): Promise<TransactionResult> {
+  if (!args.transactionId || typeof args.transactionId !== 'string') {
+    throw new Error('transactionId is required');
+  }
+
+  const dbManager = getDbManager();
+  await dbManager.rollbackTransaction(args.transactionId);
+
+  return {
+    transactionId: args.transactionId,
+    status: 'rolled_back',
+    message: 'Transaction rolled back successfully.'
+  };
+}
+
+/**
+ * Get connection context for including in tool responses
+ */
+export function getConnectionContext(): ConnectionContext {
+  const dbManager = getDbManager();
+  return dbManager.getConnectionContext();
 }

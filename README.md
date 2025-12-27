@@ -285,12 +285,14 @@ Executes SQL statements on the database. Supports pagination and parameterized q
 
 **Parameters:**
 
-- `sql` (required): SQL statement to execute. Use `$1`, `$2`, etc. for parameterized queries.
-- `params` (optional): Array of parameters for parameterized queries (e.g., `[123, "value"]`). Prevents SQL injection.
+- `sql` (required): SQL statement(s) to execute. Use `$1`, `$2`, etc. for parameterized queries.
+- `params` (optional): Array of parameters for parameterized queries (e.g., `[123, "value"]`). Prevents SQL injection. Not supported with `allowMultipleStatements`.
 - `maxRows` (optional): Maximum rows to return (default: 1000, max: 100000). Use with `offset` for pagination.
 - `offset` (optional): Number of rows to skip for pagination (default: 0).
 - `allowLargeScript` (optional): Set to true to bypass the 100KB SQL length limit for deployment scripts.
-- `includeSchemaHint` (optional): Include schema information (columns, primary keys, foreign keys) for tables referenced in the query. Helps AI agents understand table structure without separate queries.
+- `includeSchemaHint` (optional): Include schema information (columns, primary keys, foreign keys) for tables referenced in the query.
+- `allowMultipleStatements` (optional): Allow multiple SQL statements separated by semicolons. Returns results for each statement with line numbers.
+- `transactionId` (optional): Execute within an active transaction. Get this from `begin_transaction`.
 
 **Returns:**
 
@@ -395,6 +397,44 @@ batch_execute({
   ]
 })
 // Returns all three results in parallel, keyed by name
+```
+
+### Transaction Control
+
+#### `begin_transaction`
+
+Start a new database transaction. Returns a transactionId to use with `execute_sql`, `commit_transaction`, or `rollback_transaction`.
+
+**Parameters:** None
+
+**Returns:**
+
+- `transactionId`: Unique ID for this transaction
+- `status`: "started"
+- `message`: Instructions for using the transaction
+
+#### `commit_transaction`
+
+Commit an active transaction, making all changes permanent.
+
+**Parameters:**
+
+- `transactionId` (required): The transaction ID returned by `begin_transaction`
+
+#### `rollback_transaction`
+
+Rollback an active transaction, undoing all changes made within it.
+
+**Parameters:**
+
+- `transactionId` (required): The transaction ID returned by `begin_transaction`
+
+**Example - Transaction Usage:**
+
+```
+1. Call begin_transaction to get a transactionId
+2. Call execute_sql with transactionId for each statement
+3. Call commit_transaction to save changes, OR rollback_transaction to undo
 ```
 
 #### `explain_query`
@@ -519,6 +559,62 @@ Supported error patterns include: `Connection terminated`, `ECONNRESET`, `ETIMED
 ### Hidden Connection Details
 
 Host URLs, ports, and credentials are never exposed in tool responses. Only server names (aliases) are visible, preventing accidental exposure of infrastructure details.
+
+### Connection Context in Responses
+
+All tool responses include a `connection` object showing which server, database, and schema the operation ran on:
+
+```json
+{
+  "rows": [...],
+  "connection": {
+    "server": "production",
+    "database": "myapp",
+    "schema": "public"
+  }
+}
+```
+
+### Multi-Statement Execution
+
+Execute multiple SQL statements in a single call using `allowMultipleStatements: true`:
+
+```
+execute_sql({
+  sql: "INSERT INTO logs VALUES (1); INSERT INTO logs VALUES (2); SELECT * FROM logs;",
+  allowMultipleStatements: true
+})
+```
+
+Returns results for each statement with line numbers for easy debugging.
+
+### Transaction Support
+
+Explicit transaction control for atomic multi-statement operations:
+
+```
+1. begin_transaction() → returns transactionId
+2. execute_sql({ sql: "UPDATE ...", transactionId: "..." })
+3. execute_sql({ sql: "INSERT ...", transactionId: "..." })
+4. commit_transaction({ transactionId: "..." }) OR rollback_transaction({ transactionId: "..." })
+```
+
+### Line Number Tracking
+
+When `execute_sql_file` or multi-statement execution encounters errors, line numbers are included to help locate issues:
+
+```json
+{
+  "errors": [
+    {
+      "statementIndex": 5,
+      "lineNumber": 42,
+      "sql": "INSERT INTO...",
+      "error": "syntax error at or near..."
+    }
+  ]
+}
+```
 
 ## Security
 

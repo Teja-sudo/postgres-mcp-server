@@ -1,10 +1,13 @@
 import { Pool, PoolClient, QueryResult, QueryResultRow } from "pg";
+import { v4 as uuidv4 } from "uuid";
 import {
   ServerConfig,
   ServersConfig,
   ConnectionState,
   ConnectionInfo,
   DatabaseInfo,
+  ConnectionContext,
+  TransactionInfo,
 } from "./types.js";
 import { isReadOnlySql } from "./utils/validation.js";
 
@@ -179,6 +182,7 @@ export class DatabaseManager {
   private currentPool: Pool | null = null;
   private readOnlyMode: boolean;
   private queryTimeoutMs: number;
+  private activeTransactions: Map<string, { client: PoolClient; info: TransactionInfo }> = new Map();
 
   constructor(
     readOnlyMode: boolean = true,
@@ -550,6 +554,126 @@ export class DatabaseManager {
       Math.max(1000, timeoutMs),
       MAX_QUERY_TIMEOUT_MS
     );
+  }
+
+  /**
+   * Returns the current connection context for including in tool responses
+   */
+  public getConnectionContext(): ConnectionContext {
+    return {
+      server: this.connectionState.currentServer,
+      database: this.connectionState.currentDatabase,
+      schema: this.connectionState.currentSchema,
+    };
+  }
+
+  /**
+   * Begins a new transaction and returns a transaction ID
+   * @param name Optional human-readable name for the transaction
+   */
+  public async beginTransaction(name?: string): Promise<TransactionInfo> {
+    if (!this.currentPool) {
+      throw new Error(
+        "No database connection. Please switch to a server and database first."
+      );
+    }
+
+    const transactionId = uuidv4();
+    const client = await this.currentPool.connect();
+
+    try {
+      await client.query("BEGIN");
+
+      const info: TransactionInfo = {
+        transactionId,
+        name,
+        server: this.connectionState.currentServer || "",
+        database: this.connectionState.currentDatabase || "",
+        schema: this.connectionState.currentSchema || "",
+        startedAt: new Date(),
+      };
+
+      this.activeTransactions.set(transactionId, { client, info });
+      return info;
+    } catch (error) {
+      client.release();
+      throw error;
+    }
+  }
+
+  /**
+   * Commits an active transaction
+   */
+  public async commitTransaction(transactionId: string): Promise<void> {
+    const transaction = this.activeTransactions.get(transactionId);
+    if (!transaction) {
+      throw new Error(`Transaction not found: ${transactionId}`);
+    }
+
+    try {
+      await transaction.client.query("COMMIT");
+    } finally {
+      transaction.client.release();
+      this.activeTransactions.delete(transactionId);
+    }
+  }
+
+  /**
+   * Rolls back an active transaction
+   */
+  public async rollbackTransaction(transactionId: string): Promise<void> {
+    const transaction = this.activeTransactions.get(transactionId);
+    if (!transaction) {
+      throw new Error(`Transaction not found: ${transactionId}`);
+    }
+
+    try {
+      await transaction.client.query("ROLLBACK");
+    } finally {
+      transaction.client.release();
+      this.activeTransactions.delete(transactionId);
+    }
+  }
+
+  /**
+   * Executes a query within a transaction
+   */
+  public async queryInTransaction<T extends QueryResultRow = any>(
+    transactionId: string,
+    sql: string,
+    params?: any[]
+  ): Promise<QueryResult<T>> {
+    const transaction = this.activeTransactions.get(transactionId);
+    if (!transaction) {
+      throw new Error(`Transaction not found: ${transactionId}`);
+    }
+
+    // Check for read-only mode violations
+    if (this.readOnlyMode) {
+      const { isReadOnly, reason } = isReadOnlySql(sql);
+      if (!isReadOnly) {
+        throw new Error(`Read-only mode violation: ${reason}`);
+      }
+    }
+
+    return transaction.client.query<T>(sql, params);
+  }
+
+  /**
+   * Gets information about an active transaction
+   */
+  public getTransactionInfo(transactionId: string): TransactionInfo | null {
+    const transaction = this.activeTransactions.get(transactionId);
+    return transaction ? { ...transaction.info } : null;
+  }
+
+  /**
+   * Lists all active transactions
+   */
+  public listActiveTransactions(): TransactionInfo[] {
+    return Array.from(this.activeTransactions.values()).map((t) => ({
+      ...t.info,
+    }));
   }
 }
 

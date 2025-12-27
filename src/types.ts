@@ -186,3 +186,66 @@ export interface BatchExecuteResult {
   totalExecutionTimeMs: number;
   results: { [name: string]: BatchQueryResult };
 }
+
+/**
+ * Connection context included in tool responses
+ */
+export interface ConnectionContext {
+  server: string | null;
+  database: string | null;
+  schema: string | null;
+}
+
+/**
+ * Result of multi-statement execution
+ */
+export interface MultiStatementResult {
+  statementIndex: number;
+  sql: string;
+  lineNumber: number;
+  success: boolean;
+  rows?: any[];
+  rowCount?: number;
+  error?: string;
+}
+
+/**
+ * Extended execute_sql result with multi-statement support
+ */
+export interface ExecuteSqlMultiResult {
+  results: MultiStatementResult[];
+  totalStatements: number;
+  successCount: number;
+  failureCount: number;
+  executionTimeMs: number;
+  schemaHint?: SchemaHint;
+}
+
+/**
+ * Statement with line number tracking
+ */
+export interface ParsedStatement {
+  sql: string;
+  lineNumber: number;
+}
+
+/**
+ * Transaction info
+ */
+export interface TransactionInfo {
+  transactionId: string;
+  name?: string;
+  server: string;
+  database: string;
+  schema: string;
+  startedAt: Date;
+}
+
+/**
+ * Transaction result
+ */
+export interface TransactionResult {
+  transactionId: string;
+  status: 'started' | 'committed' | 'rolled_back';
+  message: string;
+}
