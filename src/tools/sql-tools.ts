@@ -1,5 +1,14 @@
 import { getDbManager } from '../db-manager.js';
-import { ExecuteSqlResult, QueryPlan } from '../types.js';
+import {
+  ExecuteSqlResult,
+  QueryPlan,
+  SchemaHint,
+  TableSchemaHint,
+  MutationPreviewResult,
+  BatchQuery,
+  BatchQueryResult,
+  BatchExecuteResult
+} from '../types.js';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -19,6 +28,7 @@ export async function executeSql(args: {
   maxRows?: number;
   offset?: number;
   allowLargeScript?: boolean;
+  includeSchemaHint?: boolean;
 }): Promise<ExecuteSqlResult> {
   // Validate SQL input
   if (args.sql === undefined || args.sql === null) {
@@ -72,6 +82,12 @@ export async function executeSql(args: {
   const rows = result.rows || [];
   const totalRows = rows.length;
 
+  // Get schema hints if requested
+  let schemaHint: SchemaHint | undefined;
+  if (args.includeSchemaHint) {
+    schemaHint = await getSchemaHintForSql(sql);
+  }
+
   // Apply offset and limit to the results
   const startIndex = Math.min(offset, totalRows);
   const endIndex = Math.min(startIndex + maxRows, totalRows);
@@ -108,7 +124,8 @@ export async function executeSql(args: {
       truncated: true,
       executionTimeMs: Math.round(executionTimeMs * 100) / 100,
       offset: startIndex,
-      hasMore: endIndex < totalRows
+      hasMore: endIndex < totalRows,
+      ...(schemaHint && { schemaHint })
     };
   }
 
@@ -118,7 +135,8 @@ export async function executeSql(args: {
     fields,
     executionTimeMs: Math.round(executionTimeMs * 100) / 100,
     offset: startIndex,
-    hasMore: endIndex < totalRows
+    hasMore: endIndex < totalRows,
+    ...(schemaHint && { schemaHint })
   };
 }
 
@@ -593,4 +611,376 @@ function splitSqlStatements(sql: string): string[] {
   }
 
   return statements.filter(s => s.length > 0);
+}
+
+/**
+ * Extracts table names from a SQL query.
+ * Handles common patterns: FROM, JOIN, INTO, UPDATE, DELETE FROM
+ */
+function extractTablesFromSql(sql: string): Array<{ schema: string; table: string }> {
+  const tables: Array<{ schema: string; table: string }> = [];
+  const seen = new Set<string>();
+
+  // Normalize SQL: remove comments and extra whitespace
+  const normalized = sql
+    .replace(/--[^\n]*/g, '') // Remove line comments
+    .replace(/\/\*[\s\S]*?\*\//g, '') // Remove block comments
+    .replace(/\s+/g, ' ') // Normalize whitespace
+    .trim();
+
+  // Patterns to find table references
+  const patterns = [
+    /\bFROM\s+(["`]?[\w]+["`]?(?:\s*\.\s*["`]?[\w]+["`]?)?)/gi,
+    /\bJOIN\s+(["`]?[\w]+["`]?(?:\s*\.\s*["`]?[\w]+["`]?)?)/gi,
+    /\bINTO\s+(["`]?[\w]+["`]?(?:\s*\.\s*["`]?[\w]+["`]?)?)/gi,
+    /\bUPDATE\s+(["`]?[\w]+["`]?(?:\s*\.\s*["`]?[\w]+["`]?)?)/gi,
+    /\bDELETE\s+FROM\s+(["`]?[\w]+["`]?(?:\s*\.\s*["`]?[\w]+["`]?)?)/gi,
+  ];
+
+  for (const pattern of patterns) {
+    let match;
+    while ((match = pattern.exec(normalized)) !== null) {
+      const tableRef = match[1].replace(/["`]/g, '').trim();
+
+      // Skip common SQL keywords that might be matched
+      if (['SELECT', 'WHERE', 'SET', 'VALUES', 'AND', 'OR'].includes(tableRef.toUpperCase())) {
+        continue;
+      }
+
+      let schema = 'public';
+      let table = tableRef;
+
+      if (tableRef.includes('.')) {
+        const parts = tableRef.split('.');
+        schema = parts[0].trim();
+        table = parts[1].trim();
+      }
+
+      const key = `${schema}.${table}`.toLowerCase();
+      if (!seen.has(key)) {
+        seen.add(key);
+        tables.push({ schema, table });
+      }
+    }
+  }
+
+  return tables;
+}
+
+/**
+ * Gets schema hints for tables mentioned in SQL
+ */
+async function getSchemaHintForSql(sql: string): Promise<SchemaHint> {
+  const dbManager = getDbManager();
+  const tables = extractTablesFromSql(sql);
+  const tableHints: TableSchemaHint[] = [];
+
+  for (const { schema, table } of tables.slice(0, 10)) { // Limit to 10 tables
+    try {
+      // Get columns
+      const columnsResult = await dbManager.query(`
+        SELECT
+          column_name as name,
+          data_type as type,
+          is_nullable = 'YES' as nullable
+        FROM information_schema.columns
+        WHERE table_schema = $1 AND table_name = $2
+        ORDER BY ordinal_position
+      `, [schema, table]);
+
+      // Get primary key
+      const pkResult = await dbManager.query(`
+        SELECT a.attname as column_name
+        FROM pg_index i
+        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+        JOIN pg_class c ON c.oid = i.indrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE i.indisprimary
+          AND n.nspname = $1
+          AND c.relname = $2
+      `, [schema, table]);
+
+      // Get foreign keys
+      const fkResult = await dbManager.query(`
+        SELECT
+          kcu.column_name,
+          ccu.table_schema || '.' || ccu.table_name as referenced_table,
+          ccu.column_name as referenced_column
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+          ON tc.constraint_name = kcu.constraint_name
+          AND tc.table_schema = kcu.table_schema
+        JOIN information_schema.constraint_column_usage ccu
+          ON ccu.constraint_name = tc.constraint_name
+        WHERE tc.constraint_type = 'FOREIGN KEY'
+          AND tc.table_schema = $1
+          AND tc.table_name = $2
+      `, [schema, table]);
+
+      // Get row count estimate
+      const countResult = await dbManager.query(`
+        SELECT reltuples::bigint as estimate
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = $1 AND c.relname = $2
+      `, [schema, table]);
+
+      const hint: TableSchemaHint = {
+        schema,
+        table,
+        columns: columnsResult.rows.map(r => ({
+          name: r.name,
+          type: r.type,
+          nullable: r.nullable
+        })),
+        primaryKey: pkResult.rows.map(r => r.column_name),
+        rowCountEstimate: countResult.rows[0]?.estimate || 0
+      };
+
+      // Group foreign keys by constraint
+      if (fkResult.rows.length > 0) {
+        const fkMap = new Map<string, { columns: string[]; referencedColumns: string[] }>();
+        for (const row of fkResult.rows) {
+          const key = row.referenced_table;
+          if (!fkMap.has(key)) {
+            fkMap.set(key, { columns: [], referencedColumns: [] });
+          }
+          fkMap.get(key)!.columns.push(row.column_name);
+          fkMap.get(key)!.referencedColumns.push(row.referenced_column);
+        }
+        hint.foreignKeys = Array.from(fkMap.entries()).map(([refTable, data]) => ({
+          columns: data.columns,
+          referencedTable: refTable,
+          referencedColumns: data.referencedColumns
+        }));
+      }
+
+      tableHints.push(hint);
+    } catch (error) {
+      // Skip tables that don't exist or have permission issues
+      console.error(`Could not get schema hint for ${schema}.${table}: ${error}`);
+    }
+  }
+
+  return { tables: tableHints };
+}
+
+/**
+ * Preview the effect of a mutation (INSERT/UPDATE/DELETE) without executing it.
+ * Returns estimated rows affected and sample of rows that would be affected.
+ */
+export async function mutationPreview(args: {
+  sql: string;
+  sampleSize?: number;
+}): Promise<MutationPreviewResult> {
+  if (!args.sql || typeof args.sql !== 'string') {
+    throw new Error('sql parameter is required');
+  }
+
+  const sql = args.sql.trim();
+  const sampleSize = Math.min(args.sampleSize || 5, 20); // Default 5, max 20
+
+  // Detect mutation type
+  const upperSql = sql.toUpperCase();
+  let mutationType: 'INSERT' | 'UPDATE' | 'DELETE' | 'UNKNOWN' = 'UNKNOWN';
+
+  if (upperSql.startsWith('UPDATE')) {
+    mutationType = 'UPDATE';
+  } else if (upperSql.startsWith('DELETE')) {
+    mutationType = 'DELETE';
+  } else if (upperSql.startsWith('INSERT')) {
+    mutationType = 'INSERT';
+  } else {
+    throw new Error('SQL must be an INSERT, UPDATE, or DELETE statement');
+  }
+
+  const dbManager = getDbManager();
+
+  // For INSERT, we can't preview affected rows
+  if (mutationType === 'INSERT') {
+    // Use EXPLAIN to estimate rows
+    const explainResult = await dbManager.query(`EXPLAIN (FORMAT JSON) ${sql}`);
+    const plan = explainResult.rows[0]['QUERY PLAN'][0];
+
+    return {
+      mutationType,
+      estimatedRowsAffected: plan?.Plan?.['Plan Rows'] || 1,
+      sampleAffectedRows: [],
+      warning: 'INSERT preview cannot show affected rows - they do not exist yet'
+    };
+  }
+
+  // For UPDATE and DELETE, extract WHERE clause and table
+  let targetTable: string | undefined;
+  let whereClause: string | undefined;
+
+  if (mutationType === 'UPDATE') {
+    // Pattern: UPDATE table SET ... WHERE ...
+    const updateMatch = sql.match(/UPDATE\s+(["`]?[\w.]+["`]?)\s+SET/i);
+    const whereMatch = sql.match(/\bWHERE\s+(.+)$/is);
+    targetTable = updateMatch?.[1]?.replace(/["`]/g, '');
+    whereClause = whereMatch?.[1];
+  } else if (mutationType === 'DELETE') {
+    // Pattern: DELETE FROM table WHERE ...
+    const deleteMatch = sql.match(/DELETE\s+FROM\s+(["`]?[\w.]+["`]?)/i);
+    const whereMatch = sql.match(/\bWHERE\s+(.+)$/is);
+    targetTable = deleteMatch?.[1]?.replace(/["`]/g, '');
+    whereClause = whereMatch?.[1];
+  }
+
+  if (!targetTable) {
+    throw new Error('Could not parse target table from SQL');
+  }
+
+  // Get estimated row count using EXPLAIN
+  let estimatedRowsAffected = 0;
+  try {
+    const explainResult = await dbManager.query(`EXPLAIN (FORMAT JSON) ${sql}`);
+    const plan = explainResult.rows[0]['QUERY PLAN'][0];
+    estimatedRowsAffected = plan?.Plan?.['Plan Rows'] || 0;
+  } catch (error) {
+    // EXPLAIN might fail, continue with count query
+  }
+
+  // Build SELECT query to get sample of affected rows
+  let sampleRows: any[] = [];
+  try {
+    const selectSql = whereClause
+      ? `SELECT * FROM ${targetTable} WHERE ${whereClause} LIMIT ${sampleSize}`
+      : `SELECT * FROM ${targetTable} LIMIT ${sampleSize}`;
+
+    const sampleResult = await dbManager.query(selectSql);
+    sampleRows = sampleResult.rows;
+
+    // If EXPLAIN didn't work, get count
+    if (estimatedRowsAffected === 0) {
+      const countSql = whereClause
+        ? `SELECT COUNT(*) as cnt FROM ${targetTable} WHERE ${whereClause}`
+        : `SELECT COUNT(*) as cnt FROM ${targetTable}`;
+      const countResult = await dbManager.query(countSql);
+      estimatedRowsAffected = parseInt(countResult.rows[0]?.cnt || '0', 10);
+    }
+  } catch (error) {
+    throw new Error(`Could not preview affected rows: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  const result: MutationPreviewResult = {
+    mutationType,
+    estimatedRowsAffected,
+    sampleAffectedRows: sampleRows,
+    targetTable
+  };
+
+  if (whereClause) {
+    result.whereClause = whereClause;
+  } else {
+    result.warning = 'No WHERE clause - ALL rows in the table will be affected!';
+  }
+
+  return result;
+}
+
+/**
+ * Execute multiple SQL queries in parallel.
+ * Returns results keyed by query name.
+ */
+export async function batchExecute(args: {
+  queries: BatchQuery[];
+  stopOnError?: boolean;
+}): Promise<BatchExecuteResult> {
+  if (!args.queries || !Array.isArray(args.queries)) {
+    throw new Error('queries parameter is required and must be an array');
+  }
+
+  if (args.queries.length === 0) {
+    throw new Error('queries array cannot be empty');
+  }
+
+  if (args.queries.length > 20) {
+    throw new Error('Maximum 20 queries allowed in a batch');
+  }
+
+  // Validate each query
+  const seenNames = new Set<string>();
+  for (const query of args.queries) {
+    if (!query.name || typeof query.name !== 'string') {
+      throw new Error('Each query must have a name');
+    }
+    if (!query.sql || typeof query.sql !== 'string') {
+      throw new Error(`Query "${query.name}" must have sql`);
+    }
+    if (seenNames.has(query.name)) {
+      throw new Error(`Duplicate query name: ${query.name}`);
+    }
+    seenNames.add(query.name);
+  }
+
+  const dbManager = getDbManager();
+  const stopOnError = args.stopOnError === true; // Default false
+  const startTime = process.hrtime.bigint();
+
+  const results: { [name: string]: BatchQueryResult } = {};
+  let successCount = 0;
+  let failureCount = 0;
+
+  // Execute all queries in parallel
+  const promises = args.queries.map(async (query) => {
+    const queryStartTime = process.hrtime.bigint();
+
+    try {
+      const result = await dbManager.query(query.sql, query.params);
+      const queryEndTime = process.hrtime.bigint();
+      const executionTimeMs = Number(queryEndTime - queryStartTime) / 1_000_000;
+
+      return {
+        name: query.name,
+        result: {
+          success: true,
+          rows: result.rows,
+          rowCount: result.rowCount ?? result.rows.length,
+          executionTimeMs: Math.round(executionTimeMs * 100) / 100
+        } as BatchQueryResult
+      };
+    } catch (error) {
+      const queryEndTime = process.hrtime.bigint();
+      const executionTimeMs = Number(queryEndTime - queryStartTime) / 1_000_000;
+
+      return {
+        name: query.name,
+        result: {
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+          executionTimeMs: Math.round(executionTimeMs * 100) / 100
+        } as BatchQueryResult
+      };
+    }
+  });
+
+  // Wait for all queries
+  const queryResults = await Promise.all(promises);
+
+  // Collect results
+  for (const { name, result } of queryResults) {
+    results[name] = result;
+    if (result.success) {
+      successCount++;
+    } else {
+      failureCount++;
+      if (stopOnError) {
+        // Mark remaining as not executed
+        break;
+      }
+    }
+  }
+
+  const endTime = process.hrtime.bigint();
+  const totalExecutionTimeMs = Number(endTime - startTime) / 1_000_000;
+
+  return {
+    totalQueries: args.queries.length,
+    successCount,
+    failureCount,
+    totalExecutionTimeMs: Math.round(totalExecutionTimeMs * 100) / 100,
+    results
+  };
 }

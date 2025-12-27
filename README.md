@@ -290,6 +290,7 @@ Executes SQL statements on the database. Supports pagination and parameterized q
 - `maxRows` (optional): Maximum rows to return (default: 1000, max: 100000). Use with `offset` for pagination.
 - `offset` (optional): Number of rows to skip for pagination (default: 0).
 - `allowLargeScript` (optional): Set to true to bypass the 100KB SQL length limit for deployment scripts.
+- `includeSchemaHint` (optional): Include schema information (columns, primary keys, foreign keys) for tables referenced in the query. Helps AI agents understand table structure without separate queries.
 
 **Returns:**
 
@@ -300,6 +301,8 @@ Executes SQL statements on the database. Supports pagination and parameterized q
 - `offset`: Current offset
 - `hasMore`: Whether more rows are available
 - `outputFile`: (Only if output is too large) Path to temp file with full results
+- `schemaHint`: (When includeSchemaHint=true) Schema information for referenced tables:
+  - `tables`: Array of table schemas with columns, primary keys, foreign keys, and row count estimates
 
 **Note:** Large outputs are automatically written to a temp file, and the file path is returned. This prevents token wastage when dealing with large result sets.
 
@@ -330,6 +333,69 @@ Executes a `.sql` file from the filesystem. Useful for running migration scripts
 - `rollback`: Whether a rollback was performed
 
 **Limits:** Max file size: 50MB. Supports PostgreSQL-specific syntax including dollar-quoted strings and block comments.
+
+#### `mutation_preview`
+
+Preview the effect of INSERT, UPDATE, or DELETE statements without executing them. Shows estimated rows affected and a sample of rows that would be modified. Essential for verifying destructive queries before running them.
+
+**Parameters:**
+
+- `sql` (required): The INSERT, UPDATE, or DELETE statement to preview
+- `sampleSize` (optional): Number of sample rows to show (default: 5, max: 20)
+
+**Returns:**
+
+- `mutationType`: Type of mutation (INSERT, UPDATE, DELETE)
+- `estimatedRowsAffected`: Estimated number of rows that would be affected
+- `sampleAffectedRows`: Sample of rows that would be modified (for UPDATE/DELETE)
+- `targetTable`: The table being modified
+- `whereClause`: The WHERE clause from the query (if present)
+- `warning`: Warning message if no WHERE clause (all rows affected) or for INSERT previews
+
+**Example:**
+
+```
+mutation_preview({ sql: "DELETE FROM orders WHERE status = 'cancelled'" })
+// Returns: { mutationType: "DELETE", estimatedRowsAffected: 150, sampleAffectedRows: [...5 rows...] }
+```
+
+#### `batch_execute`
+
+Execute multiple SQL queries in parallel. Returns all results keyed by query name. Efficient for fetching multiple independent pieces of data in a single call.
+
+**Parameters:**
+
+- `queries` (required): Array of queries to execute (max 20):
+  - `name`: Unique name for this query (used as key in results)
+  - `sql`: SQL query to execute
+  - `params` (optional): Query parameters
+- `stopOnError` (optional): Stop on first error (default: false, continues with all queries)
+
+**Returns:**
+
+- `totalQueries`: Total number of queries in the batch
+- `successCount`: Number of successful queries
+- `failureCount`: Number of failed queries
+- `totalExecutionTimeMs`: Total execution time in milliseconds
+- `results`: Object with query results keyed by name:
+  - `success`: Whether the query succeeded
+  - `rows`: Result rows (if successful)
+  - `rowCount`: Number of rows returned
+  - `error`: Error message (if failed)
+  - `executionTimeMs`: Individual query execution time
+
+**Example:**
+
+```
+batch_execute({
+  queries: [
+    { name: "user_count", sql: "SELECT COUNT(*) FROM users" },
+    { name: "order_total", sql: "SELECT SUM(total) FROM orders" },
+    { name: "recent_signups", sql: "SELECT COUNT(*) FROM users WHERE created_at > NOW() - INTERVAL '7 days'" }
+  ]
+})
+// Returns all three results in parallel, keyed by name
+```
 
 #### `explain_query`
 

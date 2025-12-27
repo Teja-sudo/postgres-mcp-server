@@ -20,6 +20,8 @@ import {
   analyzeWorkloadIndexes,
   analyzeQueryIndexes,
   analyzeDbHealth,
+  mutationPreview,
+  batchExecute,
 } from "./tools/index.js";
 import { withConnectionRetry } from "./utils/index.js";
 
@@ -34,12 +36,14 @@ const getTopQueriesWithRetry = withConnectionRetry(getTopQueries);
 const analyzeWorkloadIndexesWithRetry = withConnectionRetry(analyzeWorkloadIndexes);
 const analyzeQueryIndexesWithRetry = withConnectionRetry(analyzeQueryIndexes);
 const analyzeDbHealthWithRetry = withConnectionRetry(async () => analyzeDbHealth());
+const mutationPreviewWithRetry = withConnectionRetry(mutationPreview);
+const batchExecuteWithRetry = withConnectionRetry(batchExecute);
 
 // Create MCP server using the new high-level API
 const server = new McpServer(
   {
     name: "postgres-mcp-server",
-    version: "1.7.0",
+    version: "1.8.0",
   },
   {
     capabilities: {
@@ -202,7 +206,7 @@ server.registerTool(
   "execute_sql",
   {
     description:
-      "Execute SQL queries. Supports SELECT, INSERT, UPDATE, DELETE (if not in readonly mode). Use $1, $2 placeholders with params array to prevent SQL injection. Returns rows, execution time, and pagination info.",
+      "Execute SQL queries. Supports SELECT, INSERT, UPDATE, DELETE (if not in readonly mode). Use $1, $2 placeholders with params array to prevent SQL injection. Returns rows, execution time, and pagination info. Use includeSchemaHint for table context.",
     inputSchema: z.object({
       sql: z
         .string()
@@ -226,6 +230,11 @@ server.registerTool(
         .optional()
         .default(false)
         .describe("Bypass 100KB SQL limit for deployment scripts"),
+      includeSchemaHint: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Include schema info (columns, PKs, FKs) for tables in the query. Helps understand table structure."),
     }),
   },
   async (args) => {
@@ -278,6 +287,56 @@ server.registerTool(
   },
   async (args) => {
     const result = await executeSqlFileWithRetry(args);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "mutation_preview",
+  {
+    description:
+      "Preview the effect of INSERT/UPDATE/DELETE without executing. Shows estimated rows affected and sample of rows that would be modified. Use this before running destructive queries to verify the impact.",
+    inputSchema: z.object({
+      sql: z
+        .string()
+        .describe("The INSERT, UPDATE, or DELETE statement to preview"),
+      sampleSize: z
+        .number()
+        .optional()
+        .default(5)
+        .describe("Number of sample rows to show (default: 5, max: 20)"),
+    }),
+  },
+  async (args) => {
+    const result = await mutationPreviewWithRetry(args);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "batch_execute",
+  {
+    description:
+      "Execute multiple SQL queries in parallel. Returns all results keyed by query name. Efficient for fetching multiple independent pieces of data in one call.",
+    inputSchema: z.object({
+      queries: z
+        .array(
+          z.object({
+            name: z.string().describe("Unique name for this query (used as key in results)"),
+            sql: z.string().describe("SQL query to execute"),
+            params: z.array(z.any()).optional().describe("Query parameters"),
+          })
+        )
+        .describe("Array of queries to execute (max 20)"),
+      stopOnError: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Stop on first error (default: false, continues with all queries)"),
+    }),
+  },
+  async (args) => {
+    const result = await batchExecuteWithRetry(args);
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );

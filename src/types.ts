@@ -113,4 +113,76 @@ export interface ExecuteSqlResult {
   executionTimeMs?: number;
   offset?: number;
   hasMore?: boolean;
+  schemaHint?: SchemaHint;
+}
+
+/**
+ * Schema hint for tables involved in a query
+ */
+export interface SchemaHint {
+  tables: TableSchemaHint[];
+}
+
+export interface TableSchemaHint {
+  schema: string;
+  table: string;
+  columns: ColumnHint[];
+  primaryKey?: string[];
+  foreignKeys?: ForeignKeyHint[];
+  rowCountEstimate?: number;
+}
+
+export interface ColumnHint {
+  name: string;
+  type: string;
+  nullable: boolean;
+}
+
+export interface ForeignKeyHint {
+  columns: string[];
+  referencedTable: string;
+  referencedColumns: string[];
+}
+
+/**
+ * Result of mutation preview (dry-run for INSERT/UPDATE/DELETE)
+ */
+export interface MutationPreviewResult {
+  mutationType: 'INSERT' | 'UPDATE' | 'DELETE' | 'UNKNOWN';
+  estimatedRowsAffected: number;
+  sampleAffectedRows: any[];
+  warning?: string;
+  targetTable?: string;
+  whereClause?: string;
+}
+
+/**
+ * Single query in a batch
+ */
+export interface BatchQuery {
+  name: string;
+  sql: string;
+  params?: any[];
+}
+
+/**
+ * Result of a single query in a batch
+ */
+export interface BatchQueryResult {
+  success: boolean;
+  rows?: any[];
+  rowCount?: number;
+  error?: string;
+  executionTimeMs: number;
+}
+
+/**
+ * Result of batch execution
+ */
+export interface BatchExecuteResult {
+  totalQueries: number;
+  successCount: number;
+  failureCount: number;
+  totalExecutionTimeMs: number;
+  results: { [name: string]: BatchQueryResult };
 }
