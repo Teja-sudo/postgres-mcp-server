@@ -63,13 +63,19 @@ export async function executeSql(args: {
   const endTime = process.hrtime.bigint();
   const executionTimeMs = Number(endTime - startTime) / 1_000_000;
 
+  // Defensive: ensure result has expected structure
+  if (!result || typeof result !== 'object') {
+    throw new Error('Query returned invalid result');
+  }
+
   const fields = result.fields?.map(f => f.name) || [];
-  const totalRows = result.rows.length;
+  const rows = result.rows || [];
+  const totalRows = rows.length;
 
   // Apply offset and limit to the results
   const startIndex = Math.min(offset, totalRows);
   const endIndex = Math.min(startIndex + maxRows, totalRows);
-  const paginatedRows = result.rows.slice(startIndex, endIndex);
+  const paginatedRows = rows.slice(startIndex, endIndex);
   const returnedRows = paginatedRows.length;
 
   // Calculate actual output size
