@@ -8,6 +8,8 @@ interface ServerInfo {
   isDefault: boolean;
   defaultDatabase?: string;
   defaultSchema?: string;
+  /** AI context/guidance for this server */
+  context?: string;
 }
 
 interface ListServersResult {
@@ -122,7 +124,8 @@ export async function listServers(args: {
       isConnected,
       isDefault: config.isDefault === true || name === defaultServerName,
       defaultDatabase: config.defaultDatabase,
-      defaultSchema: config.defaultSchema
+      defaultSchema: config.defaultSchema,
+      context: config.context
     });
   }
 

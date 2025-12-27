@@ -87,7 +87,7 @@ function parseSslFromEnv(sslValue: string | undefined): ServerConfig["ssl"] {
 /**
  * Loads server configurations from individual PG_* environment variables.
  * Pattern: PG_NAME_1, PG_HOST_1, PG_PORT_1, PG_USERNAME_1, PG_PASSWORD_1,
- *          PG_DATABASE_1, PG_SCHEMA_1, PG_SSL_1, PG_DEFAULT_1
+ *          PG_DATABASE_1, PG_SCHEMA_1, PG_SSL_1, PG_DEFAULT_1, PG_CONTEXT_1
  */
 function loadServersFromEnvVars(): ServersConfig {
   const servers: ServersConfig = {};
@@ -133,6 +133,7 @@ function loadServersFromEnvVars(): ServersConfig {
       defaultSchema: process.env[`PG_SCHEMA${suffix}`],
       isDefault: process.env[`PG_DEFAULT${suffix}`]?.toLowerCase() === "true",
       ssl: parseSslFromEnv(process.env[`PG_SSL${suffix}`]),
+      context: process.env[`PG_CONTEXT${suffix}`],
     };
 
     servers[name] = config;
@@ -330,12 +331,16 @@ export class DatabaseManager {
   }
 
   public getConnectionInfo(): ConnectionInfo {
+    const currentServer = this.connectionState.currentServer;
+    const serverConfig = currentServer ? this.serversConfig[currentServer] : null;
+
     return {
       isConnected: this.isConnected(),
-      server: this.connectionState.currentServer,
+      server: currentServer,
       database: this.connectionState.currentDatabase,
       schema: this.connectionState.currentSchema,
       accessMode: this.readOnlyMode ? "readonly" : "full",
+      context: serverConfig?.context,
     };
   }
 

@@ -64,7 +64,7 @@ function withContext<T>(result: T): T & { connection: ReturnType<typeof getConne
 const server = new McpServer(
   {
     name: "postgres-mcp-server",
-    version: "1.9.0",
+    version: "2.0.0",
   },
   {
     capabilities: {

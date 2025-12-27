@@ -35,6 +35,7 @@ export PG_DATABASE_1="myapp_dev"
 export PG_SCHEMA_1="public"
 export PG_SSL_1="true"
 export PG_DEFAULT_1="true"
+export PG_CONTEXT_1="Development server. Feel free to run any queries. Test data only."
 
 # Server 2 - Staging
 export PG_NAME_2="staging"
@@ -44,6 +45,7 @@ export PG_USERNAME_2="staging_user"
 export PG_PASSWORD_2="staging_password"
 export PG_DATABASE_2="myapp_staging"
 export PG_SSL_2="require"
+export PG_CONTEXT_2="Staging server with production-like data. Avoid bulk deletes. Use LIMIT on large tables."
 
 # Server 3 - Production
 export PG_NAME_3="production"
@@ -54,6 +56,7 @@ export PG_PASSWORD_3="prod_password"
 export PG_DATABASE_3="myapp_prod"
 export PG_SCHEMA_3="app"
 export PG_SSL_3="true"
+export PG_CONTEXT_3="PRODUCTION - Read-only queries only. Always use LIMIT. Avoid full table scans. Peak hours: 9am-5pm EST."
 ```
 
 **Environment Variable Reference:**
@@ -69,6 +72,32 @@ export PG_SSL_3="true"
 | `PG_SCHEMA_{n}`   | No       | Default schema (default: "public")                                 |
 | `PG_SSL_{n}`      | No       | SSL mode: `true`, `false`, `require`, `prefer`, `allow`, `disable` |
 | `PG_DEFAULT_{n}`  | No       | Set to `true` to make this the default server                      |
+| `PG_CONTEXT_{n}`  | No       | AI context/guidance for this server (see below)                    |
+
+#### AI Context for Servers
+
+The `PG_CONTEXT_{n}` variable allows you to provide guidance to AI agents about how to interact with each server. This context is returned in `list_servers` and `get_current_connection` responses, helping AI agents make better decisions.
+
+**Example context values:**
+
+```bash
+# Development - full access
+export PG_CONTEXT_DEV="Development environment. Safe to run any queries. Contains test data only."
+
+# Staging - be careful
+export PG_CONTEXT_STAGING="Staging with production-like data. Use LIMIT clauses. Avoid bulk operations."
+
+# Production - strict guidelines
+export PG_CONTEXT_PROD="PRODUCTION DATABASE - CRITICAL GUIDELINES:
+- Read-only queries strongly preferred
+- Always use LIMIT (max 1000 rows)
+- Avoid full table scans on large tables (users, orders, events)
+- Peak hours: 9am-5pm EST - minimize heavy queries
+- Main schemas: 'app' (application data), 'analytics' (reporting)
+- Contact DBA before any DDL operations"
+```
+
+The context appears in the `list_servers` response for each server and in `get_current_connection` for the active server, allowing AI agents to adjust their behavior accordingly.
 
 **Note:** The suffix `{n}` can be any string (e.g., `_1`, `_2`, `_DEV`, `_PROD`). The system detects servers by looking for `PG_NAME_*` variables.
 
@@ -86,15 +115,17 @@ export POSTGRES_SERVERS='{
     "defaultDatabase": "myapp_dev",
     "defaultSchema": "public",
     "isDefault": true,
-    "ssl": true
+    "ssl": true,
+    "context": "Development server. Safe for any queries."
   },
-  "staging": {
-    "host": "staging.example.com",
+  "production": {
+    "host": "prod.example.com",
     "port": "5432",
     "username": "your_username",
     "password": "your_password",
-    "defaultDatabase": "myapp_staging",
-    "ssl": "require"
+    "defaultDatabase": "myapp_prod",
+    "ssl": "require",
+    "context": "PRODUCTION - Read-only queries only. Always use LIMIT."
   }
 }'
 ```

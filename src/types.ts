@@ -12,6 +12,14 @@ export interface ServerConfig {
     cert?: string;
     key?: string;
   };
+  /**
+   * AI context/guidance for this server. Can include:
+   * - Server purpose (production, staging, development)
+   * - Dos and don'ts (e.g., "Read-only queries preferred", "Avoid large table scans")
+   * - Database-specific hints (e.g., "Main user data in 'users' schema")
+   * - Any instructions to help AI agents use this server effectively
+   */
+  context?: string;
 }
 
 export interface ServersConfig {
@@ -30,6 +38,8 @@ export interface ConnectionInfo {
   database: string | null;
   schema: string | null;
   accessMode: 'full' | 'readonly';
+  /** AI context/guidance for the current server */
+  context?: string;
 }
 
 export interface DatabaseInfo {

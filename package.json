@@ -1,6 +1,6 @@
 {
   "name": "@tejasanik/postgres-mcp-server",
-  "version": "1.8.0",
+  "version": "2.0.0",
   "description": "A Model Context Protocol (MCP) server for PostgreSQL database management and analysis",
   "type": "module",
   "main": "dist/index.js",

@@ -201,6 +201,59 @@ describe('DatabaseManager', () => {
       // staging should still come from JSON
       expect(manager.getServerConfig('staging')?.host).toBe('staging-host');
     });
+
+    it('should parse context from PG_CONTEXT_* env vars', () => {
+      process.env.PG_NAME_1 = 'dev';
+      process.env.PG_HOST_1 = 'localhost';
+      process.env.PG_USERNAME_1 = 'user';
+      process.env.PG_CONTEXT_1 = 'Development server. Safe for any queries.';
+
+      process.env.PG_NAME_PROD = 'production';
+      process.env.PG_HOST_PROD = 'prod.example.com';
+      process.env.PG_USERNAME_PROD = 'prod_user';
+      process.env.PG_CONTEXT_PROD = 'PRODUCTION - Read-only queries only. Always use LIMIT.';
+
+      const manager = new DatabaseManager();
+
+      expect(manager.getServerConfig('dev')?.context).toBe('Development server. Safe for any queries.');
+      expect(manager.getServerConfig('production')?.context).toBe('PRODUCTION - Read-only queries only. Always use LIMIT.');
+    });
+
+    it('should parse context from POSTGRES_SERVERS JSON', () => {
+      process.env.POSTGRES_SERVERS = JSON.stringify({
+        dev: {
+          host: 'localhost',
+          port: '5432',
+          username: 'user',
+          password: 'pass',
+          context: 'Test environment with sample data.'
+        },
+        prod: {
+          host: 'prod.example.com',
+          port: '5432',
+          username: 'prod_user',
+          password: 'prod_pass',
+          context: 'Production - be careful!'
+        }
+      });
+
+      const manager = new DatabaseManager();
+
+      expect(manager.getServerConfig('dev')?.context).toBe('Test environment with sample data.');
+      expect(manager.getServerConfig('prod')?.context).toBe('Production - be careful!');
+    });
+
+    it('should include context in getConnectionInfo', () => {
+      process.env.PG_NAME_1 = 'dev';
+      process.env.PG_HOST_1 = 'localhost';
+      process.env.PG_USERNAME_1 = 'user';
+      process.env.PG_CONTEXT_1 = 'Development context here';
+
+      const manager = new DatabaseManager();
+      // Note: Not connected yet, so context should be undefined
+      const infoBeforeConnect = manager.getConnectionInfo();
+      expect(infoBeforeConnect.context).toBeUndefined();
+    });
   });
 
   describe('access mode from environment', () => {
