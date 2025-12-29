@@ -630,6 +630,888 @@ INVALID;`);
     });
   });
 
+  describe('previewSqlFile', () => {
+    let testDir: string;
+    let testFile: string;
+
+    beforeEach(() => {
+      // Create unique test directory for each test run
+      testDir = fs.mkdtempSync('/tmp/postgres-mcp-preview-test-');
+      testFile = `${testDir}/test.sql`;
+    });
+
+    afterEach(() => {
+      // Clean up test files and directory
+      try {
+        if (fs.existsSync(testFile)) {
+          fs.unlinkSync(testFile);
+        }
+        if (fs.existsSync(testDir)) {
+          fs.rmdirSync(testDir);
+        }
+      } catch (e) {
+        // Ignore cleanup errors
+      }
+    });
+
+    it('should require filePath parameter', async () => {
+      const { previewSqlFile } = await import('../tools/sql-tools.js');
+      await expect(previewSqlFile({ filePath: '' }))
+        .rejects.toThrow('filePath parameter is required');
+    });
+
+    it('should only allow .sql files', async () => {
+      const { previewSqlFile } = await import('../tools/sql-tools.js');
+      await expect(previewSqlFile({ filePath: '/path/to/file.txt' }))
+        .rejects.toThrow('Only .sql files are allowed');
+    });
+
+    it('should throw if file does not exist', async () => {
+      const { previewSqlFile } = await import('../tools/sql-tools.js');
+      await expect(previewSqlFile({ filePath: '/nonexistent/path/file.sql' }))
+        .rejects.toThrow('File not found');
+    });
+
+    it('should throw if file is empty', async () => {
+      const { previewSqlFile } = await import('../tools/sql-tools.js');
+      fs.writeFileSync(testFile, '');
+      await expect(previewSqlFile({ filePath: testFile }))
+        .rejects.toThrow('File is empty');
+    });
+
+    it('should preview a simple SQL file', async () => {
+      const { previewSqlFile } = await import('../tools/sql-tools.js');
+      fs.writeFileSync(testFile, 'SELECT 1; SELECT 2; SELECT 3;');
+
+      const result = await previewSqlFile({ filePath: testFile });
+
+      expect(result.totalStatements).toBe(3);
+      expect(result.statementsByType['SELECT']).toBe(3);
+      expect(result.statements).toHaveLength(3);
+      expect(result.warnings).toHaveLength(0);
+      expect(result.summary).toContain('3 statements');
+    });
+
+    it('should count statement types correctly', async () => {
+      const { previewSqlFile } = await import('../tools/sql-tools.js');
+      fs.writeFileSync(testFile, `
+        CREATE TABLE test (id INT);
+        INSERT INTO test VALUES (1);
+        INSERT INTO test VALUES (2);
+        UPDATE test SET id = 3 WHERE id = 1;
+        SELECT * FROM test;
+        DELETE FROM test WHERE id = 2;
+        DROP TABLE test;
+      `);
+
+      const result = await previewSqlFile({ filePath: testFile });
+
+      expect(result.totalStatements).toBe(7);
+      expect(result.statementsByType['CREATE']).toBe(1);
+      expect(result.statementsByType['INSERT']).toBe(2);
+      expect(result.statementsByType['UPDATE']).toBe(1);
+      expect(result.statementsByType['SELECT']).toBe(1);
+      expect(result.statementsByType['DELETE']).toBe(1);
+      expect(result.statementsByType['DROP']).toBe(1);
+    });
+
+    it('should warn about DROP statements', async () => {
+      const { previewSqlFile } = await import('../tools/sql-tools.js');
+      fs.writeFileSync(testFile, `
+        CREATE TABLE test (id INT);
+        DROP TABLE test;
+        DROP INDEX idx_test;
+      `);
+
+      const result = await previewSqlFile({ filePath: testFile });
+
+      expect(result.warnings.length).toBeGreaterThan(0);
+      expect(result.warnings.some(w => w.includes('DROP'))).toBe(true);
+    });
+
+    it('should warn about TRUNCATE statements', async () => {
+      const { previewSqlFile } = await import('../tools/sql-tools.js');
+      fs.writeFileSync(testFile, `TRUNCATE TABLE users;`);
+
+      const result = await previewSqlFile({ filePath: testFile });
+
+      expect(result.warnings.length).toBe(1);
+      expect(result.warnings[0]).toContain('TRUNCATE');
+    });
+
+    it('should warn about DELETE without WHERE', async () => {
+      const { previewSqlFile } = await import('../tools/sql-tools.js');
+      fs.writeFileSync(testFile, `DELETE FROM users;`);
+
+      const result = await previewSqlFile({ filePath: testFile });
+
+      expect(result.warnings.length).toBe(1);
+      expect(result.warnings[0]).toContain('DELETE without WHERE');
+    });
+
+    it('should warn about UPDATE without WHERE', async () => {
+      const { previewSqlFile } = await import('../tools/sql-tools.js');
+      fs.writeFileSync(testFile, `UPDATE users SET status = 'inactive';`);
+
+      const result = await previewSqlFile({ filePath: testFile });
+
+      expect(result.warnings.length).toBe(1);
+      expect(result.warnings[0]).toContain('UPDATE without WHERE');
+    });
+
+    it('should NOT warn about DELETE with WHERE', async () => {
+      const { previewSqlFile } = await import('../tools/sql-tools.js');
+      fs.writeFileSync(testFile, `DELETE FROM users WHERE id = 1;`);
+
+      const result = await previewSqlFile({ filePath: testFile });
+
+      expect(result.warnings).toHaveLength(0);
+    });
+
+    it('should NOT warn about UPDATE with WHERE', async () => {
+      const { previewSqlFile } = await import('../tools/sql-tools.js');
+      fs.writeFileSync(testFile, `UPDATE users SET status = 'inactive' WHERE id = 1;`);
+
+      const result = await previewSqlFile({ filePath: testFile });
+
+      expect(result.warnings).toHaveLength(0);
+    });
+
+    it('should strip patterns before parsing', async () => {
+      const { previewSqlFile } = await import('../tools/sql-tools.js');
+      fs.writeFileSync(testFile, `
+SELECT 1;
+/
+SELECT 2;
+/
+      `);
+
+      const result = await previewSqlFile({
+        filePath: testFile,
+        stripPatterns: ['/']
+      });
+
+      expect(result.totalStatements).toBe(2);
+      expect(result.statementsByType['SELECT']).toBe(2);
+    });
+
+    it('should strip regex patterns before parsing', async () => {
+      const { previewSqlFile } = await import('../tools/sql-tools.js');
+      fs.writeFileSync(testFile, `
+SELECT 1;
+GO
+SELECT 2;
+  GO
+SELECT 3;
+      `);
+
+      const result = await previewSqlFile({
+        filePath: testFile,
+        stripPatterns: ['^\\s*GO\\s*$'],
+        stripAsRegex: true
+      });
+
+      expect(result.totalStatements).toBe(3);
+    });
+
+    it('should limit statements returned based on maxStatements', async () => {
+      const { previewSqlFile } = await import('../tools/sql-tools.js');
+      // Create file with 30 statements
+      const statements = Array(30).fill('SELECT 1;').join('\n');
+      fs.writeFileSync(testFile, statements);
+
+      const result = await previewSqlFile({
+        filePath: testFile,
+        maxStatements: 10
+      });
+
+      expect(result.totalStatements).toBe(30);
+      expect(result.statements).toHaveLength(10);
+    });
+
+    it('should format file size correctly', async () => {
+      const { previewSqlFile } = await import('../tools/sql-tools.js');
+      // Create a larger file
+      const content = 'SELECT * FROM large_table;\n'.repeat(100);
+      fs.writeFileSync(testFile, content);
+
+      const result = await previewSqlFile({ filePath: testFile });
+
+      expect(result.fileSize).toBeGreaterThan(0);
+      expect(result.fileSizeFormatted).toBeDefined();
+      expect(typeof result.fileSizeFormatted).toBe('string');
+    });
+
+    it('should include line numbers in statement preview', async () => {
+      const { previewSqlFile } = await import('../tools/sql-tools.js');
+      // Write file with explicit line structure
+      fs.writeFileSync(testFile, '-- Comment line 1\nSELECT 1;\n-- Comment line 3\nSELECT 2;\nSELECT 3;');
+
+      const result = await previewSqlFile({ filePath: testFile });
+
+      // Verify statements have line numbers assigned
+      expect(result.statements.length).toBe(3);
+      expect(result.statements[0].lineNumber).toBeGreaterThan(0);
+      expect(result.statements[1].lineNumber).toBeGreaterThan(result.statements[0].lineNumber);
+      expect(result.statements[2].lineNumber).toBeGreaterThan(result.statements[1].lineNumber);
+    });
+
+    it('should truncate long SQL statements', async () => {
+      const { previewSqlFile } = await import('../tools/sql-tools.js');
+      const longSelect = 'SELECT ' + 'a, '.repeat(200) + 'b FROM table1;';
+      fs.writeFileSync(testFile, longSelect);
+
+      const result = await previewSqlFile({ filePath: testFile });
+
+      expect(result.statements[0].sql.length).toBeLessThanOrEqual(303); // 300 + '...'
+      expect(result.statements[0].sql).toContain('...');
+    });
+
+    it('should handle multi-line statements correctly', async () => {
+      const { previewSqlFile } = await import('../tools/sql-tools.js');
+      fs.writeFileSync(testFile, `
+CREATE TABLE users (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(100),
+  email VARCHAR(255)
+);
+
+INSERT INTO users (name, email)
+VALUES ('John', 'john@example.com');
+      `);
+
+      const result = await previewSqlFile({ filePath: testFile });
+
+      expect(result.totalStatements).toBe(2);
+      expect(result.statementsByType['CREATE']).toBe(1);
+      expect(result.statementsByType['INSERT']).toBe(1);
+    });
+
+    it('should handle dollar-quoted strings', async () => {
+      const { previewSqlFile } = await import('../tools/sql-tools.js');
+      fs.writeFileSync(testFile, `
+CREATE FUNCTION test() RETURNS void AS $$
+BEGIN
+  -- This semicolon should not split the statement;
+  RAISE NOTICE 'Hello';
+END;
+$$ LANGUAGE plpgsql;
+
+SELECT 1;
+      `);
+
+      const result = await previewSqlFile({ filePath: testFile });
+
+      expect(result.totalStatements).toBe(2);
+      expect(result.statementsByType['CREATE']).toBe(1);
+      expect(result.statementsByType['SELECT']).toBe(1);
+    });
+
+    it('should generate meaningful summary', async () => {
+      const { previewSqlFile } = await import('../tools/sql-tools.js');
+      fs.writeFileSync(testFile, `
+        CREATE TABLE t1 (id INT);
+        CREATE TABLE t2 (id INT);
+        INSERT INTO t1 VALUES (1);
+        SELECT * FROM t1;
+      `);
+
+      const result = await previewSqlFile({ filePath: testFile });
+
+      expect(result.summary).toContain('4 statements');
+      expect(result.summary).toContain('CREATE');
+      expect(result.summary).toContain('INSERT');
+      expect(result.summary).toContain('SELECT');
+    });
+
+    it('should handle file with only comments', async () => {
+      const { previewSqlFile } = await import('../tools/sql-tools.js');
+      fs.writeFileSync(testFile, `
+        -- This is a comment
+        /* This is a block comment */
+        -- Another comment
+      `);
+
+      const result = await previewSqlFile({ filePath: testFile });
+
+      expect(result.totalStatements).toBe(0);
+      expect(result.statements).toHaveLength(0);
+      expect(result.summary).toContain('0 statement');
+    });
+
+    it('should handle CTE queries (WITH statements)', async () => {
+      const { previewSqlFile } = await import('../tools/sql-tools.js');
+      fs.writeFileSync(testFile, `
+WITH cte AS (SELECT 1 AS n)
+SELECT * FROM cte;
+
+WITH ins AS (
+  INSERT INTO test (name) VALUES ('test')
+  RETURNING *
+)
+SELECT * FROM ins;
+      `);
+
+      const result = await previewSqlFile({ filePath: testFile });
+
+      expect(result.totalStatements).toBe(2);
+      // Both WITH statements end with SELECT (to get the results)
+      // so they should be detected as WITH SELECT
+      expect(result.statementsByType['WITH SELECT']).toBe(2);
+    });
+
+    it('should handle multiple dangerous operations and generate multiple warnings', async () => {
+      const { previewSqlFile } = await import('../tools/sql-tools.js');
+      fs.writeFileSync(testFile, `
+        DROP TABLE users;
+        DROP TABLE orders;
+        TRUNCATE TABLE logs;
+        DELETE FROM sessions;
+        UPDATE config SET value = 'new';
+      `);
+
+      const result = await previewSqlFile({ filePath: testFile });
+
+      expect(result.warnings.length).toBe(5);
+      expect(result.warnings.filter(w => w.includes('DROP')).length).toBe(2);
+      expect(result.warnings.filter(w => w.includes('TRUNCATE')).length).toBe(1);
+      expect(result.warnings.filter(w => w.includes('DELETE without WHERE')).length).toBe(1);
+      expect(result.warnings.filter(w => w.includes('UPDATE without WHERE')).length).toBe(1);
+    });
+  });
+
+  describe('mutationDryRun', () => {
+    let mockClient: { query: MockFn; release: MockFn };
+
+    beforeEach(() => {
+      mockClient = {
+        query: jest.fn<MockFn>(),
+        release: jest.fn<MockFn>()
+      };
+      mockGetClient.mockResolvedValue(mockClient);
+    });
+
+    it('should require sql parameter', async () => {
+      const { mutationDryRun } = await import('../tools/sql-tools.js');
+      await expect(mutationDryRun({ sql: '' }))
+        .rejects.toThrow('sql parameter is required');
+    });
+
+    it('should only accept INSERT/UPDATE/DELETE statements', async () => {
+      const { mutationDryRun } = await import('../tools/sql-tools.js');
+      await expect(mutationDryRun({ sql: 'SELECT * FROM users' }))
+        .rejects.toThrow('SQL must be an INSERT, UPDATE, or DELETE statement');
+    });
+
+    it('should execute UPDATE in transaction and rollback', async () => {
+      const { mutationDryRun } = await import('../tools/sql-tools.js');
+
+      mockClient.query
+        .mockResolvedValueOnce({}) // BEGIN
+        .mockResolvedValueOnce({ rows: [{ id: 1, name: 'old' }] }) // SELECT before
+        .mockResolvedValueOnce({ rows: [{ id: 1, name: 'new' }], rowCount: 1 }) // UPDATE RETURNING
+        .mockResolvedValueOnce({}); // ROLLBACK
+
+      const result = await mutationDryRun({
+        sql: "UPDATE users SET name = 'new' WHERE id = 1"
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.mutationType).toBe('UPDATE');
+      expect(result.rowsAffected).toBe(1);
+      expect(mockClient.query).toHaveBeenCalledWith('BEGIN');
+      expect(mockClient.query).toHaveBeenCalledWith('ROLLBACK');
+    });
+
+    it('should execute DELETE in transaction and rollback', async () => {
+      const { mutationDryRun } = await import('../tools/sql-tools.js');
+
+      mockClient.query
+        .mockResolvedValueOnce({}) // BEGIN
+        .mockResolvedValueOnce({ rows: [{ id: 1 }] }) // SELECT before
+        .mockResolvedValueOnce({ rows: [{ id: 1 }], rowCount: 1 }) // DELETE RETURNING
+        .mockResolvedValueOnce({}); // ROLLBACK
+
+      const result = await mutationDryRun({
+        sql: 'DELETE FROM users WHERE id = 1'
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.mutationType).toBe('DELETE');
+      expect(result.rowsAffected).toBe(1);
+    });
+
+    it('should execute INSERT in transaction and rollback', async () => {
+      const { mutationDryRun } = await import('../tools/sql-tools.js');
+
+      mockClient.query
+        .mockResolvedValueOnce({}) // BEGIN
+        .mockResolvedValueOnce({ rows: [{ id: 1, name: 'test' }], rowCount: 1 }) // INSERT RETURNING
+        .mockResolvedValueOnce({}); // ROLLBACK
+
+      const result = await mutationDryRun({
+        sql: "INSERT INTO users (name) VALUES ('test')"
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.mutationType).toBe('INSERT');
+      expect(result.rowsAffected).toBe(1);
+    });
+
+    it('should capture PostgreSQL error details on failure', async () => {
+      const { mutationDryRun } = await import('../tools/sql-tools.js');
+
+      const pgError = new Error('duplicate key value violates unique constraint');
+      (pgError as any).code = '23505';
+      (pgError as any).constraint = 'users_email_key';
+      (pgError as any).detail = 'Key (email)=(test@test.com) already exists.';
+      (pgError as any).table = 'users';
+
+      mockClient.query
+        .mockResolvedValueOnce({}) // BEGIN
+        .mockRejectedValueOnce(pgError) // INSERT RETURNING fails
+        .mockRejectedValueOnce(pgError) // INSERT without RETURNING also fails
+        .mockResolvedValueOnce({}); // ROLLBACK
+
+      const result = await mutationDryRun({
+        sql: "INSERT INTO users (email) VALUES ('test@test.com')"
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.error).toBeDefined();
+      expect(result.error!.code).toBe('23505');
+      expect(result.error!.constraint).toBe('users_email_key');
+      expect(result.error!.detail).toContain('already exists');
+      expect(result.error!.table).toBe('users');
+    });
+
+    it('should warn about UPDATE without WHERE', async () => {
+      const { mutationDryRun } = await import('../tools/sql-tools.js');
+
+      mockClient.query
+        .mockResolvedValueOnce({}) // BEGIN
+        .mockResolvedValueOnce({ rows: [{ id: 1 }] }) // SELECT before
+        .mockResolvedValueOnce({ rows: [], rowCount: 100 }) // UPDATE
+        .mockResolvedValueOnce({}); // ROLLBACK
+
+      const result = await mutationDryRun({
+        sql: "UPDATE users SET status = 'inactive'"
+      });
+
+      expect(result.warnings).toBeDefined();
+      expect(result.warnings!.some(w => w.includes('No WHERE clause'))).toBe(true);
+    });
+
+    it('should detect INSERT sequence warnings (but still execute)', async () => {
+      const { mutationDryRun } = await import('../tools/sql-tools.js');
+
+      mockClient.query
+        .mockResolvedValueOnce({}) // BEGIN
+        .mockResolvedValueOnce({ rows: [{ id: 1 }], rowCount: 1 }) // INSERT
+        .mockResolvedValueOnce({}); // ROLLBACK
+
+      const result = await mutationDryRun({
+        sql: "INSERT INTO users (name) VALUES ('test')"
+      });
+
+      // INSERT should execute (not skipped) but have a warning
+      expect(result.skipped).toBeUndefined();
+      expect(result.success).toBe(true);
+      expect(result.nonRollbackableWarnings).toBeDefined();
+      expect(result.nonRollbackableWarnings!.some(w => w.operation === 'SEQUENCE')).toBe(true);
+      expect(result.nonRollbackableWarnings!.some(w => w.mustSkip === false)).toBe(true);
+    });
+
+    it('should skip INSERT with explicit NEXTVAL but run EXPLAIN', async () => {
+      const { mutationDryRun } = await import('../tools/sql-tools.js');
+
+      // Mock EXPLAIN query
+      mockQuery.mockResolvedValueOnce({
+        rows: [{ 'QUERY PLAN': [{ Plan: { 'Node Type': 'ModifyTable' } }] }],
+        rowCount: 1
+      });
+
+      const result = await mutationDryRun({
+        sql: "INSERT INTO users (id, name) VALUES (nextval('users_id_seq'), 'test')"
+      });
+
+      expect(result.skipped).toBe(true);
+      expect(result.skipReason).toContain('NEXTVAL');
+      expect(result.rowsAffected).toBe(0);
+      expect(result.nonRollbackableWarnings).toBeDefined();
+      expect(result.nonRollbackableWarnings!.some(w => w.operation === 'SEQUENCE' && w.mustSkip === true)).toBe(true);
+      // Should have EXPLAIN plan
+      expect(result.explainPlan).toBeDefined();
+      expect(mockQuery).toHaveBeenCalledWith(expect.stringContaining('EXPLAIN'));
+    });
+
+    it('should capture before and after rows for UPDATE', async () => {
+      const { mutationDryRun } = await import('../tools/sql-tools.js');
+
+      mockClient.query
+        .mockResolvedValueOnce({}) // BEGIN
+        .mockResolvedValueOnce({ rows: [{ id: 1, status: 'active' }] }) // SELECT before
+        .mockResolvedValueOnce({ rows: [{ id: 1, status: 'inactive' }], rowCount: 1 }) // UPDATE RETURNING
+        .mockResolvedValueOnce({}); // ROLLBACK
+
+      const result = await mutationDryRun({
+        sql: "UPDATE users SET status = 'inactive' WHERE id = 1"
+      });
+
+      expect(result.beforeRows).toBeDefined();
+      expect(result.beforeRows![0].status).toBe('active');
+      expect(result.affectedRows).toBeDefined();
+      expect(result.affectedRows![0].status).toBe('inactive');
+    });
+
+    it('should handle CTE UPDATE statements', async () => {
+      const { mutationDryRun } = await import('../tools/sql-tools.js');
+
+      mockClient.query
+        .mockResolvedValueOnce({}) // BEGIN
+        .mockResolvedValueOnce({ rows: [{ id: 1 }], rowCount: 1 }) // UPDATE
+        .mockResolvedValueOnce({}); // ROLLBACK
+
+      const result = await mutationDryRun({
+        sql: "WITH updated AS (UPDATE users SET status = 'inactive' WHERE id = 1 RETURNING *) SELECT * FROM updated"
+      });
+
+      expect(result.mutationType).toBe('UPDATE');
+    });
+
+    it('should always rollback even on error', async () => {
+      const { mutationDryRun } = await import('../tools/sql-tools.js');
+
+      const error = new Error('Some error');
+      mockClient.query
+        .mockResolvedValueOnce({}) // BEGIN
+        .mockRejectedValueOnce(error) // INSERT RETURNING fails
+        .mockRejectedValueOnce(error) // INSERT without RETURNING also fails
+        .mockResolvedValueOnce({}); // ROLLBACK
+
+      const result = await mutationDryRun({
+        sql: "INSERT INTO users (name) VALUES ('test')"
+      });
+
+      expect(result.success).toBe(false);
+      expect(mockClient.query).toHaveBeenCalledWith('ROLLBACK');
+    });
+  });
+
+  describe('dryRunSqlFile', () => {
+    let mockClient: { query: MockFn; release: MockFn };
+    let testDir: string;
+    let testFile: string;
+
+    beforeEach(() => {
+      mockClient = {
+        query: jest.fn<MockFn>(),
+        release: jest.fn<MockFn>()
+      };
+      mockGetClient.mockResolvedValue(mockClient);
+
+      testDir = fs.mkdtempSync('/tmp/postgres-mcp-dryrun-test-');
+      testFile = `${testDir}/test.sql`;
+    });
+
+    afterEach(() => {
+      try {
+        if (fs.existsSync(testFile)) fs.unlinkSync(testFile);
+        if (fs.existsSync(testDir)) fs.rmdirSync(testDir);
+      } catch (e) { /* ignore */ }
+    });
+
+    it('should require filePath parameter', async () => {
+      const { dryRunSqlFile } = await import('../tools/sql-tools.js');
+      await expect(dryRunSqlFile({ filePath: '' }))
+        .rejects.toThrow('filePath parameter is required');
+    });
+
+    it('should only allow .sql files', async () => {
+      const { dryRunSqlFile } = await import('../tools/sql-tools.js');
+      await expect(dryRunSqlFile({ filePath: '/path/to/file.txt' }))
+        .rejects.toThrow('Only .sql files are allowed');
+    });
+
+    it('should execute all statements and rollback', async () => {
+      const { dryRunSqlFile } = await import('../tools/sql-tools.js');
+      fs.writeFileSync(testFile, 'SELECT 1; SELECT 2; SELECT 3;');
+
+      mockClient.query
+        .mockResolvedValueOnce({}) // BEGIN
+        .mockResolvedValueOnce({ rows: [{ '?column?': 1 }], rowCount: 1 }) // SELECT 1
+        .mockResolvedValueOnce({ rows: [{ '?column?': 2 }], rowCount: 1 }) // SELECT 2
+        .mockResolvedValueOnce({ rows: [{ '?column?': 3 }], rowCount: 1 }) // SELECT 3
+        .mockResolvedValueOnce({}); // ROLLBACK
+
+      const result = await dryRunSqlFile({ filePath: testFile });
+
+      expect(result.success).toBe(true);
+      expect(result.totalStatements).toBe(3);
+      expect(result.successCount).toBe(3);
+      expect(result.failureCount).toBe(0);
+      expect(result.rolledBack).toBe(true);
+      expect(mockClient.query).toHaveBeenCalledWith('BEGIN');
+      expect(mockClient.query).toHaveBeenCalledWith('ROLLBACK');
+    });
+
+    it('should capture errors with line numbers', async () => {
+      const { dryRunSqlFile } = await import('../tools/sql-tools.js');
+      fs.writeFileSync(testFile, `SELECT 1;
+SELECT 2;
+INVALID SQL;
+SELECT 4;`);
+
+      const pgError = new Error('syntax error at or near "INVALID"');
+      (pgError as any).code = '42601';
+      (pgError as any).position = '1';
+
+      mockClient.query
+        .mockResolvedValueOnce({}) // BEGIN
+        .mockResolvedValueOnce({ rows: [], rowCount: 1 }) // SELECT 1
+        .mockResolvedValueOnce({ rows: [], rowCount: 1 }) // SELECT 2
+        .mockRejectedValueOnce(pgError) // INVALID
+        .mockResolvedValueOnce({ rows: [], rowCount: 1 }) // SELECT 4
+        .mockResolvedValueOnce({}); // ROLLBACK
+
+      const result = await dryRunSqlFile({ filePath: testFile, stopOnError: false });
+
+      expect(result.success).toBe(false);
+      expect(result.failureCount).toBe(1);
+      expect(result.statementResults[2].success).toBe(false);
+      expect(result.statementResults[2].lineNumber).toBe(3);
+      expect(result.statementResults[2].error).toBeDefined();
+      expect(result.statementResults[2].error!.code).toBe('42601');
+    });
+
+    it('should stop on first error when stopOnError is true', async () => {
+      const { dryRunSqlFile } = await import('../tools/sql-tools.js');
+      fs.writeFileSync(testFile, `SELECT 1;
+INVALID;
+SELECT 3;`);
+
+      mockClient.query
+        .mockResolvedValueOnce({}) // BEGIN
+        .mockResolvedValueOnce({ rows: [], rowCount: 1 }) // SELECT 1
+        .mockRejectedValueOnce(new Error('syntax error')) // INVALID
+        .mockResolvedValueOnce({}); // ROLLBACK
+
+      const result = await dryRunSqlFile({ filePath: testFile, stopOnError: true });
+
+      expect(result.success).toBe(false);
+      expect(result.statementResults.length).toBe(2); // Only first two, stopped at error
+      expect(result.successCount).toBe(1);
+      expect(result.failureCount).toBe(1);
+    });
+
+    it('should continue on error when stopOnError is false', async () => {
+      const { dryRunSqlFile } = await import('../tools/sql-tools.js');
+      fs.writeFileSync(testFile, `SELECT 1;
+INVALID;
+SELECT 3;`);
+
+      mockClient.query
+        .mockResolvedValueOnce({}) // BEGIN
+        .mockResolvedValueOnce({ rows: [], rowCount: 1 }) // SELECT 1
+        .mockRejectedValueOnce(new Error('syntax error')) // INVALID
+        .mockResolvedValueOnce({ rows: [], rowCount: 1 }) // SELECT 3
+        .mockResolvedValueOnce({}); // ROLLBACK
+
+      const result = await dryRunSqlFile({ filePath: testFile, stopOnError: false });
+
+      expect(result.statementResults.length).toBe(3);
+      expect(result.successCount).toBe(2);
+      expect(result.failureCount).toBe(1);
+    });
+
+    it('should skip non-rollbackable operations (NEXTVAL) but run EXPLAIN', async () => {
+      const { dryRunSqlFile } = await import('../tools/sql-tools.js');
+      fs.writeFileSync(testFile, `INSERT INTO users (name) VALUES ('test');
+SELECT nextval('users_id_seq');`);
+
+      mockClient.query
+        .mockResolvedValueOnce({}) // BEGIN
+        .mockResolvedValueOnce({ rows: [], rowCount: 1 }) // INSERT (with warning but executed)
+        .mockResolvedValueOnce({ rows: [{ 'QUERY PLAN': [{ Plan: { 'Node Type': 'Result' } }] }] }) // EXPLAIN for nextval
+        .mockResolvedValueOnce({}); // ROLLBACK
+
+      const result = await dryRunSqlFile({ filePath: testFile });
+
+      expect(result.nonRollbackableWarnings.length).toBeGreaterThan(0);
+      expect(result.nonRollbackableWarnings.some(w => w.operation === 'SEQUENCE')).toBe(true);
+      expect(result.skippedCount).toBe(1);
+      expect(result.statementResults[1].skipped).toBe(true);
+      expect(result.statementResults[1].skipReason).toContain('NEXTVAL');
+      // Should have EXPLAIN plan for skipped statement
+      expect(result.statementResults[1].explainPlan).toBeDefined();
+    });
+
+    it('should skip VACUUM operations', async () => {
+      const { dryRunSqlFile } = await import('../tools/sql-tools.js');
+      fs.writeFileSync(testFile, `SELECT 1;
+VACUUM users;`);
+
+      // VACUUM is now SKIPPED, not executed
+      mockClient.query
+        .mockResolvedValueOnce({}) // BEGIN
+        .mockResolvedValueOnce({ rows: [], rowCount: 1 }) // SELECT 1 (VACUUM is SKIPPED)
+        .mockResolvedValueOnce({}); // ROLLBACK
+
+      const result = await dryRunSqlFile({ filePath: testFile });
+
+      expect(result.nonRollbackableWarnings.some(w => w.operation === 'VACUUM')).toBe(true);
+      expect(result.skippedCount).toBe(1);
+      expect(result.statementResults[1].skipped).toBe(true);
+      expect(result.failureCount).toBe(0); // Not a failure, just skipped
+    });
+
+    it('should strip patterns before execution', async () => {
+      const { dryRunSqlFile } = await import('../tools/sql-tools.js');
+      fs.writeFileSync(testFile, `SELECT 1;
+/
+SELECT 2;
+/`);
+
+      mockClient.query
+        .mockResolvedValueOnce({}) // BEGIN
+        .mockResolvedValueOnce({ rows: [], rowCount: 1 }) // SELECT 1
+        .mockResolvedValueOnce({ rows: [], rowCount: 1 }) // SELECT 2
+        .mockResolvedValueOnce({}); // ROLLBACK
+
+      const result = await dryRunSqlFile({
+        filePath: testFile,
+        stripPatterns: ['/']
+      });
+
+      expect(result.totalStatements).toBe(2);
+      expect(result.success).toBe(true);
+    });
+
+    it('should include execution time for each statement', async () => {
+      const { dryRunSqlFile } = await import('../tools/sql-tools.js');
+      fs.writeFileSync(testFile, 'SELECT 1; SELECT 2;');
+
+      mockClient.query
+        .mockResolvedValueOnce({}) // BEGIN
+        .mockResolvedValueOnce({ rows: [], rowCount: 1 })
+        .mockResolvedValueOnce({ rows: [], rowCount: 1 })
+        .mockResolvedValueOnce({}); // ROLLBACK
+
+      const result = await dryRunSqlFile({ filePath: testFile });
+
+      result.statementResults.forEach(stmt => {
+        expect(stmt.executionTimeMs).toBeDefined();
+        expect(typeof stmt.executionTimeMs).toBe('number');
+      });
+    });
+
+    it('should generate comprehensive summary', async () => {
+      const { dryRunSqlFile } = await import('../tools/sql-tools.js');
+      fs.writeFileSync(testFile, `CREATE TABLE test (id INT);
+INSERT INTO test VALUES (1);
+SELECT * FROM test;`);
+
+      mockClient.query
+        .mockResolvedValueOnce({}) // BEGIN
+        .mockResolvedValueOnce({ rowCount: 0 }) // CREATE
+        .mockResolvedValueOnce({ rowCount: 1 }) // INSERT
+        .mockResolvedValueOnce({ rows: [{ id: 1 }], rowCount: 1 }) // SELECT
+        .mockResolvedValueOnce({}); // ROLLBACK
+
+      const result = await dryRunSqlFile({ filePath: testFile });
+
+      expect(result.summary).toContain('Dry-run');
+      expect(result.summary).toContain('3 statements');
+      expect(result.summary).toContain('succeeded');
+      expect(result.summary).toContain('rolled back');
+    });
+
+    it('should include sample rows in results', async () => {
+      const { dryRunSqlFile } = await import('../tools/sql-tools.js');
+      fs.writeFileSync(testFile, 'SELECT id, name FROM users;');
+
+      mockClient.query
+        .mockResolvedValueOnce({}) // BEGIN
+        .mockResolvedValueOnce({
+          rows: [{ id: 1, name: 'Alice' }, { id: 2, name: 'Bob' }],
+          rowCount: 2
+        })
+        .mockResolvedValueOnce({}); // ROLLBACK
+
+      const result = await dryRunSqlFile({ filePath: testFile });
+
+      expect(result.statementResults[0].rows).toBeDefined();
+      expect(result.statementResults[0].rows!.length).toBe(2);
+    });
+
+    it('should capture detailed constraint violation errors', async () => {
+      const { dryRunSqlFile } = await import('../tools/sql-tools.js');
+      fs.writeFileSync(testFile, "INSERT INTO users (email) VALUES ('duplicate@test.com');");
+
+      const pgError = new Error('duplicate key value violates unique constraint "users_email_key"');
+      (pgError as any).code = '23505';
+      (pgError as any).severity = 'ERROR';
+      (pgError as any).detail = 'Key (email)=(duplicate@test.com) already exists.';
+      (pgError as any).schema = 'public';
+      (pgError as any).table = 'users';
+      (pgError as any).constraint = 'users_email_key';
+
+      mockClient.query
+        .mockResolvedValueOnce({}) // BEGIN
+        .mockRejectedValueOnce(pgError) // INSERT fails
+        .mockResolvedValueOnce({}); // ROLLBACK
+
+      const result = await dryRunSqlFile({ filePath: testFile });
+
+      expect(result.success).toBe(false);
+      expect(result.statementResults[0].error).toBeDefined();
+      const error = result.statementResults[0].error!;
+      expect(error.code).toBe('23505');
+      expect(error.severity).toBe('ERROR');
+      expect(error.detail).toContain('already exists');
+      expect(error.schema).toBe('public');
+      expect(error.table).toBe('users');
+      expect(error.constraint).toBe('users_email_key');
+    });
+
+    it('should capture foreign key violation errors', async () => {
+      const { dryRunSqlFile } = await import('../tools/sql-tools.js');
+      fs.writeFileSync(testFile, 'INSERT INTO orders (user_id) VALUES (999);');
+
+      const pgError = new Error('insert or update on table "orders" violates foreign key constraint');
+      (pgError as any).code = '23503';
+      (pgError as any).detail = 'Key (user_id)=(999) is not present in table "users".';
+      (pgError as any).constraint = 'orders_user_id_fkey';
+
+      mockClient.query
+        .mockResolvedValueOnce({}) // BEGIN
+        .mockRejectedValueOnce(pgError)
+        .mockResolvedValueOnce({}); // ROLLBACK
+
+      const result = await dryRunSqlFile({ filePath: testFile });
+
+      expect(result.statementResults[0].error!.code).toBe('23503');
+      expect(result.statementResults[0].error!.constraint).toBe('orders_user_id_fkey');
+    });
+
+    it('should limit results to maxStatements', async () => {
+      const { dryRunSqlFile } = await import('../tools/sql-tools.js');
+      const statements = Array(30).fill('SELECT 1;').join('\n');
+      fs.writeFileSync(testFile, statements);
+
+      // Mock BEGIN, 30 SELECTs, ROLLBACK
+      mockClient.query.mockResolvedValue({ rows: [], rowCount: 1 });
+
+      const result = await dryRunSqlFile({
+        filePath: testFile,
+        maxStatements: 10
+      });
+
+      expect(result.totalStatements).toBe(30);
+      expect(result.statementResults.length).toBe(10);
+    });
+  });
+
   describe('allowMultipleStatements', () => {
     it('should execute multiple statements and return results for each', async () => {
       mockQuery

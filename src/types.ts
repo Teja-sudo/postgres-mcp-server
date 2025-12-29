@@ -40,6 +40,8 @@ export interface ConnectionInfo {
   accessMode: 'full' | 'readonly';
   /** AI context/guidance for the current server */
   context?: string;
+  /** Current database user name */
+  user?: string;
 }
 
 export interface DatabaseInfo {
@@ -258,4 +260,165 @@ export interface TransactionResult {
   transactionId: string;
   status: 'started' | 'committed' | 'rolled_back';
   message: string;
+}
+
+/**
+ * Detailed error information for dry-run operations
+ * Contains all PostgreSQL error details to help AI quickly identify and fix issues
+ */
+export interface DryRunError {
+  /** Error message from PostgreSQL */
+  message: string;
+  /** PostgreSQL error code (e.g., '23505' for unique violation) */
+  code?: string;
+  /** Error severity (ERROR, FATAL, PANIC, WARNING, NOTICE) */
+  severity?: string;
+  /** Detailed error description */
+  detail?: string;
+  /** Hint for fixing the error */
+  hint?: string;
+  /** Character position in SQL where error occurred */
+  position?: number;
+  /** Internal query position if error in PL/pgSQL */
+  internalPosition?: number;
+  /** Internal query text */
+  internalQuery?: string;
+  /** Error context/stack trace from PL/pgSQL */
+  where?: string;
+  /** Schema name related to error */
+  schema?: string;
+  /** Table name related to error */
+  table?: string;
+  /** Column name related to error */
+  column?: string;
+  /** Data type related to error */
+  dataType?: string;
+  /** Constraint name that caused error */
+  constraint?: string;
+  /** File in PostgreSQL source where error originated */
+  file?: string;
+  /** Line in PostgreSQL source */
+  line?: string;
+  /** Routine that generated error */
+  routine?: string;
+}
+
+/**
+ * Result of executing a single statement in dry-run mode
+ */
+export interface DryRunStatementResult {
+  /** Statement index (1-based) */
+  index: number;
+  /** Line number in source file/input */
+  lineNumber: number;
+  /** The SQL statement (may be truncated) */
+  sql: string;
+  /** Detected statement type (SELECT, INSERT, UPDATE, DELETE, CREATE, etc.) */
+  type: string;
+  /** Whether the statement executed successfully */
+  success: boolean;
+  /** Whether the statement was skipped (non-rollbackable operation) */
+  skipped?: boolean;
+  /** Reason for skipping the statement */
+  skipReason?: string;
+  /** Number of rows affected (for DML) or returned (for SELECT) */
+  rowCount?: number;
+  /** Sample of affected/returned rows */
+  rows?: any[];
+  /** Execution time in milliseconds */
+  executionTimeMs?: number;
+  /** Error details if statement failed */
+  error?: DryRunError;
+  /** Warnings generated during execution */
+  warnings?: string[];
+  /** Query plan from EXPLAIN (for skipped DML statements) */
+  explainPlan?: object[];
+}
+
+/**
+ * Operations that cannot be fully rolled back or have side effects
+ */
+export interface NonRollbackableWarning {
+  /** Type of operation */
+  operation: 'SEQUENCE' | 'VACUUM' | 'CLUSTER' | 'REINDEX_CONCURRENTLY' |
+             'CREATE_INDEX_CONCURRENTLY' | 'CREATE_DATABASE' | 'DROP_DATABASE' |
+             'NOTIFY' | 'LISTEN' | 'UNLISTEN' | 'DISCARD' | 'LOAD';
+  /** Warning message explaining the limitation */
+  message: string;
+  /** Statement index (1-based) if applicable */
+  statementIndex?: number;
+  /** Line number if applicable */
+  lineNumber?: number;
+  /** Whether the operation must be skipped (true) or is just a warning (false) */
+  mustSkip?: boolean;
+}
+
+/**
+ * Enhanced mutation preview result with actual dry-run execution
+ */
+export interface MutationDryRunResult {
+  /** Type of mutation */
+  mutationType: 'INSERT' | 'UPDATE' | 'DELETE' | 'UNKNOWN';
+  /** Whether the dry-run executed successfully */
+  success: boolean;
+  /** Whether the statement was skipped (contains non-rollbackable operation) */
+  skipped?: boolean;
+  /** Reason for skipping the statement */
+  skipReason?: string;
+  /** Actual number of rows that would be affected */
+  rowsAffected: number;
+  /** Sample of rows before the change (for UPDATE/DELETE) */
+  beforeRows?: any[];
+  /** Sample of rows after the change (for INSERT/UPDATE) or deleted rows (for DELETE) */
+  affectedRows?: any[];
+  /** Target table name */
+  targetTable?: string;
+  /** WHERE clause if present */
+  whereClause?: string;
+  /** Execution time in milliseconds */
+  executionTimeMs?: number;
+  /** Error details if execution failed */
+  error?: DryRunError;
+  /** Warnings about non-rollbackable side effects */
+  nonRollbackableWarnings?: NonRollbackableWarning[];
+  /** General warnings */
+  warnings?: string[];
+  /** Query plan from EXPLAIN (for skipped statements with NEXTVAL/SETVAL) */
+  explainPlan?: object[];
+}
+
+/**
+ * Result of dry-run execution of a SQL file
+ */
+export interface SqlFileDryRunResult {
+  /** Whether all statements executed successfully */
+  success: boolean;
+  /** Resolved file path */
+  filePath: string;
+  /** File size in bytes */
+  fileSize: number;
+  /** Human-readable file size */
+  fileSizeFormatted: string;
+  /** Total number of statements in file */
+  totalStatements: number;
+  /** Number of successfully executed statements */
+  successCount: number;
+  /** Number of failed statements */
+  failureCount: number;
+  /** Number of skipped statements (non-rollbackable operations) */
+  skippedCount: number;
+  /** Total rows affected across all statements */
+  totalRowsAffected: number;
+  /** Breakdown of statements by type */
+  statementsByType: { [type: string]: number };
+  /** Total execution time in milliseconds */
+  executionTimeMs: number;
+  /** Results for each statement */
+  statementResults: DryRunStatementResult[];
+  /** Warnings about non-rollbackable operations */
+  nonRollbackableWarnings: NonRollbackableWarning[];
+  /** Summary message */
+  summary: string;
+  /** Note that changes were rolled back */
+  rolledBack: boolean;
 }

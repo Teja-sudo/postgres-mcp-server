@@ -341,6 +341,7 @@ export class DatabaseManager {
       schema: this.connectionState.currentSchema,
       accessMode: this.readOnlyMode ? "readonly" : "full",
       context: serverConfig?.context,
+      user: serverConfig?.username,
     };
   }
 

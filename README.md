@@ -266,7 +266,7 @@ Switch to a different PostgreSQL server and optionally a specific database and s
 
 #### `get_current_connection`
 
-Returns details about the current database connection including server, database, schema, and access mode.
+Returns details about the current database connection including server, database, schema, access mode, user, and AI context.
 
 **Parameters:** None
 
@@ -277,6 +277,8 @@ Returns details about the current database connection including server, database
 - `database`: Current database name
 - `schema`: Current schema name
 - `accessMode`: "readonly" or "full"
+- `user`: Database username for the current connection
+- `context`: (If configured) AI context/guidance for the current server
 
 ### Schema & Object Exploration
 
@@ -341,13 +343,16 @@ Executes SQL statements on the database. Supports pagination and parameterized q
 
 #### `execute_sql_file`
 
-Executes a `.sql` file from the filesystem. Useful for running migration scripts, schema changes, or data imports.
+Executes a `.sql` file from the filesystem. Useful for running migration scripts, schema changes, or data imports. Supports SQL files from various tools like Liquibase, Flyway, and SQL Server migrations.
 
 **Parameters:**
 
 - `filePath` (required): Absolute or relative path to the `.sql` file to execute
 - `useTransaction` (optional): Wrap execution in a transaction (default: true). If any statement fails, all changes are rolled back.
 - `stopOnError` (optional): Stop execution on first error (default: true). If false, continues with remaining statements and collects all errors.
+- `stripPatterns` (optional): Array of patterns to remove from SQL before execution. Useful for stripping tool-specific delimiters (e.g., Liquibase's `/`, SQL Server's `GO`).
+- `stripAsRegex` (optional): If true, treat `stripPatterns` as regular expressions; if false, as literal strings (default: false).
+- `validateOnly` (optional): If true, parse and validate the file without executing (default: false). Returns a preview of all statements.
 
 **Returns:**
 
@@ -364,8 +369,83 @@ Executes a `.sql` file from the filesystem. Useful for running migration scripts
   - `sql`: The failing SQL (truncated to 200 chars)
   - `error`: Error message
 - `rollback`: Whether a rollback was performed
+- `validateOnly`: (When validateOnly=true) Set to true
+- `preview`: (When validateOnly=true) Array of statement previews:
+  - `index`: Statement index (1-based)
+  - `lineNumber`: Line number in the file
+  - `sql`: The SQL statement (truncated to 200 chars)
+  - `type`: Detected statement type (SELECT, INSERT, UPDATE, DELETE, CREATE, etc.)
 
 **Limits:** Max file size: 50MB. Supports PostgreSQL-specific syntax including dollar-quoted strings and block comments.
+
+**Examples:**
+
+```
+# Preview a file without executing
+execute_sql_file({ filePath: "/path/to/migration.sql", validateOnly: true })
+
+# Strip Liquibase delimiters (literal "/" on its own line)
+execute_sql_file({ filePath: "/path/to/liquibase.sql", stripPatterns: ["/"] })
+
+# Strip SQL Server GO statements (regex pattern)
+execute_sql_file({
+  filePath: "/path/to/sqlserver.sql",
+  stripPatterns: ["^\\s*GO\\s*$"],
+  stripAsRegex: true
+})
+
+# Strip multiple patterns
+execute_sql_file({
+  filePath: "/path/to/migration.sql",
+  stripPatterns: ["/", "GO", "\\"]
+})
+```
+
+#### `preview_sql_file`
+
+Preview a SQL file without executing it. Similar to `mutation_preview` but for SQL files. Shows statement counts by type and warnings for potentially dangerous operations. Use this before `execute_sql_file` to understand what a migration will do.
+
+**Parameters:**
+
+- `filePath` (required): Absolute or relative path to the `.sql` file to preview
+- `stripPatterns` (optional): Patterns to strip from SQL before parsing (same as execute_sql_file)
+- `stripAsRegex` (optional): If true, treat patterns as regex (default: false)
+- `maxStatements` (optional): Maximum statements to show in preview (default: 20, max: 100)
+
+**Returns:**
+
+- `filePath`: Resolved file path
+- `fileSize`: File size in bytes
+- `fileSizeFormatted`: Human-readable file size (e.g., "15.2 KB")
+- `totalStatements`: Total executable statements in the file
+- `statementsByType`: Breakdown by statement type (e.g., `{ "CREATE": 5, "INSERT": 10, "ALTER": 2 }`)
+- `statements`: Array of statement previews (up to maxStatements):
+  - `index`: Statement number (1-based)
+  - `lineNumber`: Line number in file
+  - `sql`: Statement SQL (truncated to 300 chars)
+  - `type`: Statement type (SELECT, INSERT, CREATE, etc.)
+- `warnings`: Array of warnings for dangerous operations:
+  - DROP statements
+  - TRUNCATE statements
+  - DELETE/UPDATE without WHERE clause
+- `summary`: Human-readable summary (e.g., "File contains 17 statements: 10 INSERT, 5 CREATE, 2 ALTER")
+
+**Example:**
+
+```
+preview_sql_file({ filePath: "/path/to/migration.sql" })
+// Returns:
+// {
+//   "filePath": "/path/to/migration.sql",
+//   "fileSize": 15234,
+//   "fileSizeFormatted": "14.9 KB",
+//   "totalStatements": 17,
+//   "statementsByType": { "CREATE": 5, "INSERT": 10, "ALTER": 2 },
+//   "statements": [...],
+//   "warnings": ["Statement 15 (line 142): DROP statement detected - will permanently remove database object"],
+//   "summary": "File contains 17 statements: 10 INSERT, 5 CREATE, 2 ALTER"
+// }
+```
 
 #### `mutation_preview`
 
@@ -391,6 +471,151 @@ Preview the effect of INSERT, UPDATE, or DELETE statements without executing the
 mutation_preview({ sql: "DELETE FROM orders WHERE status = 'cancelled'" })
 // Returns: { mutationType: "DELETE", estimatedRowsAffected: 150, sampleAffectedRows: [...5 rows...] }
 ```
+
+#### `mutation_dry_run`
+
+**Transaction-based dry-run for mutations.** Actually executes the INSERT/UPDATE/DELETE within a transaction, captures **REAL** results, then ROLLBACK so nothing persists. More accurate than `mutation_preview` because it catches actual constraint violations, trigger effects, and exact row counts.
+
+**Non-Rollbackable Operations:** Statements containing explicit `NEXTVAL()` or `SETVAL()` are **skipped** to prevent sequence values from being permanently consumed. For skipped statements, an `EXPLAIN` query plan is provided instead.
+
+**Parameters:**
+
+- `sql` (required): The INSERT, UPDATE, or DELETE statement to dry-run
+- `sampleSize` (optional): Number of sample rows to return (default: 10, max: 20)
+
+**Returns:**
+
+- `mutationType`: Type of mutation (INSERT, UPDATE, DELETE)
+- `success`: Whether the dry-run executed successfully
+- `skipped`: If `true`, statement was skipped (contains non-rollbackable operation)
+- `skipReason`: Why the statement was skipped
+- `rowsAffected`: **Actual** number of rows that would be affected
+- `beforeRows`: Sample of rows before the change (for UPDATE/DELETE)
+- `affectedRows`: Sample of rows after the change (for INSERT/UPDATE) or deleted rows
+- `targetTable`: The table being modified
+- `whereClause`: The WHERE clause (if present)
+- `executionTimeMs`: Execution time in milliseconds
+- `error`: Detailed PostgreSQL error information if failed:
+  - `message`: Error message
+  - `code`: PostgreSQL error code (e.g., '23505' for unique violation)
+  - `detail`: Detailed error description
+  - `hint`: Hint for fixing the error
+  - `constraint`: Constraint name that caused the error
+  - `table`, `column`, `schema`: Related database objects
+- `nonRollbackableWarnings`: Warnings about side effects:
+  - `operation`: Type of operation (SEQUENCE, VACUUM, etc.)
+  - `message`: Warning message
+  - `mustSkip`: If `true`, operation was skipped; if `false`, just a warning
+- `warnings`: General warnings (e.g., no WHERE clause)
+- `explainPlan`: Query plan from EXPLAIN (for skipped DML statements with NEXTVAL/SETVAL)
+
+**Example:**
+
+```
+mutation_dry_run({ sql: "INSERT INTO users (email) VALUES ('test@test.com')" })
+// On success: { success: true, mutationType: "INSERT", rowsAffected: 1, affectedRows: [{id: 5, email: "test@test.com"}] }
+// On failure: { success: false, error: { code: "23505", constraint: "users_email_key", detail: "Key already exists" } }
+
+// With explicit NEXTVAL (skipped):
+mutation_dry_run({ sql: "INSERT INTO users (id) VALUES (nextval('users_id_seq'))" })
+// Returns: { success: true, skipped: true, skipReason: "NEXTVAL increments sequence...", explainPlan: [...] }
+```
+
+#### `dry_run_sql_file`
+
+**Transaction-based dry-run for SQL files.** Actually executes ALL statements within a transaction, captures **REAL** results for each statement (row counts, errors with line numbers, constraint violations), then ROLLBACK so nothing persists. Perfect for testing migrations before deploying.
+
+**Non-Rollbackable Operations:** The following operations are automatically **skipped** (not executed):
+- **VACUUM, CLUSTER, REINDEX CONCURRENTLY**: Cannot run inside a transaction
+- **CREATE INDEX CONCURRENTLY**: Cannot run inside a transaction
+- **CREATE/DROP DATABASE**: Cannot run inside a transaction
+- **NEXTVAL(), SETVAL()**: Would permanently consume sequence values
+
+For skipped DML statements (INSERT/UPDATE/DELETE/SELECT with NEXTVAL/SETVAL), an `EXPLAIN` query plan is provided so you can still see what the query would do.
+
+**Parameters:**
+
+- `filePath` (required): Absolute or relative path to the `.sql` file
+- `stripPatterns` (optional): Patterns to strip from SQL before execution (e.g., `["/"]` for Liquibase)
+- `stripAsRegex` (optional): If true, treat patterns as regex (default: false)
+- `maxStatements` (optional): Maximum statements to include in results (default: 50, max: 200)
+- `stopOnError` (optional): Stop on first error (default: false - continues to show ALL errors)
+
+**Returns:**
+
+- `success`: Whether all statements executed successfully (skipped statements don't count as failures)
+- `filePath`: Resolved file path
+- `fileSize`: File size in bytes
+- `fileSizeFormatted`: Human-readable file size
+- `totalStatements`: Total statements in file
+- `successCount`: Number of successful statements
+- `failureCount`: Number of failed statements
+- `skippedCount`: Number of skipped statements (non-rollbackable operations)
+- `totalRowsAffected`: Total rows affected across all statements
+- `statementsByType`: Breakdown by statement type (e.g., `{"CREATE": 5, "INSERT": 10}`)
+- `executionTimeMs`: Total execution time
+- `statementResults`: Array of results for each statement:
+  - `index`: Statement number (1-based)
+  - `lineNumber`: Line number in file
+  - `sql`: The SQL statement (truncated)
+  - `type`: Statement type (SELECT, INSERT, CREATE, etc.)
+  - `success`: Whether statement succeeded
+  - `skipped`: If `true`, statement was skipped (non-rollbackable operation)
+  - `skipReason`: Why the statement was skipped
+  - `rowCount`: Rows affected/returned
+  - `rows`: Sample rows (for SELECT or RETURNING)
+  - `executionTimeMs`: Statement execution time
+  - `error`: Detailed PostgreSQL error if failed (same fields as `mutation_dry_run`)
+  - `warnings`: Warnings for this statement
+  - `explainPlan`: Query plan from EXPLAIN (for skipped DML statements)
+- `nonRollbackableWarnings`: Warnings about operations that can't be fully rolled back:
+  - `operation`: Type (SEQUENCE, VACUUM, CLUSTER, etc.)
+  - `message`: Warning message
+  - `mustSkip`: If `true`, operation was skipped; if `false`, just a warning
+  - `statementIndex`, `lineNumber`: Location in file
+- `summary`: Human-readable summary
+- `rolledBack`: Always `true` - confirms changes were rolled back
+
+**Example:**
+
+```
+dry_run_sql_file({ filePath: "/path/to/migration.sql", stripPatterns: ["/"] })
+// Returns:
+// {
+//   "success": false,
+//   "totalStatements": 15,
+//   "successCount": 12,
+//   "failureCount": 2,
+//   "skippedCount": 1,
+//   "statementResults": [
+//     { "index": 1, "lineNumber": 1, "type": "CREATE", "success": true },
+//     { "index": 5, "lineNumber": 23, "type": "INSERT", "success": false,
+//       "error": { "code": "23505", "constraint": "users_pkey", "detail": "Key already exists" } },
+//     { "index": 8, "lineNumber": 45, "type": "SELECT", "success": true, "skipped": true,
+//       "skipReason": "NEXTVAL increments sequence...", "explainPlan": [...] },
+//     ...
+//   ],
+//   "nonRollbackableWarnings": [
+//     { "operation": "SEQUENCE", "message": "INSERT may consume sequence values...", "mustSkip": false },
+//     { "operation": "SEQUENCE", "message": "NEXTVAL increments sequence...", "mustSkip": true }
+//   ],
+//   "summary": "Dry-run of 15 statements: 12 succeeded, 2 failed, 1 skipped (non-rollbackable). All changes rolled back.",
+//   "rolledBack": true
+// }
+```
+
+**When to use `dry_run_sql_file` vs `preview_sql_file`:**
+
+| Feature | `preview_sql_file` | `dry_run_sql_file` |
+|---------|-------------------|-------------------|
+| Speed | Fast (just parsing) | Slower (actual execution) |
+| Detects syntax errors | Basic | **Actual PostgreSQL errors** |
+| Detects constraint violations | No | **Yes** |
+| Detects trigger effects | No | **Yes** |
+| Accurate row counts | No (estimates) | **Yes (actual)** |
+| Shows error details | No | **Yes (code, constraint, hint)** |
+| Consumes sequences | No | **No (NEXTVAL/SETVAL skipped)** |
+| Shows query plan for skipped ops | N/A | **Yes (EXPLAIN)** |
 
 #### `batch_execute`
 

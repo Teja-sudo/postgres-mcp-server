@@ -15,12 +15,15 @@ import {
   getObjectDetails,
   executeSql,
   executeSqlFile,
+  previewSqlFile,
+  dryRunSqlFile,
   explainQuery,
   getTopQueries,
   analyzeWorkloadIndexes,
   analyzeQueryIndexes,
   analyzeDbHealth,
   mutationPreview,
+  mutationDryRun,
   batchExecute,
   beginTransaction,
   commitTransaction,
@@ -43,6 +46,8 @@ const analyzeWorkloadIndexesWithRetry = withConnectionRetry(analyzeWorkloadIndex
 const analyzeQueryIndexesWithRetry = withConnectionRetry(analyzeQueryIndexes);
 const analyzeDbHealthWithRetry = withConnectionRetry(async () => analyzeDbHealth());
 const mutationPreviewWithRetry = withConnectionRetry(mutationPreview);
+const mutationDryRunWithRetry = withConnectionRetry(mutationDryRun);
+const dryRunSqlFileWithRetry = withConnectionRetry(dryRunSqlFile);
 const batchExecuteWithRetry = withConnectionRetry(batchExecute);
 const beginTransactionWithRetry = withConnectionRetry(beginTransaction);
 const commitTransactionWithRetry = withConnectionRetry(commitTransaction);
@@ -298,7 +303,7 @@ server.registerTool(
   "execute_sql_file",
   {
     description:
-      "Execute a .sql file from the filesystem. Useful for running migration scripts, schema changes, or data imports. Supports transaction mode for atomic execution. Max file size: 50MB. Returns detailed error info when stopOnError=false.",
+      "Execute a .sql file from the filesystem. Useful for running migration scripts, schema changes, or data imports. Supports transaction mode for atomic execution. Max file size: 50MB. Use validateOnly=true to preview without executing. Use stripPatterns to remove delimiters like '/' (Liquibase) or 'GO' (SQL Server).",
     inputSchema: z.object({
       filePath: z
         .string()
@@ -313,11 +318,56 @@ server.registerTool(
         .optional()
         .default(true)
         .describe("Stop execution on first error (default: true). If false, continues with remaining statements."),
+      stripPatterns: z
+        .array(z.string())
+        .optional()
+        .describe("Patterns to strip from SQL before execution. E.g., ['/'] for Liquibase, ['GO'] for SQL Server. By default, patterns are matched as literal strings on their own line."),
+      stripAsRegex: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("If true, stripPatterns are treated as regex patterns (default: false). Use for complex patterns like '^\\\\s*/\\\\s*$'."),
+      validateOnly: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("If true, parse and preview the file without executing (default: false). Returns statement count and types."),
     }),
   },
   async (args) => {
     const result = await executeSqlFileWithRetry(args);
     return { content: [{ type: "text", text: JSON.stringify(withContext(result), null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "preview_sql_file",
+  {
+    description:
+      "Preview a SQL file without executing it. Shows statement count, types breakdown, and warnings for potentially dangerous operations (DROP, TRUNCATE, DELETE/UPDATE without WHERE). Similar to mutation_preview but for SQL files. Use this before execute_sql_file to understand what a migration will do.",
+    inputSchema: z.object({
+      filePath: z
+        .string()
+        .describe("Absolute or relative path to the .sql file to preview"),
+      stripPatterns: z
+        .array(z.string())
+        .optional()
+        .describe("Patterns to strip from SQL before parsing. E.g., ['/'] for Liquibase, ['GO'] for SQL Server."),
+      stripAsRegex: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("If true, stripPatterns are treated as regex patterns (default: false)."),
+      maxStatements: z
+        .number()
+        .optional()
+        .default(20)
+        .describe("Maximum number of statements to show in preview (default: 20, max: 100)."),
+    }),
+  },
+  async (args) => {
+    const result = await previewSqlFile(args);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );
 
@@ -339,6 +389,64 @@ server.registerTool(
   },
   async (args) => {
     const result = await mutationPreviewWithRetry(args);
+    return { content: [{ type: "text", text: JSON.stringify(withContext(result), null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "mutation_dry_run",
+  {
+    description:
+      "Execute INSERT/UPDATE/DELETE in dry-run mode - actually runs the SQL within a transaction, captures REAL results (exact row counts, actual errors, before/after data), then ROLLBACK so nothing persists. More accurate than mutation_preview. Use this to verify mutations will work correctly before committing. Returns detailed PostgreSQL error info (code, constraint, hint) on failure.",
+    inputSchema: z.object({
+      sql: z
+        .string()
+        .describe("The INSERT, UPDATE, or DELETE statement to dry-run"),
+      sampleSize: z
+        .number()
+        .optional()
+        .default(10)
+        .describe("Number of sample rows to return (default: 10, max: 20)"),
+    }),
+  },
+  async (args) => {
+    const result = await mutationDryRunWithRetry(args);
+    return { content: [{ type: "text", text: JSON.stringify(withContext(result), null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "dry_run_sql_file",
+  {
+    description:
+      "Execute a SQL file in dry-run mode - actually runs ALL statements within a transaction, captures REAL results for each (row counts, errors with line numbers, constraint violations), then ROLLBACK so nothing persists. Perfect for testing migrations before deploying. Returns detailed error info including PostgreSQL error codes, constraint names, and hints to help quickly fix issues. Warns about non-rollbackable operations (sequences, VACUUM, etc.).",
+    inputSchema: z.object({
+      filePath: z
+        .string()
+        .describe("Absolute or relative path to the .sql file to dry-run"),
+      stripPatterns: z
+        .array(z.string())
+        .optional()
+        .describe("Patterns to strip from SQL before execution (e.g., ['/'] for Liquibase)"),
+      stripAsRegex: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("If true, stripPatterns are treated as regex patterns"),
+      maxStatements: z
+        .number()
+        .optional()
+        .default(50)
+        .describe("Maximum statements to include in results (default: 50, max: 200)"),
+      stopOnError: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Stop on first error (default: false - continues to show ALL errors)"),
+    }),
+  },
+  async (args) => {
+    const result = await dryRunSqlFileWithRetry(args);
     return { content: [{ type: "text", text: JSON.stringify(withContext(result), null, 2) }] };
   }
 );

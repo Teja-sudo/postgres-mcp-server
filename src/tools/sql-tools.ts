@@ -14,6 +14,11 @@ import {
   ExecuteSqlMultiResult,
   TransactionResult,
   TransactionInfo,
+  DryRunError,
+  DryRunStatementResult,
+  NonRollbackableWarning,
+  MutationDryRunResult,
+  SqlFileDryRunResult,
 } from '../types.js';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -27,6 +32,160 @@ const MAX_ROWS_LIMIT = 100000; // Absolute maximum rows
 const DEFAULT_SQL_LENGTH_LIMIT = 100000; // Default SQL query length limit (100KB)
 const MAX_PARAMS = 100; // Maximum number of query parameters
 const MAX_SQL_FILE_SIZE = 50 * 1024 * 1024; // Maximum SQL file size (50MB)
+const MAX_DRY_RUN_SAMPLE_ROWS = 10; // Maximum sample rows to return in dry-run
+
+/**
+ * Extract detailed error information from a PostgreSQL error.
+ * Captures all available fields to help AI quickly identify and fix issues.
+ */
+function extractDryRunError(error: unknown): DryRunError {
+  const result: DryRunError = {
+    message: error instanceof Error ? error.message : String(error)
+  };
+
+  // PostgreSQL errors have additional properties
+  if (error && typeof error === 'object') {
+    const pgError = error as Record<string, unknown>;
+
+    if (pgError.code) result.code = String(pgError.code);
+    if (pgError.severity) result.severity = String(pgError.severity);
+    if (pgError.detail) result.detail = String(pgError.detail);
+    if (pgError.hint) result.hint = String(pgError.hint);
+    if (pgError.position) result.position = Number(pgError.position);
+    if (pgError.internalPosition) result.internalPosition = Number(pgError.internalPosition);
+    if (pgError.internalQuery) result.internalQuery = String(pgError.internalQuery);
+    if (pgError.where) result.where = String(pgError.where);
+    if (pgError.schema) result.schema = String(pgError.schema);
+    if (pgError.table) result.table = String(pgError.table);
+    if (pgError.column) result.column = String(pgError.column);
+    if (pgError.dataType) result.dataType = String(pgError.dataType);
+    if (pgError.constraint) result.constraint = String(pgError.constraint);
+    if (pgError.file) result.file = String(pgError.file);
+    if (pgError.line) result.line = String(pgError.line);
+    if (pgError.routine) result.routine = String(pgError.routine);
+  }
+
+  return result;
+}
+
+/**
+ * Check if a SQL statement contains operations that cannot be fully rolled back
+ * or have side effects even within a transaction.
+ */
+function detectNonRollbackableOperations(
+  sql: string,
+  statementIndex?: number,
+  lineNumber?: number
+): NonRollbackableWarning[] {
+  const warnings: NonRollbackableWarning[] = [];
+  const upperSql = sql.toUpperCase().trim();
+
+  // Operations that cannot run inside a transaction at all - MUST SKIP
+  if (upperSql.match(/\bVACUUM\b/)) {
+    warnings.push({
+      operation: 'VACUUM',
+      message: 'VACUUM cannot run inside a transaction block. Statement skipped.',
+      statementIndex,
+      lineNumber,
+      mustSkip: true
+    });
+  }
+
+  if (upperSql.match(/\bCLUSTER\b/) && !upperSql.includes('CREATE')) {
+    warnings.push({
+      operation: 'CLUSTER',
+      message: 'CLUSTER cannot run inside a transaction block. Statement skipped.',
+      statementIndex,
+      lineNumber,
+      mustSkip: true
+    });
+  }
+
+  if (upperSql.match(/\bREINDEX\b.*\bCONCURRENTLY\b/)) {
+    warnings.push({
+      operation: 'REINDEX_CONCURRENTLY',
+      message: 'REINDEX CONCURRENTLY cannot run inside a transaction block. Statement skipped.',
+      statementIndex,
+      lineNumber,
+      mustSkip: true
+    });
+  }
+
+  if (upperSql.match(/\bCREATE\s+INDEX\b.*\bCONCURRENTLY\b/)) {
+    warnings.push({
+      operation: 'CREATE_INDEX_CONCURRENTLY',
+      message: 'CREATE INDEX CONCURRENTLY cannot run inside a transaction block. Statement skipped.',
+      statementIndex,
+      lineNumber,
+      mustSkip: true
+    });
+  }
+
+  if (upperSql.match(/\bCREATE\s+DATABASE\b/)) {
+    warnings.push({
+      operation: 'CREATE_DATABASE',
+      message: 'CREATE DATABASE cannot run inside a transaction block. Statement skipped.',
+      statementIndex,
+      lineNumber,
+      mustSkip: true
+    });
+  }
+
+  if (upperSql.match(/\bDROP\s+DATABASE\b/)) {
+    warnings.push({
+      operation: 'DROP_DATABASE',
+      message: 'DROP DATABASE cannot run inside a transaction block. Statement skipped.',
+      statementIndex,
+      lineNumber,
+      mustSkip: true
+    });
+  }
+
+  // Operations that have side effects even when rolled back - MUST SKIP
+  if (upperSql.match(/\bNEXTVAL\s*\(/)) {
+    warnings.push({
+      operation: 'SEQUENCE',
+      message: 'NEXTVAL increments sequence even when transaction is rolled back. Statement skipped to prevent sequence consumption.',
+      statementIndex,
+      lineNumber,
+      mustSkip: true
+    });
+  }
+
+  if (upperSql.match(/\bSETVAL\s*\(/)) {
+    warnings.push({
+      operation: 'SEQUENCE',
+      message: 'SETVAL modifies sequence. Statement skipped to prevent side effects.',
+      statementIndex,
+      lineNumber,
+      mustSkip: true
+    });
+  }
+
+  // INSERT with SERIAL/BIGSERIAL columns may consume sequence values - WARNING ONLY (not skipped)
+  if (upperSql.match(/\bINSERT\s+INTO\b/)) {
+    warnings.push({
+      operation: 'SEQUENCE',
+      message: 'INSERT may consume sequence values (for SERIAL/BIGSERIAL columns) even when rolled back.',
+      statementIndex,
+      lineNumber,
+      mustSkip: false  // Warning only, do not skip
+    });
+  }
+
+  // NOTIFY only sends on commit, so safe in dry-run (rollback prevents notification)
+  if (upperSql.match(/\bNOTIFY\b/)) {
+    warnings.push({
+      operation: 'NOTIFY',
+      message: 'NOTIFY sends notifications on commit. Since dry-run rolls back, notifications will NOT be sent.',
+      statementIndex,
+      lineNumber,
+      mustSkip: false  // Safe to execute in dry-run since we rollback
+    });
+  }
+
+  return warnings;
+}
 
 export async function executeSql(args: {
   sql: string;
@@ -383,6 +542,14 @@ export interface StatementError {
 /**
  * Result of executing a SQL file
  */
+/** Preview of a SQL statement for validateOnly mode */
+export interface StatementPreview {
+  index: number;
+  lineNumber: number;
+  sql: string;
+  type: string;
+}
+
 export interface ExecuteSqlFileResult {
   success: boolean;
   filePath: string;
@@ -395,6 +562,54 @@ export interface ExecuteSqlFileResult {
   error?: string;
   errors?: StatementError[];
   rollback?: boolean;
+  /** True if validateOnly mode was used */
+  validateOnly?: boolean;
+  /** Preview of statements when validateOnly is true */
+  preview?: StatementPreview[];
+}
+
+/**
+ * Result of previewing a SQL file
+ */
+export interface SqlFilePreviewResult {
+  filePath: string;
+  fileSize: number;
+  fileSizeFormatted: string;
+  totalStatements: number;
+  statementsByType: { [type: string]: number };
+  statements: StatementPreview[];
+  warnings: string[];
+  summary: string;
+}
+
+/**
+ * Preprocess SQL content by removing patterns.
+ * Supports both literal string matching and regex patterns.
+ *
+ * @param sql - The SQL content to preprocess
+ * @param patterns - Array of patterns to remove from SQL content
+ * @param isRegex - If true, patterns are treated as regex; if false, as literal strings
+ */
+function preprocessSqlContent(sql: string, patterns: string[], isRegex: boolean = false): string {
+  let result = sql;
+  for (const pattern of patterns) {
+    try {
+      if (isRegex) {
+        // Treat as regex pattern (multiline by default)
+        const regex = new RegExp(pattern, 'gm');
+        result = result.replace(regex, '');
+      } else {
+        // Treat as literal string - escape and match on its own line
+        const escapedPattern = pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const regex = new RegExp(`^\\s*${escapedPattern}\\s*$`, 'gm');
+        result = result.replace(regex, '');
+      }
+    } catch (error) {
+      // Invalid regex - skip this pattern
+      console.error(`Warning: Invalid pattern "${pattern}": ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return result;
 }
 
 /**
@@ -405,6 +620,12 @@ export async function executeSqlFile(args: {
   filePath: string;
   useTransaction?: boolean;
   stopOnError?: boolean;
+  /** Patterns to strip from SQL before execution. Use with stripAsRegex for regex patterns. */
+  stripPatterns?: string[];
+  /** If true, stripPatterns are treated as regex; if false, as literal strings (default: false) */
+  stripAsRegex?: boolean;
+  /** If true, only parse and validate the file without executing (default: false) */
+  validateOnly?: boolean;
 }): Promise<ExecuteSqlFileResult> {
   // Validate file path
   if (!args.filePath || typeof args.filePath !== 'string') {
@@ -442,20 +663,19 @@ export async function executeSqlFile(args: {
   }
 
   // Read file content
-  const sqlContent = fs.readFileSync(resolvedPath, 'utf-8');
+  let sqlContent = fs.readFileSync(resolvedPath, 'utf-8');
+
+  // Preprocess SQL content if patterns specified
+  if (args.stripPatterns && args.stripPatterns.length > 0) {
+    sqlContent = preprocessSqlContent(sqlContent, args.stripPatterns, args.stripAsRegex === true);
+  }
 
   const dbManager = getDbManager();
   const useTransaction = args.useTransaction !== false; // Default to true
   const stopOnError = args.stopOnError !== false; // Default to true
+  const validateOnly = args.validateOnly === true; // Default to false
 
   const startTime = process.hrtime.bigint();
-  const client = await dbManager.getClient();
-
-  let statementsExecuted = 0;
-  let statementsFailed = 0;
-  let totalRowsAffected = 0;
-  let rolledBack = false;
-  const collectedErrors: StatementError[] = [];
 
   // Split SQL into statements with line number tracking
   const parsedStatements = splitSqlStatementsWithLineNumbers(sqlContent);
@@ -466,6 +686,41 @@ export async function executeSqlFile(args: {
     return withoutComments.length > 0;
   });
   const totalStatements = executableStatements.length;
+
+  // If validateOnly mode, return preview without execution
+  if (validateOnly) {
+    const endTime = process.hrtime.bigint();
+    const executionTimeMs = Number(endTime - startTime) / 1_000_000;
+
+    // Create preview of statements
+    const preview = executableStatements.map((stmt, idx) => ({
+      index: idx + 1,
+      lineNumber: stmt.lineNumber,
+      sql: stmt.sql.length > 300 ? stmt.sql.substring(0, 300) + '...' : stmt.sql,
+      type: detectStatementType(stmt.sql)
+    }));
+
+    return {
+      success: true,
+      filePath: resolvedPath,
+      fileSize: stats.size,
+      totalStatements,
+      statementsExecuted: 0,
+      statementsFailed: 0,
+      executionTimeMs: Math.round(executionTimeMs * 100) / 100,
+      rowsAffected: 0,
+      validateOnly: true,
+      preview
+    } as ExecuteSqlFileResult;
+  }
+
+  const client = await dbManager.getClient();
+
+  let statementsExecuted = 0;
+  let statementsFailed = 0;
+  let totalRowsAffected = 0;
+  let rolledBack = false;
+  const collectedErrors: StatementError[] = [];
 
   try {
     if (useTransaction) {
@@ -562,6 +817,399 @@ export async function executeSqlFile(args: {
   } finally {
     client.release();
   }
+}
+
+/**
+ * Detect the type of SQL statement (SELECT, INSERT, UPDATE, DELETE, CREATE, etc.)
+ */
+function detectStatementType(sql: string): string {
+  const trimmed = stripLeadingComments(sql).toUpperCase();
+
+  // Common statement types
+  const types = [
+    'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP',
+    'TRUNCATE', 'GRANT', 'REVOKE', 'BEGIN', 'COMMIT', 'ROLLBACK',
+    'SET', 'SHOW', 'EXPLAIN', 'ANALYZE', 'VACUUM', 'REINDEX',
+    'COMMENT', 'WITH', 'DO', 'CALL', 'EXECUTE'
+  ];
+
+  for (const type of types) {
+    if (trimmed.startsWith(type + ' ') || trimmed.startsWith(type + '\n') ||
+        trimmed.startsWith(type + '\t') || trimmed === type) {
+      // Special case for WITH - check if it's a CTE followed by SELECT/INSERT/UPDATE/DELETE
+      if (type === 'WITH') {
+        if (trimmed.includes('SELECT')) return 'WITH SELECT';
+        if (trimmed.includes('INSERT')) return 'WITH INSERT';
+        if (trimmed.includes('UPDATE')) return 'WITH UPDATE';
+        if (trimmed.includes('DELETE')) return 'WITH DELETE';
+        return 'WITH';
+      }
+      return type;
+    }
+  }
+
+  return 'UNKNOWN';
+}
+
+/**
+ * Preview a SQL file without executing.
+ * Similar to mutation_preview but for SQL files - shows what would happen if executed.
+ */
+export async function previewSqlFile(args: {
+  filePath: string;
+  /** Patterns to strip from SQL before parsing */
+  stripPatterns?: string[];
+  /** If true, stripPatterns are treated as regex */
+  stripAsRegex?: boolean;
+  /** Maximum number of statements to show in preview (default: 20) */
+  maxStatements?: number;
+}): Promise<SqlFilePreviewResult> {
+  // Validate file path
+  if (!args.filePath || typeof args.filePath !== 'string') {
+    throw new Error('filePath parameter is required');
+  }
+
+  const filePath = args.filePath.trim();
+
+  // Security: Validate file extension
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext !== '.sql') {
+    throw new Error('Only .sql files are allowed');
+  }
+
+  // Security: Prevent path traversal attacks
+  const resolvedPath = path.resolve(filePath);
+
+  // Check file exists
+  if (!fs.existsSync(resolvedPath)) {
+    throw new Error(`File not found: ${filePath}`);
+  }
+
+  // Check file stats
+  const stats = fs.statSync(resolvedPath);
+  if (!stats.isFile()) {
+    throw new Error(`Not a file: ${filePath}`);
+  }
+
+  if (stats.size > MAX_SQL_FILE_SIZE) {
+    throw new Error(`File too large. Maximum size is ${MAX_SQL_FILE_SIZE / (1024 * 1024)}MB`);
+  }
+
+  if (stats.size === 0) {
+    throw new Error('File is empty');
+  }
+
+  // Read file content
+  let sqlContent = fs.readFileSync(resolvedPath, 'utf-8');
+
+  // Preprocess SQL content if patterns specified
+  if (args.stripPatterns && args.stripPatterns.length > 0) {
+    sqlContent = preprocessSqlContent(sqlContent, args.stripPatterns, args.stripAsRegex === true);
+  }
+
+  const maxStatements = Math.min(args.maxStatements || 20, 100);
+
+  // Split SQL into statements with line number tracking
+  const parsedStatements = splitSqlStatementsWithLineNumbers(sqlContent);
+  const executableStatements = parsedStatements.filter(stmt => {
+    const trimmed = stmt.sql.trim();
+    if (!trimmed) return false;
+    const withoutComments = stripLeadingComments(trimmed);
+    return withoutComments.length > 0;
+  });
+
+  const totalStatements = executableStatements.length;
+
+  // Count statements by type
+  const statementsByType: { [type: string]: number } = {};
+  const warnings: string[] = [];
+
+  executableStatements.forEach((stmt, idx) => {
+    const type = detectStatementType(stmt.sql);
+    statementsByType[type] = (statementsByType[type] || 0) + 1;
+
+    // Check for potentially dangerous operations
+    const sqlUpper = stmt.sql.toUpperCase();
+    if (type === 'DROP') {
+      warnings.push(`Statement ${idx + 1} (line ${stmt.lineNumber}): DROP statement detected - will permanently remove database object`);
+    } else if (type === 'TRUNCATE') {
+      warnings.push(`Statement ${idx + 1} (line ${stmt.lineNumber}): TRUNCATE statement detected - will delete all rows from table`);
+    } else if (type === 'DELETE' && !sqlUpper.includes('WHERE')) {
+      warnings.push(`Statement ${idx + 1} (line ${stmt.lineNumber}): DELETE without WHERE clause - will delete ALL rows from table`);
+    } else if (type === 'UPDATE' && !sqlUpper.includes('WHERE')) {
+      warnings.push(`Statement ${idx + 1} (line ${stmt.lineNumber}): UPDATE without WHERE clause - will update ALL rows in table`);
+    }
+  });
+
+  // Create statement previews (limited to maxStatements)
+  const statements = executableStatements.slice(0, maxStatements).map((stmt, idx) => ({
+    index: idx + 1,
+    lineNumber: stmt.lineNumber,
+    sql: stmt.sql.length > 300 ? stmt.sql.substring(0, 300) + '...' : stmt.sql,
+    type: detectStatementType(stmt.sql)
+  }));
+
+  // Format file size
+  const fileSizeFormatted = stats.size < 1024
+    ? `${stats.size} bytes`
+    : stats.size < 1024 * 1024
+      ? `${(stats.size / 1024).toFixed(1)} KB`
+      : `${(stats.size / (1024 * 1024)).toFixed(2)} MB`;
+
+  // Generate summary
+  const typeEntries = Object.entries(statementsByType).sort((a, b) => b[1] - a[1]);
+  const typeSummary = typeEntries.map(([type, count]) => `${count} ${type}`).join(', ');
+  const summary = `File contains ${totalStatements} statement${totalStatements !== 1 ? 's' : ''}: ${typeSummary || 'none'}`;
+
+  return {
+    filePath: resolvedPath,
+    fileSize: stats.size,
+    fileSizeFormatted,
+    totalStatements,
+    statementsByType,
+    statements,
+    warnings,
+    summary
+  };
+}
+
+/**
+ * Execute a SQL file in dry-run mode.
+ * Actually executes all statements within a transaction, captures real results,
+ * then rolls back so no changes are persisted.
+ *
+ * This provides accurate results including:
+ * - Exact row counts for each statement
+ * - Actual errors with full PostgreSQL error details
+ * - Line numbers for easy debugging
+ * - Detection of non-rollbackable operations
+ */
+export async function dryRunSqlFile(args: {
+  filePath: string;
+  /** Patterns to strip from SQL before execution */
+  stripPatterns?: string[];
+  /** If true, stripPatterns are treated as regex */
+  stripAsRegex?: boolean;
+  /** Maximum statements to show in results (default: 50) */
+  maxStatements?: number;
+  /** Stop on first error (default: false - continues to show all errors) */
+  stopOnError?: boolean;
+}): Promise<SqlFileDryRunResult> {
+  // Validate file path
+  if (!args.filePath || typeof args.filePath !== 'string') {
+    throw new Error('filePath parameter is required');
+  }
+
+  const filePath = args.filePath.trim();
+
+  // Security: Validate file extension
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext !== '.sql') {
+    throw new Error('Only .sql files are allowed');
+  }
+
+  // Security: Prevent path traversal attacks
+  const resolvedPath = path.resolve(filePath);
+
+  // Check file exists
+  if (!fs.existsSync(resolvedPath)) {
+    throw new Error(`File not found: ${filePath}`);
+  }
+
+  // Check file stats
+  const stats = fs.statSync(resolvedPath);
+  if (!stats.isFile()) {
+    throw new Error(`Not a file: ${filePath}`);
+  }
+
+  if (stats.size > MAX_SQL_FILE_SIZE) {
+    throw new Error(`File too large. Maximum size is ${MAX_SQL_FILE_SIZE / (1024 * 1024)}MB`);
+  }
+
+  if (stats.size === 0) {
+    throw new Error('File is empty');
+  }
+
+  // Read file content
+  let sqlContent = fs.readFileSync(resolvedPath, 'utf-8');
+
+  // Preprocess SQL content if patterns specified
+  if (args.stripPatterns && args.stripPatterns.length > 0) {
+    sqlContent = preprocessSqlContent(sqlContent, args.stripPatterns, args.stripAsRegex === true);
+  }
+
+  const maxStatements = Math.min(args.maxStatements || 50, 200);
+  const stopOnError = args.stopOnError === true;
+
+  // Split SQL into statements with line number tracking
+  const parsedStatements = splitSqlStatementsWithLineNumbers(sqlContent);
+  const executableStatements = parsedStatements.filter(stmt => {
+    const trimmed = stmt.sql.trim();
+    if (!trimmed) return false;
+    const withoutComments = stripLeadingComments(trimmed);
+    return withoutComments.length > 0;
+  });
+
+  const totalStatements = executableStatements.length;
+
+  // Detect all non-rollbackable operations upfront
+  const nonRollbackableWarnings: NonRollbackableWarning[] = [];
+  executableStatements.forEach((stmt, idx) => {
+    const warnings = detectNonRollbackableOperations(stmt.sql, idx + 1, stmt.lineNumber);
+    nonRollbackableWarnings.push(...warnings);
+  });
+
+  // Format file size
+  const fileSizeFormatted = stats.size < 1024
+    ? `${stats.size} bytes`
+    : stats.size < 1024 * 1024
+      ? `${(stats.size / 1024).toFixed(1)} KB`
+      : `${(stats.size / (1024 * 1024)).toFixed(2)} MB`;
+
+  const dbManager = getDbManager();
+  const client = await dbManager.getClient();
+  const startTime = process.hrtime.bigint();
+
+  const statementResults: DryRunStatementResult[] = [];
+  const statementsByType: { [type: string]: number } = {};
+  let successCount = 0;
+  let failureCount = 0;
+  let skippedCount = 0;
+  let totalRowsAffected = 0;
+  let aborted = false;
+
+  try {
+    // Start transaction
+    await client.query('BEGIN');
+
+    for (let idx = 0; idx < executableStatements.length && !aborted; idx++) {
+      const stmt = executableStatements[idx];
+      const stmtType = detectStatementType(stmt.sql);
+      statementsByType[stmtType] = (statementsByType[stmtType] || 0) + 1;
+
+      const stmtStartTime = process.hrtime.bigint();
+      const result: DryRunStatementResult = {
+        index: idx + 1,
+        lineNumber: stmt.lineNumber,
+        sql: stmt.sql.length > 300 ? stmt.sql.substring(0, 300) + '...' : stmt.sql,
+        type: stmtType,
+        success: false
+      };
+
+      // Check for non-rollbackable warnings specific to this statement
+      const stmtWarnings = nonRollbackableWarnings
+        .filter(w => w.statementIndex === idx + 1);
+      const mustSkipWarnings = stmtWarnings.filter(w => w.mustSkip);
+
+      // Only skip if there are mustSkip warnings; otherwise just warn
+      if (mustSkipWarnings.length > 0) {
+        result.skipped = true;
+        result.skipReason = mustSkipWarnings.map(w => w.message).join('; ');
+        result.warnings = stmtWarnings.map(w => w.message);
+        result.success = true; // Not a failure, just skipped
+        skippedCount++;
+
+        // For DML statements with NEXTVAL/SETVAL, run EXPLAIN to show query plan
+        const isDML = ['INSERT', 'UPDATE', 'DELETE', 'SELECT'].includes(stmtType);
+        const hasSequenceSkip = mustSkipWarnings.some(w => w.operation === 'SEQUENCE');
+        if (isDML && hasSequenceSkip) {
+          try {
+            const explainResult = await client.query(`EXPLAIN (FORMAT JSON) ${stmt.sql}`);
+            if (explainResult.rows && explainResult.rows.length > 0) {
+              result.explainPlan = explainResult.rows[0]['QUERY PLAN'];
+            }
+          } catch {
+            // Ignore EXPLAIN errors - just skip without plan
+          }
+        }
+      } else {
+        // Include non-mustSkip warnings if any
+        if (stmtWarnings.length > 0) {
+          result.warnings = stmtWarnings.map(w => w.message);
+        }
+
+        try {
+          const queryResult = await client.query(stmt.sql);
+          result.success = true;
+          result.rowCount = queryResult.rowCount || 0;
+          totalRowsAffected += result.rowCount;
+          successCount++;
+
+          // Include sample rows for SELECT or RETURNING statements
+          if (queryResult.rows && queryResult.rows.length > 0) {
+            result.rows = queryResult.rows.slice(0, MAX_DRY_RUN_SAMPLE_ROWS);
+          }
+        } catch (e) {
+          result.success = false;
+          result.error = extractDryRunError(e);
+          failureCount++;
+
+          if (stopOnError) {
+            aborted = true;
+          }
+        }
+      }
+
+      const stmtEndTime = process.hrtime.bigint();
+      result.executionTimeMs = Math.round(Number(stmtEndTime - stmtStartTime) / 1_000_000 * 100) / 100;
+
+      // Only include results up to maxStatements
+      if (statementResults.length < maxStatements) {
+        statementResults.push(result);
+      }
+    }
+
+    // Always rollback - this is a dry run
+    await client.query('ROLLBACK');
+
+  } catch (e) {
+    // Ensure rollback on any error
+    try {
+      await client.query('ROLLBACK');
+    } catch {
+      // Ignore rollback errors
+    }
+    throw e;
+  } finally {
+    client.release();
+  }
+
+  const endTime = process.hrtime.bigint();
+  const executionTimeMs = Math.round(Number(endTime - startTime) / 1_000_000 * 100) / 100;
+
+  // Generate summary
+  const typeEntries = Object.entries(statementsByType).sort((a, b) => b[1] - a[1]);
+  const typeSummary = typeEntries.map(([type, count]) => `${count} ${type}`).join(', ');
+
+  let summary = `Dry-run of ${totalStatements} statement${totalStatements !== 1 ? 's' : ''}: `;
+  summary += `${successCount} succeeded, ${failureCount} failed`;
+  if (skippedCount > 0) {
+    summary += `, ${skippedCount} skipped (non-rollbackable)`;
+  }
+  summary += '. ';
+  if (typeSummary) {
+    summary += `Types: ${typeSummary}. `;
+  }
+  summary += `Total rows affected: ${totalRowsAffected}. `;
+  summary += 'All changes rolled back.';
+
+  return {
+    success: failureCount === 0,
+    filePath: resolvedPath,
+    fileSize: stats.size,
+    fileSizeFormatted,
+    totalStatements,
+    successCount,
+    failureCount,
+    skippedCount,
+    totalRowsAffected,
+    statementsByType,
+    executionTimeMs,
+    statementResults,
+    nonRollbackableWarnings,
+    summary,
+    rolledBack: true
+  };
 }
 
 /**
@@ -980,6 +1628,219 @@ export async function mutationPreview(args: {
     result.whereClause = whereClause;
   } else {
     result.warning = 'No WHERE clause - ALL rows in the table will be affected!';
+  }
+
+  return result;
+}
+
+/**
+ * Execute a mutation (INSERT/UPDATE/DELETE) in dry-run mode.
+ * Actually executes the SQL within a transaction, captures real results,
+ * then rolls back so no changes are persisted.
+ *
+ * This provides accurate results including:
+ * - Exact row counts (not estimates)
+ * - Actual errors (constraint violations, triggers, etc.)
+ * - Before/after row states
+ */
+export async function mutationDryRun(args: {
+  sql: string;
+  sampleSize?: number;
+}): Promise<MutationDryRunResult> {
+  if (!args.sql || typeof args.sql !== 'string') {
+    throw new Error('sql parameter is required');
+  }
+
+  const sql = args.sql.trim();
+  const sampleSize = Math.min(args.sampleSize || MAX_DRY_RUN_SAMPLE_ROWS, 20);
+
+  // Detect mutation type
+  const upperSql = sql.toUpperCase();
+  let mutationType: 'INSERT' | 'UPDATE' | 'DELETE' | 'UNKNOWN' = 'UNKNOWN';
+
+  if (upperSql.startsWith('UPDATE') || upperSql.match(/^WITH\b.*\bUPDATE\b/s)) {
+    mutationType = 'UPDATE';
+  } else if (upperSql.startsWith('DELETE') || upperSql.match(/^WITH\b.*\bDELETE\b/s)) {
+    mutationType = 'DELETE';
+  } else if (upperSql.startsWith('INSERT') || upperSql.match(/^WITH\b.*\bINSERT\b/s)) {
+    mutationType = 'INSERT';
+  } else {
+    throw new Error('SQL must be an INSERT, UPDATE, or DELETE statement');
+  }
+
+  // Check for non-rollbackable operations
+  const nonRollbackableWarnings = detectNonRollbackableOperations(sql);
+  const mustSkipWarnings = nonRollbackableWarnings.filter(w => w.mustSkip);
+
+  // Skip only if there are mustSkip warnings
+  if (mustSkipWarnings.length > 0) {
+    const skipReason = mustSkipWarnings.map(w => w.message).join('; ');
+
+    // Run EXPLAIN to show query plan without executing
+    let explainPlan: object[] | undefined;
+    const dbManager = getDbManager();
+    try {
+      const explainResult = await dbManager.query(`EXPLAIN (FORMAT JSON) ${sql}`);
+      if (explainResult.rows && explainResult.rows.length > 0) {
+        explainPlan = explainResult.rows[0]['QUERY PLAN'];
+      }
+    } catch {
+      // Ignore EXPLAIN errors
+    }
+
+    return {
+      mutationType,
+      success: true, // Not a failure, just skipped
+      skipped: true,
+      skipReason,
+      rowsAffected: 0,
+      nonRollbackableWarnings,
+      explainPlan,
+      warnings: nonRollbackableWarnings.map(w => w.message)
+    };
+  }
+
+  // Extract table and WHERE clause
+  let targetTable: string | undefined;
+  let whereClause: string | undefined;
+
+  if (mutationType === 'UPDATE') {
+    const updateMatch = sql.match(/UPDATE\s+(["`]?[\w.]+["`]?)\s+SET/i);
+    const whereMatch = sql.match(/\bWHERE\s+(.+?)(?:RETURNING|$)/is);
+    targetTable = updateMatch?.[1]?.replace(/["`]/g, '');
+    whereClause = whereMatch?.[1]?.trim();
+  } else if (mutationType === 'DELETE') {
+    const deleteMatch = sql.match(/DELETE\s+FROM\s+(["`]?[\w.]+["`]?)/i);
+    const whereMatch = sql.match(/\bWHERE\s+(.+?)(?:RETURNING|$)/is);
+    targetTable = deleteMatch?.[1]?.replace(/["`]/g, '');
+    whereClause = whereMatch?.[1]?.trim();
+  } else if (mutationType === 'INSERT') {
+    const insertMatch = sql.match(/INSERT\s+INTO\s+(["`]?[\w.]+["`]?)/i);
+    targetTable = insertMatch?.[1]?.replace(/["`]/g, '');
+  }
+
+  const dbManager = getDbManager();
+  const client = await dbManager.getClient();
+  const startTime = process.hrtime.bigint();
+
+  let beforeRows: any[] | undefined;
+  let affectedRows: any[] = [];
+  let rowsAffected = 0;
+  let error: DryRunError | undefined;
+  let success = false;
+  const warnings: string[] = [];
+
+  try {
+    // Start transaction
+    await client.query('BEGIN');
+
+    // For UPDATE/DELETE, capture "before" state
+    if ((mutationType === 'UPDATE' || mutationType === 'DELETE') && targetTable) {
+      try {
+        const beforeSql = whereClause
+          ? `SELECT * FROM ${targetTable} WHERE ${whereClause} LIMIT ${sampleSize}`
+          : `SELECT * FROM ${targetTable} LIMIT ${sampleSize}`;
+        const beforeResult = await client.query(beforeSql);
+        beforeRows = beforeResult.rows;
+      } catch (e) {
+        // Couldn't get before rows, continue anyway
+        warnings.push(`Could not capture before state: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+
+    // Execute the actual mutation
+    // Add RETURNING * if not already present to get affected rows
+    let executeSql = sql;
+    const hasReturning = upperSql.includes('RETURNING');
+
+    if (!hasReturning && targetTable) {
+      executeSql = `${sql} RETURNING *`;
+    }
+
+    try {
+      const result = await client.query(executeSql);
+      rowsAffected = result.rowCount || 0;
+
+      if (result.rows && result.rows.length > 0) {
+        affectedRows = result.rows.slice(0, sampleSize);
+      }
+
+      success = true;
+    } catch (e) {
+      // If RETURNING failed, try without it
+      if (!hasReturning) {
+        try {
+          const result = await client.query(sql);
+          rowsAffected = result.rowCount || 0;
+          success = true;
+
+          // Try to get affected rows for UPDATE/DELETE
+          if ((mutationType === 'UPDATE' || mutationType === 'DELETE') && targetTable && whereClause) {
+            const afterSql = `SELECT * FROM ${targetTable} WHERE ${whereClause} LIMIT ${sampleSize}`;
+            const afterResult = await client.query(afterSql);
+            affectedRows = afterResult.rows;
+          }
+        } catch (innerError) {
+          error = extractDryRunError(innerError);
+        }
+      } else {
+        error = extractDryRunError(e);
+      }
+    }
+
+    // Always rollback - this is a dry run
+    await client.query('ROLLBACK');
+
+  } catch (e) {
+    // Ensure rollback on any error
+    try {
+      await client.query('ROLLBACK');
+    } catch {
+      // Ignore rollback errors
+    }
+    error = extractDryRunError(e);
+  } finally {
+    client.release();
+  }
+
+  const endTime = process.hrtime.bigint();
+  const executionTimeMs = Number(endTime - startTime) / 1_000_000;
+
+  const result: MutationDryRunResult = {
+    mutationType,
+    success,
+    rowsAffected,
+    executionTimeMs: Math.round(executionTimeMs * 100) / 100
+  };
+
+  if (beforeRows && beforeRows.length > 0) {
+    result.beforeRows = beforeRows;
+  }
+
+  if (affectedRows.length > 0) {
+    result.affectedRows = affectedRows;
+  }
+
+  if (targetTable) {
+    result.targetTable = targetTable;
+  }
+
+  if (whereClause) {
+    result.whereClause = whereClause;
+  } else if (mutationType !== 'INSERT') {
+    warnings.push('No WHERE clause - ALL rows in the table would be affected!');
+  }
+
+  if (error) {
+    result.error = error;
+  }
+
+  if (nonRollbackableWarnings.length > 0) {
+    result.nonRollbackableWarnings = nonRollbackableWarnings;
+  }
+
+  if (warnings.length > 0) {
+    result.warnings = warnings;
   }
 
   return result;
