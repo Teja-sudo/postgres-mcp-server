@@ -8,6 +8,7 @@ interface ServerInfo {
   isDefault: boolean;
   defaultDatabase?: string;
   defaultSchema?: string;
+  context?: string;
 }
 
 describe('Server Tools', () => {
@@ -68,6 +69,34 @@ describe('Server Tools', () => {
       const result = await listServers({});
 
       expect(result.servers[0].isConnected).toBe(false);
+    });
+
+    it('should return context for servers with AI context configured', async () => {
+      process.env.POSTGRES_SERVERS = JSON.stringify({
+        dev: {
+          host: 'localhost',
+          port: '5432',
+          username: 'user',
+          password: 'pass',
+          context: 'Development server - safe for any queries'
+        },
+        prod: {
+          host: 'prod.example.com',
+          port: '5432',
+          username: 'user',
+          password: 'pass',
+          context: 'PRODUCTION - Read-only queries only. Always use LIMIT.'
+        }
+      });
+
+      const result = await listServers({});
+
+      expect(result.servers).toHaveLength(2);
+      const devServer = result.servers.find((s: ServerInfo) => s.name === 'dev');
+      const prodServer = result.servers.find((s: ServerInfo) => s.name === 'prod');
+
+      expect(devServer?.context).toBe('Development server - safe for any queries');
+      expect(prodServer?.context).toBe('PRODUCTION - Read-only queries only. Always use LIMIT.');
     });
 
     it('should not expose host or port in response', async () => {

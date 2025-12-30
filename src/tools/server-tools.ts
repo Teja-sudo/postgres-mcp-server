@@ -213,19 +213,20 @@ export async function switchServerDb(args: {
   server: string;
   database?: string;
   schema?: string;
-}): Promise<{ success: boolean; message: string; currentServer: string; currentDatabase: string; currentSchema: string }> {
+}): Promise<{ success: boolean; message: string; currentServer: string; currentDatabase: string; currentSchema: string; context?: string }> {
   const dbManager = getDbManager();
 
   try {
     await dbManager.switchServer(args.server, args.database, args.schema);
-    const state = dbManager.getCurrentState();
+    const connectionInfo = dbManager.getConnectionInfo();
 
     return {
       success: true,
       message: `Successfully connected to server '${args.server}'${args.database ? `, database '${args.database}'` : ''}${args.schema ? `, schema '${args.schema}'` : ''}`,
-      currentServer: state.currentServer!,
-      currentDatabase: state.currentDatabase!,
-      currentSchema: state.currentSchema!
+      currentServer: connectionInfo.server!,
+      currentDatabase: connectionInfo.database!,
+      currentSchema: connectionInfo.schema!,
+      context: connectionInfo.context
     };
   } catch (error) {
     throw new Error(`Failed to switch: ${error}`);

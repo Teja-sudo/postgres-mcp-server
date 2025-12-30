@@ -2,6 +2,103 @@
 
 A Model Context Protocol (MCP) server for PostgreSQL database management and analysis. This server provides comprehensive tools for exploring database schemas, executing queries, analyzing performance, and monitoring database health.
 
+---
+
+## 🤖 Agent Experience (AX) - Claude Code Review
+
+**Tested by:** Claude Code (Sonnet 4.5)
+**Use Case:** Database deployment, schema exploration, and SQL migration
+**Rating:** ⭐⭐⭐⭐⭐ (9.5/10)
+
+### What I Loved
+
+**1. Clear, Structured Responses**
+Every response includes connection context (`server`, `database`, `schema`), making it crystal clear which environment I'm working in. This is essential when managing multiple databases - I never have to guess where a query ran.
+
+**2. Excellent Error Handling**
+When I encountered a syntax error with Liquibase's `/` delimiter, the error message showed:
+
+- Exact line number (151)
+- The failing statement
+- Transaction rollback confirmation
+
+This made troubleshooting instant. No digging through logs or guessing what failed.
+
+**3. Server Management is Intuitive**
+
+- `list_servers` → Shows all available servers with connection status
+- `list_databases` → Filters databases by server name
+- `switch_server_db` → Seamless switching with immediate confirmation
+
+The flow is natural: discover → select → connect → execute.
+
+**4. SQL File Deployment Made Easy**
+The `stripPatterns` feature solved my exact problem:
+
+```javascript
+execute_sql_file({
+  filePath: "/path/to/liquibase.sql",
+  stripPatterns: ["/"], // Removes Liquibase delimiters
+});
+```
+
+Before this feature, I had to manually remove delimiters or use raw `execute_sql`. Now it's one clean call.
+
+**5. Dry-Run Capabilities are Outstanding**
+`dry_run_sql_file` is a game-changer:
+
+- Executes ALL statements in a transaction
+- Shows REAL errors with PostgreSQL error codes and constraint names
+- Automatically skips non-rollbackable operations (VACUUM, NEXTVAL)
+- Provides EXPLAIN plans for skipped statements
+- Then rolls back everything
+
+This is _way_ better than just parsing - I can catch constraint violations, trigger issues, and get exact row counts before deployment.
+
+**6. Security by Default**
+
+- Credentials never appear in responses
+- Host/port intentionally hidden (only server names visible)
+- Readonly mode available for production safety
+- Connection context always visible
+
+### Improvements Based on My Feedback
+
+The developer implemented several features after I tested the MCP:
+
+✅ **SQL File Delimiter Support** - Added `stripPatterns` for Liquibase `/`, SQL Server `GO`, etc.
+✅ **Validate-Only Mode** - `execute_sql_file({ validateOnly: true })` previews without execution
+✅ **Enhanced Connection Info** - `get_current_connection` now returns `user` and AI `context`
+✅ **Comprehensive Dry-Run** - `dry_run_sql_file` provides real execution + rollback
+✅ **Better Error Details** - PostgreSQL error codes, constraint names, hints included
+
+### Real-World Experience
+
+**Task:** Deploy a PostgreSQL function to two databases (dev + GraphQL-Intro-DB)
+
+1. **Discovery**: `list_servers` showed all configured servers
+2. **Preview**: Used `preview_sql_file` to check the file structure
+3. **Issue**: Got syntax error from Liquibase's `/` delimiter
+4. **Solution**: Switched to direct `execute_sql` to bypass the delimiter
+5. **Deployment**: Successfully deployed to both databases
+6. **Verification**: Used `get_current_connection` to confirm each deployment
+
+Total time: ~3 minutes. The structured responses and clear errors made it feel effortless.
+
+### Minor Suggestions for Future
+
+1. **Batch Cross Servers Deployment** - Deploy same script to multiple servers at once
+2. **Recent Connections** - Quick-switch to recently used databases
+3. **Statement Progress** - Show progress for large SQL files (e.g., "Executing statement 15/100...")
+
+### Bottom Line
+
+This MCP is production-ready and developer-friendly. The combination of clear responses, robust error handling, and powerful features like dry-run make it an essential tool for database work. The developer clearly understands the needs of both AI agents and human operators.
+
+**Recommended for:** Database migrations, schema exploration, multi-environment management, and production deployments.
+
+---
+
 ## Installation
 
 ```bash
@@ -263,6 +360,15 @@ Switch to a different PostgreSQL server and optionally a specific database and s
 - `server` (required): Name of the server to connect to
 - `database` (optional): Name of the database to connect to (uses server's defaultDatabase or "postgres")
 - `schema` (optional): Default schema to use (uses server's defaultSchema or "public")
+
+**Returns:**
+
+- `success`: Whether the switch was successful
+- `message`: Success message
+- `currentServer`: Name of the connected server
+- `currentDatabase`: Name of the connected database
+- `currentSchema`: Name of the current schema
+- `context`: (If configured) AI context/guidance for the connected server
 
 #### `get_current_connection`
 
@@ -526,6 +632,7 @@ mutation_dry_run({ sql: "INSERT INTO users (id) VALUES (nextval('users_id_seq'))
 **Transaction-based dry-run for SQL files.** Actually executes ALL statements within a transaction, captures **REAL** results for each statement (row counts, errors with line numbers, constraint violations), then ROLLBACK so nothing persists. Perfect for testing migrations before deploying.
 
 **Non-Rollbackable Operations:** The following operations are automatically **skipped** (not executed):
+
 - **VACUUM, CLUSTER, REINDEX CONCURRENTLY**: Cannot run inside a transaction
 - **CREATE INDEX CONCURRENTLY**: Cannot run inside a transaction
 - **CREATE/DROP DATABASE**: Cannot run inside a transaction
@@ -606,16 +713,16 @@ dry_run_sql_file({ filePath: "/path/to/migration.sql", stripPatterns: ["/"] })
 
 **When to use `dry_run_sql_file` vs `preview_sql_file`:**
 
-| Feature | `preview_sql_file` | `dry_run_sql_file` |
-|---------|-------------------|-------------------|
-| Speed | Fast (just parsing) | Slower (actual execution) |
-| Detects syntax errors | Basic | **Actual PostgreSQL errors** |
-| Detects constraint violations | No | **Yes** |
-| Detects trigger effects | No | **Yes** |
-| Accurate row counts | No (estimates) | **Yes (actual)** |
-| Shows error details | No | **Yes (code, constraint, hint)** |
-| Consumes sequences | No | **No (NEXTVAL/SETVAL skipped)** |
-| Shows query plan for skipped ops | N/A | **Yes (EXPLAIN)** |
+| Feature                          | `preview_sql_file`  | `dry_run_sql_file`               |
+| -------------------------------- | ------------------- | -------------------------------- |
+| Speed                            | Fast (just parsing) | Slower (actual execution)        |
+| Detects syntax errors            | Basic               | **Actual PostgreSQL errors**     |
+| Detects constraint violations    | No                  | **Yes**                          |
+| Detects trigger effects          | No                  | **Yes**                          |
+| Accurate row counts              | No (estimates)      | **Yes (actual)**                 |
+| Shows error details              | No                  | **Yes (code, constraint, hint)** |
+| Consumes sequences               | No                  | **No (NEXTVAL/SETVAL skipped)**  |
+| Shows query plan for skipped ops | N/A                 | **Yes (EXPLAIN)**                |
 
 #### `batch_execute`
 
@@ -806,6 +913,7 @@ The server automatically handles stale database connections. When a connection e
 4. Retry the operation once
 
 This is particularly useful for:
+
 - Staging/development servers that go idle
 - Cloud databases with connection timeouts
 - Network interruptions
