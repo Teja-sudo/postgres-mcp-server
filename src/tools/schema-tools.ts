@@ -1,6 +1,105 @@
 import { getDbManager } from '../db-manager.js';
-import { SchemaInfo, TableInfo, ColumnInfo, ConstraintInfo, IndexInfo, ConnectionOverride } from '../types.js';
-import { validateIdentifier } from '../utils/validation.js';
+import { SchemaInfo, TableInfo, ColumnInfo, ConstraintInfo, IndexInfo, ConnectionOverride, PaginatedResult } from '../types.js';
+import { validateIdentifier, validatePositiveInteger } from '../utils/validation.js';
+
+/** Default pagination limit for listObjects */
+const DEFAULT_LIST_LIMIT = 100;
+/** Maximum pagination limit for listObjects */
+const MAX_LIST_LIMIT = 1000;
+
+/** Object type for listObjects */
+type ObjectType = 'table' | 'view' | 'sequence' | 'extension' | 'all';
+
+/**
+ * Validates list objects filter parameter.
+ */
+function validateFilter(filter: string | undefined): void {
+  if (!filter) return;
+  if (filter.length > 128) {
+    throw new Error('filter must be 128 characters or less');
+  }
+  if (!/^[a-zA-Z0-9_% ]+$/.test(filter)) {
+    throw new Error('filter contains invalid characters');
+  }
+}
+
+/**
+ * Builds a single UNION query part for a specific object type.
+ */
+function buildObjectTypeQuery(
+  type: 'table' | 'view' | 'sequence' | 'extension',
+  hasFilter: boolean
+): string {
+  const filterClause = hasFilter ? "AND %NAME% ILIKE '%' || $2 || '%'" : '';
+
+  switch (type) {
+    case 'table':
+      return `
+        SELECT
+          tablename as name,
+          'table'::text as type,
+          tableowner as owner,
+          schemaname as schema
+        FROM pg_catalog.pg_tables
+        WHERE schemaname = $1
+        ${filterClause.replace('%NAME%', 'tablename')}
+      `;
+    case 'view':
+      return `
+        SELECT
+          v.table_name as name,
+          'view'::text as type,
+          COALESCE(c.relowner::regrole::text, '') as owner,
+          v.table_schema as schema
+        FROM information_schema.views v
+        LEFT JOIN pg_class c ON c.relname = v.table_name
+        LEFT JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = v.table_schema
+        WHERE v.table_schema = $1
+        ${filterClause.replace('%NAME%', 'v.table_name')}
+      `;
+    case 'sequence':
+      return `
+        SELECT
+          s.sequence_name as name,
+          'sequence'::text as type,
+          COALESCE(c.relowner::regrole::text, '') as owner,
+          s.sequence_schema as schema
+        FROM information_schema.sequences s
+        LEFT JOIN pg_class c ON c.relname = s.sequence_name
+        LEFT JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = s.sequence_schema
+        WHERE s.sequence_schema = $1
+        ${filterClause.replace('%NAME%', 's.sequence_name')}
+      `;
+    case 'extension':
+      return `
+        SELECT
+          extname as name,
+          'extension'::text as type,
+          COALESCE(extowner::regrole::text, '') as owner,
+          n.nspname as schema
+        FROM pg_extension e
+        JOIN pg_namespace n ON e.extnamespace = n.oid
+        WHERE n.nspname = $1
+        ${filterClause.replace('%NAME%', 'extname')}
+      `;
+  }
+}
+
+/**
+ * Collects union query parts based on requested object type.
+ */
+function collectUnionParts(objectType: ObjectType, hasFilter: boolean): string[] {
+  const parts: string[] = [];
+  const types: Array<'table' | 'view' | 'sequence' | 'extension'> = ['table', 'view', 'sequence', 'extension'];
+
+  for (const type of types) {
+    if (objectType === 'all' || objectType === type) {
+      parts.push(buildObjectTypeQuery(type, hasFilter));
+    }
+  }
+
+  return parts;
+}
 
 export async function listSchemas(args: {
   includeSystemSchemas?: boolean;
@@ -37,15 +136,29 @@ export async function listSchemas(args: {
   return result.rows;
 }
 
+/**
+ * Lists database objects (tables, views, sequences, extensions) in a schema.
+ * Supports filtering by object type, name pattern, and pagination.
+ *
+ * @param args - Query parameters including schema, filters, and pagination
+ * @returns Paginated result with objects and metadata
+ */
 export async function listObjects(args: {
+  /** Schema name to list objects from (required) */
   schema: string;
+  /** Filter by object type (default: 'all') */
   objectType?: 'table' | 'view' | 'sequence' | 'extension' | 'all';
+  /** Filter objects by name pattern (ILIKE matching) */
   filter?: string;
+  /** Maximum number of objects to return (default: 100, max: 1000) */
+  limit?: number;
+  /** Number of objects to skip for pagination (default: 0) */
+  offset?: number;
   // Connection override parameters
   server?: string;
   database?: string;
   targetSchema?: string; // Use targetSchema to avoid confusion with the required schema param
-}): Promise<TableInfo[]> {
+}): Promise<PaginatedResult<TableInfo>> {
   // Validate required parameters
   if (!args.schema) {
     throw new Error('schema parameter is required');
@@ -53,22 +166,18 @@ export async function listObjects(args: {
 
   // Validate schema name to prevent SQL injection
   validateIdentifier(args.schema, 'schema');
+  validateFilter(args.filter);
 
-  // Validate filter if provided
-  if (args.filter) {
-    // Allow more characters in filter since it's used with ILIKE and parameterized
-    if (args.filter.length > 128) {
-      throw new Error('filter must be 128 characters or less');
-    }
-    // Only allow safe characters in filter
-    if (!/^[a-zA-Z0-9_% ]+$/.test(args.filter)) {
-      throw new Error('filter contains invalid characters');
-    }
-  }
+  // Validate and set pagination parameters
+  const limit = args.limit !== undefined
+    ? validatePositiveInteger(args.limit, 'limit', 1, MAX_LIST_LIMIT)
+    : DEFAULT_LIST_LIMIT;
+  const offset = args.offset !== undefined
+    ? validatePositiveInteger(args.offset, 'offset', 0, 1000000)
+    : 0;
 
   const dbManager = getDbManager();
-  const objectType = args.objectType || 'all';
-  const objects: TableInfo[] = [];
+  const objectType: ObjectType = args.objectType || 'all';
 
   // Build connection override if specified
   const hasOverride = args.server || args.database || args.targetSchema;
@@ -76,84 +185,68 @@ export async function listObjects(args: {
     ? { server: args.server, database: args.database, schema: args.targetSchema }
     : undefined;
 
-  // List tables
-  if (objectType === 'all' || objectType === 'table') {
-    const tablesQuery = `
-      SELECT
-        tablename as name,
-        'table' as type,
-        tableowner as owner,
-        schemaname as schema
-      FROM pg_catalog.pg_tables
-      WHERE schemaname = $1
-      ${args.filter ? "AND tablename ILIKE '%' || $2 || '%'" : ''}
-      ORDER BY tablename
-    `;
-    const params = args.filter ? [args.schema, args.filter] : [args.schema];
-    const tables = await dbManager.queryWithOverride<TableInfo>(tablesQuery, params, override);
-    objects.push(...tables.rows);
+  // Build union query parts using helper
+  const unionParts = collectUnionParts(objectType, !!args.filter);
+  const baseParams = args.filter ? [args.schema, args.filter] : [args.schema];
+
+  if (unionParts.length === 0) {
+    // No valid object types requested
+    return {
+      items: [],
+      totalCount: 0,
+      offset,
+      limit,
+      hasMore: false,
+    };
   }
 
-  // List views
-  if (objectType === 'all' || objectType === 'view') {
-    const viewsQuery = `
-      SELECT
-        v.table_name as name,
-        'view' as type,
-        v.table_schema as schema,
-        COALESCE(c.relowner::regrole::text, '') as owner
-      FROM information_schema.views v
-      LEFT JOIN pg_class c ON c.relname = v.table_name
-      LEFT JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = v.table_schema
-      WHERE v.table_schema = $1
-      ${args.filter ? "AND v.table_name ILIKE '%' || $2 || '%'" : ''}
-      ORDER BY v.table_name
-    `;
-    const params = args.filter ? [args.schema, args.filter] : [args.schema];
-    const views = await dbManager.queryWithOverride<TableInfo>(viewsQuery, params, override);
-    objects.push(...views.rows);
-  }
+  // Build the combined query with UNION ALL
+  const unionQuery = unionParts.join('\nUNION ALL\n');
 
-  // List sequences
-  if (objectType === 'all' || objectType === 'sequence') {
-    const sequencesQuery = `
-      SELECT
-        s.sequence_name as name,
-        'sequence' as type,
-        s.sequence_schema as schema,
-        COALESCE(c.relowner::regrole::text, '') as owner
-      FROM information_schema.sequences s
-      LEFT JOIN pg_class c ON c.relname = s.sequence_name
-      LEFT JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = s.sequence_schema
-      WHERE s.sequence_schema = $1
-      ${args.filter ? "AND s.sequence_name ILIKE '%' || $2 || '%'" : ''}
-      ORDER BY s.sequence_name
-    `;
-    const params = args.filter ? [args.schema, args.filter] : [args.schema];
-    const sequences = await dbManager.queryWithOverride<TableInfo>(sequencesQuery, params, override);
-    objects.push(...sequences.rows);
-  }
+  // First, get the total count (without pagination)
+  const countQuery = `SELECT COUNT(*) as total FROM (${unionQuery}) as combined`;
+  const countResult = await dbManager.queryWithOverride<{ total: string }>(countQuery, baseParams, override);
+  const totalCount = parseInt(countResult.rows[0]?.total || '0', 10);
 
-  // List extensions (schema-independent but we can filter)
-  if (objectType === 'all' || objectType === 'extension') {
-    const extensionsQuery = `
-      SELECT
-        extname as name,
-        'extension' as type,
-        n.nspname as schema,
-        COALESCE(extowner::regrole::text, '') as owner
-      FROM pg_extension e
-      JOIN pg_namespace n ON e.extnamespace = n.oid
-      WHERE n.nspname = $1
-      ${args.filter ? "AND extname ILIKE '%' || $2 || '%'" : ''}
-      ORDER BY extname
-    `;
-    const params = args.filter ? [args.schema, args.filter] : [args.schema];
-    const extensions = await dbManager.queryWithOverride<TableInfo>(extensionsQuery, params, override);
-    objects.push(...extensions.rows);
-  }
+  // Then get the paginated results
+  const paginatedQuery = `
+    SELECT * FROM (${unionQuery}) as combined
+    ORDER BY type, name
+    LIMIT ${limit} OFFSET ${offset}
+  `;
+  const objectsResult = await dbManager.queryWithOverride<TableInfo>(paginatedQuery, baseParams, override);
 
-  return objects;
+  return {
+    items: objectsResult.rows,
+    totalCount,
+    offset,
+    limit,
+    hasMore: offset + objectsResult.rows.length < totalCount,
+  };
+}
+
+/**
+ * Lists database objects without pagination (legacy compatibility).
+ * Returns all objects matching the criteria.
+ *
+ * @deprecated Use listObjects with pagination for better performance on large schemas
+ * @param args - Query parameters including schema and filters
+ * @returns Array of all matching objects
+ */
+export async function listObjectsUnpaginated(args: {
+  schema: string;
+  objectType?: 'table' | 'view' | 'sequence' | 'extension' | 'all';
+  filter?: string;
+  server?: string;
+  database?: string;
+  targetSchema?: string;
+}): Promise<TableInfo[]> {
+  const result = await listObjects({
+    ...args,
+    limit: MAX_LIST_LIMIT,
+    offset: 0,
+  });
+  return result.items;
 }
 
 export async function getObjectDetails(args: {

@@ -11,12 +11,19 @@ import {
   ConnectionOverride,
 } from "./types.js";
 import { isReadOnlySql } from "./utils/validation.js";
-import { validateDatabaseName, validateSchemaName } from "./db-manager/validation.js";
+import {
+  validateDatabaseName,
+  validateSchemaName,
+} from "./db-manager/validation.js";
+import {
+  TRANSACTION_CLEANUP_TIMEOUT_MS,
+  TRANSACTION_CLEANUP_INTERVAL_MS,
+} from "./tools/sql/utils/constants.js";
 
 const DEFAULT_PORT = "5432";
 const DEFAULT_DATABASE = "postgres";
 const DEFAULT_SCHEMA = "public";
-const DEFAULT_QUERY_TIMEOUT_MS = 30000; // 30 seconds
+const DEFAULT_QUERY_TIMEOUT_MS = 200000; // 30 seconds
 const MAX_QUERY_TIMEOUT_MS = 300000; // 5 minutes
 
 /** SSL configuration object for pg Pool */
@@ -68,7 +75,12 @@ function getSslConfig(ssl: ServerConfig["ssl"]): SslConfigObject | undefined {
     return undefined;
   }
 
-  if (ssl === true || ssl === "require" || ssl === "prefer" || ssl === "allow") {
+  if (
+    ssl === true ||
+    ssl === "require" ||
+    ssl === "prefer" ||
+    ssl === "allow"
+  ) {
     // Most cloud providers need rejectUnauthorized: false for self-signed certs
     return { rejectUnauthorized: false };
   }
@@ -228,6 +240,8 @@ export class DatabaseManager {
   // Pool cache for connection overrides (keyed by "serverName:database")
   private poolCache: Map<string, CachedPool> = new Map();
   private poolCleanupInterval: ReturnType<typeof setInterval> | null = null;
+  private transactionCleanupInterval: ReturnType<typeof setInterval> | null =
+    null;
 
   // Track pool creation promises to prevent race conditions
   // When multiple concurrent requests need the same pool, they all wait for the same Promise
@@ -252,6 +266,8 @@ export class DatabaseManager {
 
     // Start pool cleanup interval
     this.startPoolCleanup();
+    // Start transaction cleanup interval
+    this.startTransactionCleanup();
   }
 
   /**
@@ -294,6 +310,108 @@ export class DatabaseManager {
         this.poolCache.delete(key);
       }
     }
+  }
+
+  /**
+   * Starts the periodic cleanup of abandoned transactions.
+   * Transactions older than TRANSACTION_CLEANUP_TIMEOUT_MS (45 minutes) are
+   * automatically rolled back to prevent connection leaks.
+   */
+  private startTransactionCleanup(): void {
+    if (this.transactionCleanupInterval) {
+      return;
+    }
+
+    this.transactionCleanupInterval = setInterval(() => {
+      this.cleanupAbandonedTransactions();
+    }, TRANSACTION_CLEANUP_INTERVAL_MS);
+
+    // Allow the process to exit even if the interval is running
+    if (this.transactionCleanupInterval.unref) {
+      this.transactionCleanupInterval.unref();
+    }
+  }
+
+  /**
+   * Cleans up transactions that have been open for too long.
+   * Rolls back and releases the client for any transaction older than
+   * TRANSACTION_CLEANUP_TIMEOUT_MS (45 minutes).
+   *
+   * @returns Array of cleaned up transaction IDs with their info
+   */
+  private cleanupAbandonedTransactions(): Array<{
+    transactionId: string;
+    name?: string;
+    age: number;
+  }> {
+    const now = Date.now();
+    const cleanedUp: Array<{
+      transactionId: string;
+      name?: string;
+      age: number;
+    }> = [];
+
+    for (const [
+      transactionId,
+      transaction,
+    ] of this.activeTransactions.entries()) {
+      const age = now - transaction.info.startedAt.getTime();
+      if (age > TRANSACTION_CLEANUP_TIMEOUT_MS) {
+        const info = {
+          transactionId,
+          name: transaction.info.name,
+          age,
+        };
+
+        // Roll back the transaction and release the client
+        transaction.client
+          .query("ROLLBACK")
+          .catch((err) => {
+            console.error(
+              `Error rolling back abandoned transaction ${transactionId}:`,
+              err
+            );
+          })
+          .finally(() => {
+            transaction.client.release();
+          });
+
+        this.activeTransactions.delete(transactionId);
+        cleanedUp.push(info);
+
+        console.error(
+          `Cleaned up abandoned transaction: ${transactionId}` +
+            (transaction.info.name ? ` (${transaction.info.name})` : "") +
+            ` - age: ${Math.round(age / 60000)} minutes`
+        );
+      }
+    }
+
+    return cleanedUp;
+  }
+
+  /**
+   * Gets the age of a transaction in milliseconds.
+   *
+   * @param transactionId - The transaction ID
+   * @returns Age in milliseconds or null if transaction not found
+   */
+  public getTransactionAge(transactionId: string): number | null {
+    const transaction = this.activeTransactions.get(transactionId);
+    if (!transaction) return null;
+    return Date.now() - transaction.info.startedAt.getTime();
+  }
+
+  /**
+   * Gets the remaining time before a transaction is auto-cleaned in milliseconds.
+   *
+   * @param transactionId - The transaction ID
+   * @returns Remaining time in milliseconds or null if transaction not found
+   */
+  public getTransactionTimeRemaining(transactionId: string): number | null {
+    const age = this.getTransactionAge(transactionId);
+    if (age === null) return null;
+    return Math.max(0, TRANSACTION_CLEANUP_TIMEOUT_MS - age);
   }
 
   /**
@@ -557,7 +675,10 @@ export class DatabaseManager {
   /**
    * Acquires a client from the main pool with proper tracking
    */
-  private async acquireMainPoolClient(): Promise<{ client: PoolClient; release: () => void }> {
+  private async acquireMainPoolClient(): Promise<{
+    client: PoolClient;
+    release: () => void;
+  }> {
     if (!this.currentPool) {
       throw new Error(
         "No database connection. Please switch to a server and database first."
@@ -575,8 +696,14 @@ export class DatabaseManager {
     this.mainPoolActiveConnections++;
 
     const release = () => {
-      this.totalActiveConnections = Math.max(0, this.totalActiveConnections - 1);
-      this.mainPoolActiveConnections = Math.max(0, this.mainPoolActiveConnections - 1);
+      this.totalActiveConnections = Math.max(
+        0,
+        this.totalActiveConnections - 1
+      );
+      this.mainPoolActiveConnections = Math.max(
+        0,
+        this.mainPoolActiveConnections - 1
+      );
       client.release();
     };
 
@@ -601,7 +728,10 @@ export class DatabaseManager {
     cached.lastUsed = Date.now();
 
     const release = () => {
-      this.totalActiveConnections = Math.max(0, this.totalActiveConnections - 1);
+      this.totalActiveConnections = Math.max(
+        0,
+        this.totalActiveConnections - 1
+      );
       cached.activeConnections = Math.max(0, cached.activeConnections - 1);
       client.release();
     };
@@ -708,7 +838,10 @@ export class DatabaseManager {
     override?: ConnectionOverride
   ): Promise<OverrideClientResult> {
     // If no override, use current connection
-    if (!override || (!override.server && !override.database && !override.schema)) {
+    if (
+      !override ||
+      (!override.server && !override.database && !override.schema)
+    ) {
       if (!this.currentPool) {
         throw new Error(
           "No database connection. Please switch to a server and database first, or provide server/database/schema override parameters."
@@ -723,11 +856,15 @@ export class DatabaseManager {
       // Set search_path to current schema
       const schema = this.connectionState.currentSchema || DEFAULT_SCHEMA;
       try {
-        await client.query(`SET search_path TO ${this.escapeIdentifier(schema)}`);
+        await client.query(
+          `SET search_path TO ${this.escapeIdentifier(schema)}`
+        );
       } catch (error) {
         release();
         throw new Error(
-          `Failed to set schema '${schema}': ${error instanceof Error ? error.message : String(error)}`
+          `Failed to set schema '${schema}': ${
+            error instanceof Error ? error.message : String(error)
+          }`
         );
       }
 
@@ -745,8 +882,26 @@ export class DatabaseManager {
     // Resolve server - use override or current
     const serverName = override.server || this.connectionState.currentServer;
     if (!serverName) {
+      // Build a helpful error message describing what was provided vs what's needed
+      const providedParams: string[] = [];
+      if (override.database)
+        providedParams.push(`database='${override.database}'`);
+      if (override.schema) providedParams.push(`schema='${override.schema}'`);
+
+      const providedStr =
+        providedParams.length > 0
+          ? ` You provided ${providedParams.join(", ")} but no server.`
+          : "";
+
+      const availableServers = this.getServerNames();
+      const serversHint =
+        availableServers.length > 0
+          ? ` Available servers: ${availableServers.join(", ")}.`
+          : " No servers are configured. Please set PG_* environment variables or POSTGRES_SERVERS.";
+
       throw new Error(
-        "No server specified and no current connection. Provide 'server' parameter or connect first."
+        `No server specified and no current connection.${providedStr} ` +
+          `Provide 'server' parameter to specify target server, or use switch_server to connect first.${serversHint}`
       );
     }
 
@@ -754,7 +909,9 @@ export class DatabaseManager {
     if (!serverConfig) {
       const availableServers = this.getServerNames();
       throw new Error(
-        `Server '${serverName}' not found. Available servers: ${availableServers.join(", ") || "none configured"}`
+        `Server '${serverName}' not found. Available servers: ${
+          availableServers.join(", ") || "none configured"
+        }`
       );
     }
 
@@ -762,7 +919,10 @@ export class DatabaseManager {
     let database: string;
     if (override.database) {
       database = override.database;
-    } else if (serverName === this.connectionState.currentServer && this.connectionState.currentDatabase) {
+    } else if (
+      serverName === this.connectionState.currentServer &&
+      this.connectionState.currentDatabase
+    ) {
       database = this.connectionState.currentDatabase;
     } else {
       database = serverConfig.defaultDatabase || DEFAULT_DATABASE;
@@ -775,7 +935,10 @@ export class DatabaseManager {
     let schema: string;
     if (override.schema) {
       schema = override.schema;
-    } else if (serverName === this.connectionState.currentServer && this.connectionState.currentSchema) {
+    } else if (
+      serverName === this.connectionState.currentServer &&
+      this.connectionState.currentSchema
+    ) {
       schema = this.connectionState.currentSchema;
     } else {
       schema = serverConfig.defaultSchema || DEFAULT_SCHEMA;
@@ -794,11 +957,15 @@ export class DatabaseManager {
       const { client, release } = await this.acquireMainPoolClient();
 
       try {
-        await client.query(`SET search_path TO ${this.escapeIdentifier(schema)}`);
+        await client.query(
+          `SET search_path TO ${this.escapeIdentifier(schema)}`
+        );
       } catch (error) {
         release();
         throw new Error(
-          `Failed to set schema '${schema}': ${error instanceof Error ? error.message : String(error)}`
+          `Failed to set schema '${schema}': ${
+            error instanceof Error ? error.message : String(error)
+          }`
         );
       }
 
@@ -809,13 +976,19 @@ export class DatabaseManager {
         database,
         schema,
         context: serverConfig.context,
-        isOverride: override.schema !== undefined && override.schema !== this.connectionState.currentSchema,
+        isOverride:
+          override.schema !== undefined &&
+          override.schema !== this.connectionState.currentSchema,
       };
     }
 
     // Get or create cached pool for the override connection
     // This handles concurrent requests efficiently
-    const cached = await this.getOrCreateCachedPool(serverName, database, serverConfig);
+    const cached = await this.getOrCreateCachedPool(
+      serverName,
+      database,
+      serverConfig
+    );
     const { client, release } = await this.acquireCachedPoolClient(cached);
 
     try {
@@ -823,7 +996,9 @@ export class DatabaseManager {
     } catch (error) {
       release();
       throw new Error(
-        `Failed to set schema '${schema}': ${error instanceof Error ? error.message : String(error)}`
+        `Failed to set schema '${schema}': ${
+          error instanceof Error ? error.message : String(error)
+        }`
       );
     }
 
@@ -851,7 +1026,11 @@ export class DatabaseManager {
     sql: string,
     params?: any[],
     override?: ConnectionOverride
-  ): Promise<QueryResult<T> & { connectionInfo: { server: string; database: string; schema: string } }> {
+  ): Promise<
+    QueryResult<T> & {
+      connectionInfo: { server: string; database: string; schema: string };
+    }
+  > {
     if (!sql || typeof sql !== "string") {
       throw new Error("SQL query is required and must be a string");
     }
@@ -941,11 +1120,16 @@ export class DatabaseManager {
       maxSize: MAX_POOL_SIZE_CACHED,
       lastUsed: new Date(cached.lastUsed),
       createdAt: new Date(cached.createdAt),
-      idleTimeRemaining: Math.max(0, POOL_IDLE_TIMEOUT_MS - (now - cached.lastUsed)),
+      idleTimeRemaining: Math.max(
+        0,
+        POOL_IDLE_TIMEOUT_MS - (now - cached.lastUsed)
+      ),
     }));
 
-    const cachedPoolsTotalActive = Array.from(this.poolCache.values())
-      .reduce((sum, cached) => sum + cached.activeConnections, 0);
+    const cachedPoolsTotalActive = Array.from(this.poolCache.values()).reduce(
+      (sum, cached) => sum + cached.activeConnections,
+      0
+    );
 
     return {
       totalActiveConnections: this.totalActiveConnections,
@@ -972,7 +1156,13 @@ export class DatabaseManager {
   public getCachedPoolStats(): {
     count: number;
     maxSize: number;
-    pools: Array<{ key: string; serverName: string; database: string; lastUsed: Date; createdAt: Date }>;
+    pools: Array<{
+      key: string;
+      serverName: string;
+      database: string;
+      lastUsed: Date;
+      createdAt: Date;
+    }>;
   } {
     const pools = Array.from(this.poolCache.entries()).map(([key, cached]) => ({
       key,
@@ -990,11 +1180,33 @@ export class DatabaseManager {
   }
 
   public async close(): Promise<void> {
-    // Stop cleanup interval
+    // Stop cleanup intervals
     if (this.poolCleanupInterval) {
       clearInterval(this.poolCleanupInterval);
       this.poolCleanupInterval = null;
     }
+    if (this.transactionCleanupInterval) {
+      clearInterval(this.transactionCleanupInterval);
+      this.transactionCleanupInterval = null;
+    }
+
+    // Roll back and release all active transactions
+    for (const [
+      transactionId,
+      transaction,
+    ] of this.activeTransactions.entries()) {
+      try {
+        await transaction.client.query("ROLLBACK");
+      } catch (err) {
+        console.error(
+          `Error rolling back transaction ${transactionId} during close:`,
+          err
+        );
+      } finally {
+        transaction.client.release();
+      }
+    }
+    this.activeTransactions.clear();
 
     // Close all cached pools
     await this.closeAllCachedPools();
@@ -1243,20 +1455,48 @@ export class DatabaseManager {
   }
 
   /**
-   * Gets information about an active transaction
+   * Gets information about an active transaction, including time remaining.
+   *
+   * @param transactionId - The transaction ID
+   * @returns Transaction info with age and time remaining, or null if not found
    */
-  public getTransactionInfo(transactionId: string): TransactionInfo | null {
+  public getTransactionInfo(
+    transactionId: string
+  ): (TransactionInfo & { ageMs: number; timeRemainingMs: number }) | null {
     const transaction = this.activeTransactions.get(transactionId);
-    return transaction ? { ...transaction.info } : null;
+    if (!transaction) return null;
+
+    const ageMs = Date.now() - transaction.info.startedAt.getTime();
+    const timeRemainingMs = Math.max(0, TRANSACTION_CLEANUP_TIMEOUT_MS - ageMs);
+
+    return {
+      ...transaction.info,
+      ageMs,
+      timeRemainingMs,
+    };
   }
 
   /**
-   * Lists all active transactions
+   * Lists all active transactions with age and time remaining.
+   *
+   * @returns Array of transaction info objects with age and time remaining
    */
-  public listActiveTransactions(): TransactionInfo[] {
-    return Array.from(this.activeTransactions.values()).map((t) => ({
-      ...t.info,
-    }));
+  public listActiveTransactions(): Array<
+    TransactionInfo & { ageMs: number; timeRemainingMs: number }
+  > {
+    const now = Date.now();
+    return Array.from(this.activeTransactions.values()).map((t) => {
+      const ageMs = now - t.info.startedAt.getTime();
+      const timeRemainingMs = Math.max(
+        0,
+        TRANSACTION_CLEANUP_TIMEOUT_MS - ageMs
+      );
+      return {
+        ...t.info,
+        ageMs,
+        timeRemainingMs,
+      };
+    });
   }
 }
 

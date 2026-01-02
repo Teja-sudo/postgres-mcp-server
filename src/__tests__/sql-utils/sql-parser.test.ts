@@ -1,14 +1,28 @@
 /**
  * SQL Parser Utilities Tests
+ *
+ * Comprehensive test suite covering:
+ * - SQL statement parsing and splitting
+ * - Comment handling (line comments, block comments, nested comments)
+ * - Dollar-quoted strings
+ * - Statement type detection
+ * - Table extraction from SQL
+ * - Schema change detection
+ * - Edge cases and error handling
  */
 
 import {
   splitSqlStatementsWithLineNumbers,
+  splitSqlStatementsWithWarnings,
   stripLeadingComments,
   detectStatementType,
   extractTablesFromSql,
   filterExecutableStatements,
   normalizeSql,
+  isEmptyAfterPreprocessing,
+  detectSchemaChanges,
+  ParseWarning,
+  ParseResult,
 } from '../../tools/sql/utils/sql-parser.js';
 
 describe('sql-parser', () => {
@@ -427,6 +441,233 @@ comment */ * FROM users`;
       const sql = 'SELECT 1 + 1';
       const tables = extractTablesFromSql(sql);
       expect(tables).toHaveLength(0);
+    });
+
+    it('should extract table from MERGE INTO', () => {
+      const sql = 'MERGE INTO target_table t USING source_table s ON t.id = s.id';
+      const tables = extractTablesFromSql(sql);
+      expect(tables.some((t) => t.table === 'target_table')).toBe(true);
+    });
+
+    it('should extract table from USING clause', () => {
+      const sql = 'MERGE INTO target_table t USING source_table s ON t.id = s.id';
+      const tables = extractTablesFromSql(sql);
+      expect(tables.some((t) => t.table === 'source_table')).toBe(true);
+    });
+
+    it('should extract table from COPY', () => {
+      const sql = "COPY users TO '/tmp/users.csv'";
+      const tables = extractTablesFromSql(sql);
+      expect(tables.some((t) => t.table === 'users')).toBe(true);
+    });
+
+    it('should extract schema-qualified table from COPY', () => {
+      const sql = "COPY public.users FROM '/tmp/users.csv'";
+      const tables = extractTablesFromSql(sql);
+      expect(tables.some((t) => t.schema === 'public' && t.table === 'users')).toBe(true);
+    });
+
+    it('should extract table from TABLE keyword', () => {
+      const sql = 'COPY TABLE data_export TO STDOUT';
+      const tables = extractTablesFromSql(sql);
+      expect(tables.some((t) => t.table === 'data_export')).toBe(true);
+    });
+  });
+
+  describe('stripLeadingComments - nested block comments', () => {
+    it('should handle simple nested block comments', () => {
+      const sql = `/* outer /* inner */ end outer */
+SELECT * FROM users`;
+      expect(stripLeadingComments(sql).trim()).toBe('SELECT * FROM users');
+    });
+
+    it('should handle deeply nested block comments', () => {
+      const sql = `/* level1 /* level2 /* level3 */ level2 */ level1 */
+SELECT 1`;
+      expect(stripLeadingComments(sql).trim()).toBe('SELECT 1');
+    });
+
+    it('should return empty for unclosed nested block comment', () => {
+      const sql = '/* outer /* inner unclosed */';
+      expect(stripLeadingComments(sql)).toBe('');
+    });
+
+    it('should handle multiple consecutive nested block comments', () => {
+      const sql = `/* first /* nested */ end */
+/* second /* also nested */ done */
+SELECT * FROM table1`;
+      expect(stripLeadingComments(sql).trim()).toBe('SELECT * FROM table1');
+    });
+  });
+
+  describe('splitSqlStatementsWithWarnings', () => {
+    it('should return empty warnings for valid SQL', () => {
+      const sql = 'SELECT 1; SELECT 2';
+      const result = splitSqlStatementsWithWarnings(sql);
+      expect(result.statements).toHaveLength(2);
+      expect(result.warnings).toHaveLength(0);
+    });
+
+    it('should warn about unclosed dollar-quote', () => {
+      const sql = 'SELECT $$unclosed dollar quote';
+      const result = splitSqlStatementsWithWarnings(sql);
+      expect(result.warnings).toHaveLength(1);
+      expect(result.warnings[0].type).toBe('unclosed_dollar_quote');
+      expect(result.warnings[0].tag).toBe('$$');
+      expect(result.warnings[0].lineNumber).toBe(1);
+    });
+
+    it('should warn about unclosed custom dollar-quote tag', () => {
+      const sql = 'SELECT $my_tag$unclosed custom tag';
+      const result = splitSqlStatementsWithWarnings(sql);
+      expect(result.warnings).toHaveLength(1);
+      expect(result.warnings[0].type).toBe('unclosed_dollar_quote');
+      expect(result.warnings[0].tag).toBe('$my_tag$');
+    });
+
+    it('should warn about unclosed block comment', () => {
+      const sql = 'SELECT * FROM users /* unclosed comment';
+      const result = splitSqlStatementsWithWarnings(sql);
+      expect(result.warnings).toHaveLength(1);
+      expect(result.warnings[0].type).toBe('unclosed_block_comment');
+    });
+
+    it('should warn about unclosed string literal', () => {
+      const sql = "SELECT 'unclosed string";
+      const result = splitSqlStatementsWithWarnings(sql);
+      expect(result.warnings).toHaveLength(1);
+      expect(result.warnings[0].type).toBe('unclosed_string');
+      expect(result.warnings[0].lineNumber).toBe(1);
+    });
+
+    it('should track correct line number for unclosed constructs', () => {
+      const sql = `SELECT 1;
+SELECT 2;
+SELECT $$unclosed on line 3`;
+      const result = splitSqlStatementsWithWarnings(sql);
+      expect(result.warnings[0].lineNumber).toBe(3);
+    });
+
+    it('should handle dollar-quote inside SQL string literal correctly', () => {
+      // This tests that $fileName$ inside a string doesn't get misinterpreted
+      const sql = "INSERT INTO logs VALUES ('$fileName$ not found')";
+      const result = splitSqlStatementsWithWarnings(sql);
+      expect(result.warnings).toHaveLength(0);
+      expect(result.statements).toHaveLength(1);
+    });
+
+    it('should preserve line numbers through all constructs', () => {
+      const sql = `-- Line 1 comment
+/* Block comment
+   on lines 2-3 */
+SELECT 1;
+SELECT 2`;
+      const result = splitSqlStatementsWithWarnings(sql);
+      // First executable statement starts on line 4
+      expect(result.statements[0].lineNumber).toBe(4);
+      // Second statement on line 5
+      expect(result.statements[1].lineNumber).toBe(5);
+    });
+
+    it('should handle nested block comments in warnings context', () => {
+      const sql = 'SELECT * FROM users /* outer /* inner unclosed';
+      const result = splitSqlStatementsWithWarnings(sql);
+      expect(result.warnings).toHaveLength(1);
+      expect(result.warnings[0].type).toBe('unclosed_block_comment');
+    });
+  });
+
+  describe('isEmptyAfterPreprocessing', () => {
+    it('should return true for empty string', () => {
+      expect(isEmptyAfterPreprocessing('')).toBe(true);
+    });
+
+    it('should return true for whitespace only', () => {
+      expect(isEmptyAfterPreprocessing('   \n\t  ')).toBe(true);
+    });
+
+    it('should return true for line comment only', () => {
+      expect(isEmptyAfterPreprocessing('-- just a comment')).toBe(true);
+    });
+
+    it('should return true for block comment only', () => {
+      expect(isEmptyAfterPreprocessing('/* block comment */')).toBe(true);
+    });
+
+    it('should return true for multiple comments only', () => {
+      expect(isEmptyAfterPreprocessing(`-- comment
+/* another comment */
+-- more comments`)).toBe(true);
+    });
+
+    it('should return false for SQL with comments', () => {
+      expect(isEmptyAfterPreprocessing('-- comment\nSELECT 1')).toBe(false);
+    });
+
+    it('should return false for valid SQL', () => {
+      expect(isEmptyAfterPreprocessing('SELECT 1')).toBe(false);
+    });
+  });
+
+  describe('detectSchemaChanges', () => {
+    it('should detect SET search_path', () => {
+      const result = detectSchemaChanges('SET search_path TO my_schema');
+      expect(result.hasSchemaChange).toBe(true);
+      expect(result.changeType).toBe('search_path');
+      expect(result.newSchema).toBe('my_schema');
+    });
+
+    it('should detect SET search_path with = syntax', () => {
+      const result = detectSchemaChanges('SET search_path = my_schema');
+      expect(result.hasSchemaChange).toBe(true);
+      expect(result.changeType).toBe('search_path');
+    });
+
+    it('should detect SET LOCAL search_path', () => {
+      const result = detectSchemaChanges('SET LOCAL search_path TO temp_schema');
+      expect(result.hasSchemaChange).toBe(true);
+      expect(result.changeType).toBe('search_path');
+    });
+
+    it('should detect CREATE SCHEMA', () => {
+      const result = detectSchemaChanges('CREATE SCHEMA new_schema');
+      expect(result.hasSchemaChange).toBe(true);
+      expect(result.changeType).toBe('schema_create');
+    });
+
+    it('should detect DROP SCHEMA', () => {
+      const result = detectSchemaChanges('DROP SCHEMA old_schema CASCADE');
+      expect(result.hasSchemaChange).toBe(true);
+      expect(result.changeType).toBe('schema_drop');
+    });
+
+    it('should detect ALTER SCHEMA', () => {
+      const result = detectSchemaChanges('ALTER SCHEMA my_schema RENAME TO new_name');
+      expect(result.hasSchemaChange).toBe(true);
+      expect(result.changeType).toBe('schema_alter');
+    });
+
+    it('should return false for non-schema statements', () => {
+      const result = detectSchemaChanges('SELECT * FROM users');
+      expect(result.hasSchemaChange).toBe(false);
+      expect(result.changeType).toBeUndefined();
+    });
+
+    it('should handle comments in schema change statements', () => {
+      const result = detectSchemaChanges('-- change schema\nSET search_path TO new_schema');
+      expect(result.hasSchemaChange).toBe(true);
+    });
+  });
+
+  describe('normalizeSql - nested block comments', () => {
+    it('should remove nested block comments', () => {
+      const sql = 'SELECT /* outer /* inner */ outer */ * FROM users';
+      expect(normalizeSql(sql)).toBe('SELECT * FROM users');
+    });
+
+    it('should handle multiple levels of nesting', () => {
+      const sql = 'SELECT /* l1 /* l2 /* l3 */ l2 */ l1 */ 1';
+      expect(normalizeSql(sql)).toBe('SELECT 1');
     });
   });
 });

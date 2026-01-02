@@ -315,24 +315,26 @@ describe('SQL Tools', () => {
         // Mock hypopg check to return true
         mockClient.query.mockResolvedValueOnce({ rows: [{ has_hypopg: true }] });
 
+        // SQL injection patterns are caught with specific error message
         await expect(explainQuery({
           sql: 'SELECT * FROM users',
           hypotheticalIndexes: [
             { table: 'users; DROP TABLE', columns: ['id'] }
           ]
-        })).rejects.toThrow('invalid characters');
+        })).rejects.toThrow('potentially dangerous SQL characters');
       });
 
       it('should validate column names in hypothetical indexes', async () => {
         // Mock hypopg check to return true
         mockClient.query.mockResolvedValueOnce({ rows: [{ has_hypopg: true }] });
 
+        // SQL injection patterns are caught with specific error message
         await expect(explainQuery({
           sql: 'SELECT * FROM users',
           hypotheticalIndexes: [
             { table: 'users', columns: ['id; DROP'] }
           ]
-        })).rejects.toThrow('invalid characters');
+        })).rejects.toThrow('potentially dangerous SQL characters');
       });
 
       it('should validate index type', async () => {

@@ -87,35 +87,45 @@ describe('Schema Tools', () => {
     });
 
     it('should validate schema name', async () => {
+      // Schema with SQL injection patterns throws specific error
       await expect(listObjects({ schema: 'public; DROP TABLE users;--' }))
-        .rejects.toThrow('invalid characters');
+        .rejects.toThrow('potentially dangerous SQL characters');
 
+      // Schema with invalid characters throws pattern validation error
       await expect(listObjects({ schema: "schema'" }))
         .rejects.toThrow('invalid characters');
     });
 
     it('should list all object types by default', async () => {
-      mockQuery
-        .mockResolvedValueOnce({ rows: [{ name: 'users', type: 'table', owner: 'app', schema: 'public' }] })
-        .mockResolvedValueOnce({ rows: [{ name: 'active_users', type: 'view', owner: '', schema: 'public' }] })
-        .mockResolvedValueOnce({ rows: [{ name: 'users_id_seq', type: 'sequence', owner: '', schema: 'public' }] })
-        .mockResolvedValueOnce({ rows: [] });
+      // New implementation uses UNION query with pagination
+      mockQueryWithOverride
+        .mockResolvedValueOnce({ rows: [{ total: '3' }] }) // count query
+        .mockResolvedValueOnce({
+          rows: [
+            { name: 'users', type: 'table', owner: 'app', schema: 'public' },
+            { name: 'active_users', type: 'view', owner: '', schema: 'public' },
+            { name: 'users_id_seq', type: 'sequence', owner: '', schema: 'public' }
+          ]
+        });
 
       const result = await listObjects({ schema: 'public' });
 
-      expect(result).toHaveLength(3);
-      expect(mockQuery).toHaveBeenCalledTimes(4); // tables, views, sequences, extensions
+      expect(result.items).toHaveLength(3);
+      expect(result.totalCount).toBe(3);
+      expect(mockQueryWithOverride).toHaveBeenCalledTimes(2); // count + paginated query
     });
 
     it('should filter by object type', async () => {
-      mockQuery.mockResolvedValue({
-        rows: [{ name: 'users', type: 'table', owner: 'app', schema: 'public' }]
-      });
+      mockQueryWithOverride
+        .mockResolvedValueOnce({ rows: [{ total: '1' }] }) // count query
+        .mockResolvedValueOnce({
+          rows: [{ name: 'users', type: 'table', owner: 'app', schema: 'public' }]
+        });
 
       const result = await listObjects({ schema: 'public', objectType: 'table' });
 
-      expect(result).toHaveLength(1);
-      expect(mockQuery).toHaveBeenCalledTimes(1);
+      expect(result.items).toHaveLength(1);
+      expect(mockQueryWithOverride).toHaveBeenCalledTimes(2); // count + paginated query
     });
 
     it('should validate filter parameter', async () => {
@@ -139,6 +149,75 @@ describe('Schema Tools', () => {
         ['public', 'user']
       );
     });
+
+    describe('pagination', () => {
+      it('should return paginated result with metadata', async () => {
+        // First call: count query
+        mockQueryWithOverride
+          .mockResolvedValueOnce({ rows: [{ total: '25' }] })
+          // Second call: paginated data
+          .mockResolvedValueOnce({
+            rows: [
+              { name: 'users', type: 'table', owner: 'app', schema: 'public' },
+              { name: 'orders', type: 'table', owner: 'app', schema: 'public' },
+            ]
+          });
+
+        const result = await listObjects({ schema: 'public', objectType: 'table', limit: 2, offset: 0 });
+
+        expect(result.items).toHaveLength(2);
+        expect(result.totalCount).toBe(25);
+        expect(result.limit).toBe(2);
+        expect(result.offset).toBe(0);
+        expect(result.hasMore).toBe(true);
+      });
+
+      it('should set hasMore to false when on last page', async () => {
+        mockQueryWithOverride
+          .mockResolvedValueOnce({ rows: [{ total: '5' }] })
+          .mockResolvedValueOnce({
+            rows: [
+              { name: 'users', type: 'table', owner: 'app', schema: 'public' },
+            ]
+          });
+
+        const result = await listObjects({ schema: 'public', objectType: 'table', limit: 10, offset: 4 });
+
+        expect(result.hasMore).toBe(false);
+      });
+
+      it('should handle empty results', async () => {
+        mockQueryWithOverride
+          .mockResolvedValueOnce({ rows: [{ total: '0' }] })
+          .mockResolvedValueOnce({ rows: [] });
+
+        const result = await listObjects({ schema: 'empty_schema', objectType: 'table' });
+
+        expect(result.items).toHaveLength(0);
+        expect(result.totalCount).toBe(0);
+        expect(result.hasMore).toBe(false);
+      });
+
+      it('should use default limit when not specified', async () => {
+        mockQueryWithOverride
+          .mockResolvedValueOnce({ rows: [{ total: '5' }] })
+          .mockResolvedValueOnce({ rows: [] });
+
+        const result = await listObjects({ schema: 'public' });
+
+        expect(result.limit).toBe(100); // DEFAULT_LIST_LIMIT
+      });
+
+      it('should reject limit exceeding maximum', async () => {
+        await expect(listObjects({ schema: 'public', limit: 1001 }))
+          .rejects.toThrow('must be an integer between');
+      });
+
+      it('should reject negative offset', async () => {
+        await expect(listObjects({ schema: 'public', offset: -1 }))
+          .rejects.toThrow('must be an integer between');
+      });
+    });
   });
 
   describe('getObjectDetails', () => {
@@ -153,13 +232,15 @@ describe('Schema Tools', () => {
     });
 
     it('should validate schema name', async () => {
+      // Schema with SQL injection patterns throws specific error
       await expect(getObjectDetails({ schema: 'public; DROP', objectName: 'users' }))
-        .rejects.toThrow('invalid characters');
+        .rejects.toThrow('potentially dangerous SQL characters');
     });
 
     it('should validate object name', async () => {
+      // Object name with SQL injection patterns throws specific error
       await expect(getObjectDetails({ schema: 'public', objectName: 'users; DROP' }))
-        .rejects.toThrow('invalid characters');
+        .rejects.toThrow('potentially dangerous SQL characters');
     });
 
     it('should return columns, constraints, and indexes', async () => {

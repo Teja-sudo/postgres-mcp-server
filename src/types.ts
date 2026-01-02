@@ -86,6 +86,23 @@ export interface TableInfo {
   schema: string;
 }
 
+/**
+ * Paginated result wrapper for list operations.
+ * Provides total count, pagination metadata, and the actual items.
+ */
+export interface PaginatedResult<T> {
+  /** The items in the current page */
+  items: T[];
+  /** Total number of items across all pages */
+  totalCount: number;
+  /** Current page offset (0-based) */
+  offset: number;
+  /** Maximum items per page */
+  limit: number;
+  /** Whether there are more items after this page */
+  hasMore: boolean;
+}
+
 export interface ColumnInfo {
   column_name: string;
   data_type: string;

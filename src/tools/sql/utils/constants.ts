@@ -41,8 +41,17 @@ export const MAX_MUTATION_SAMPLE_SIZE = 20;
 /** Default sample size for mutation preview */
 export const DEFAULT_MUTATION_SAMPLE_SIZE = 5;
 
-/** Transaction timeout in milliseconds (10 minutes) */
+/** Transaction timeout in milliseconds (10 minutes for active operations) */
 export const TRANSACTION_TIMEOUT_MS = 10 * 60 * 1000;
+
+/** Transaction auto-cleanup timeout in milliseconds (45 minutes) */
+export const TRANSACTION_CLEANUP_TIMEOUT_MS = 45 * 60 * 1000;
+
+/** Transaction cleanup check interval in milliseconds (5 minutes) */
+export const TRANSACTION_CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
+
+/** Maximum SQL length for ReDoS-safe regex operations (100KB) */
+export const MAX_SQL_LENGTH_FOR_REGEX = 100000;
 
 /** Maximum hypothetical indexes per query */
 export const MAX_HYPOTHETICAL_INDEXES = 10;

@@ -11,12 +11,12 @@ import { getDbManager, DatabaseManager } from '../db-manager.js';
  * @param maxRetries - Maximum number of retries (default: 1)
  * @returns Wrapped function with retry logic
  */
-export function withConnectionRetry<T extends any[], R>(
+export function withConnectionRetry<T extends unknown[], R>(
   handler: (...args: T) => Promise<R>,
   maxRetries: number = 1
 ): (...args: T) => Promise<R> {
   return async (...args: T): Promise<R> => {
-    let lastError: any;
+    let lastError: unknown;
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
