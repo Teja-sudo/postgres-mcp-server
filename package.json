@@ -1,10 +1,9 @@
 {
   "name": "@tejasanik/postgres-mcp-server",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "description": "A Model Context Protocol (MCP) server for PostgreSQL database management and analysis",
   "type": "module",
   "main": "dist/index.js",
-  "types": "dist/index.d.ts",
   "bin": {
     "postgres-mcp-server": "./dist/index.js"
   },
@@ -54,7 +53,7 @@
     "node": ">=18.0.0"
   },
   "files": [
-    "dist",
+    "dist/**/*.js",
     "README.md"
   ],
   "repository": {
