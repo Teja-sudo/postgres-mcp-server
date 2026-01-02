@@ -1,4 +1,4 @@
-import { getDbManager } from '../db-manager.js';
+import { getDbManager, OverrideClientResult } from '../db-manager.js';
 import {
   ExecuteSqlResult,
   QueryPlan,
@@ -9,6 +9,7 @@ import {
   BatchQueryResult,
   BatchExecuteResult,
   ConnectionContext,
+  ConnectionOverride,
   ParsedStatement,
   MultiStatementResult,
   ExecuteSqlMultiResult,
@@ -196,6 +197,10 @@ export async function executeSql(args: {
   includeSchemaHint?: boolean;
   allowMultipleStatements?: boolean;
   transactionId?: string;
+  // Connection override parameters for one-time execution on a different server/database/schema
+  server?: string;
+  database?: string;
+  schema?: string;
 }): Promise<ExecuteSqlResult | ExecuteSqlMultiResult> {
   // Validate SQL input
   if (args.sql === undefined || args.sql === null) {
@@ -231,29 +236,52 @@ export async function executeSql(args: {
     throw new Error('params not supported with allowMultipleStatements. Use separate execute_sql calls for parameterized queries.');
   }
 
+  // Connection override and transaction are mutually exclusive
+  const hasOverride = args.server || args.database || args.schema;
+  if (hasOverride && args.transactionId) {
+    throw new Error('Connection override (server/database/schema) cannot be used with transactions. Transactions are bound to the main connection.');
+  }
+
   const dbManager = getDbManager();
   const maxRows = validatePositiveInteger(args.maxRows, 'maxRows', 1, MAX_ROWS_LIMIT) || MAX_ROWS_DEFAULT;
   const offset = args.offset !== undefined ? validatePositiveInteger(args.offset, 'offset', 0, Number.MAX_SAFE_INTEGER) : 0;
 
-  // Get schema hints if requested
+  // Build connection override if specified
+  const override: ConnectionOverride | undefined = hasOverride
+    ? { server: args.server, database: args.database, schema: args.schema }
+    : undefined;
+
+  // Get schema hints if requested (uses current connection for schema lookup)
   let schemaHint: SchemaHint | undefined;
   if (args.includeSchemaHint) {
-    schemaHint = await getSchemaHintForSql(sql);
+    schemaHint = await getSchemaHintForSql(sql, override);
   }
 
   // Handle multi-statement execution
   if (args.allowMultipleStatements) {
-    return executeMultipleStatements(sql, schemaHint, args.transactionId);
+    return executeMultipleStatements(sql, schemaHint, args.transactionId, override);
   }
 
   // Record start time for execution timing
   const startTime = process.hrtime.bigint();
 
-  // Execute query with optional parameters (supports transaction)
+  // Execute query with optional parameters
   let result;
   if (args.transactionId) {
+    // Transaction-based execution (no override support)
     result = await dbManager.queryInTransaction(args.transactionId, sql, args.params);
+  } else if (override) {
+    // Use connection override for one-time execution
+    const { client, release, server, database, schema } = await dbManager.getClientWithOverride(override);
+    try {
+      result = await client.query(sql, args.params);
+      // Add connection info to result for transparency
+      (result as any)._connectionInfo = { server, database, schema };
+    } finally {
+      release();
+    }
   } else {
+    // Default: use main connection
     result = await dbManager.query(sql, args.params);
   }
 
@@ -328,7 +356,8 @@ export async function executeSql(args: {
 async function executeMultipleStatements(
   sql: string,
   schemaHint?: SchemaHint,
-  transactionId?: string
+  transactionId?: string,
+  override?: ConnectionOverride
 ): Promise<ExecuteSqlMultiResult> {
   const dbManager = getDbManager();
   const startTime = process.hrtime.bigint();
@@ -348,34 +377,67 @@ async function executeMultipleStatements(
   let successCount = 0;
   let failureCount = 0;
 
-  for (let i = 0; i < executableStatements.length; i++) {
-    const stmt = executableStatements[i];
-    const stmtResult: MultiStatementResult = {
-      statementIndex: i + 1,
-      sql: stmt.sql.length > 200 ? stmt.sql.substring(0, 200) + '...' : stmt.sql,
-      lineNumber: stmt.lineNumber,
-      success: false,
-    };
-
+  // For override, get a single client and execute all statements
+  if (override) {
+    const { client, release } = await dbManager.getClientWithOverride(override);
     try {
-      let result;
-      if (transactionId) {
-        result = await dbManager.queryInTransaction(transactionId, stmt.sql);
-      } else {
-        result = await dbManager.query(stmt.sql);
+      for (let i = 0; i < executableStatements.length; i++) {
+        const stmt = executableStatements[i];
+        const stmtResult: MultiStatementResult = {
+          statementIndex: i + 1,
+          sql: stmt.sql.length > 200 ? stmt.sql.substring(0, 200) + '...' : stmt.sql,
+          lineNumber: stmt.lineNumber,
+          success: false,
+        };
+
+        try {
+          const result = await client.query(stmt.sql);
+          stmtResult.success = true;
+          stmtResult.rows = result.rows?.slice(0, 100);
+          stmtResult.rowCount = result.rowCount ?? result.rows?.length ?? 0;
+          successCount++;
+        } catch (error) {
+          stmtResult.success = false;
+          stmtResult.error = error instanceof Error ? error.message : String(error);
+          failureCount++;
+        }
+
+        results.push(stmtResult);
+      }
+    } finally {
+      release();
+    }
+  } else {
+    // Default execution path
+    for (let i = 0; i < executableStatements.length; i++) {
+      const stmt = executableStatements[i];
+      const stmtResult: MultiStatementResult = {
+        statementIndex: i + 1,
+        sql: stmt.sql.length > 200 ? stmt.sql.substring(0, 200) + '...' : stmt.sql,
+        lineNumber: stmt.lineNumber,
+        success: false,
+      };
+
+      try {
+        let result;
+        if (transactionId) {
+          result = await dbManager.queryInTransaction(transactionId, stmt.sql);
+        } else {
+          result = await dbManager.query(stmt.sql);
+        }
+
+        stmtResult.success = true;
+        stmtResult.rows = result.rows?.slice(0, 100); // Limit rows per statement
+        stmtResult.rowCount = result.rowCount ?? result.rows?.length ?? 0;
+        successCount++;
+      } catch (error) {
+        stmtResult.success = false;
+        stmtResult.error = error instanceof Error ? error.message : String(error);
+        failureCount++;
       }
 
-      stmtResult.success = true;
-      stmtResult.rows = result.rows?.slice(0, 100); // Limit rows per statement
-      stmtResult.rowCount = result.rowCount ?? result.rows?.length ?? 0;
-      successCount++;
-    } catch (error) {
-      stmtResult.success = false;
-      stmtResult.error = error instanceof Error ? error.message : String(error);
-      failureCount++;
+      results.push(stmtResult);
     }
-
-    results.push(stmtResult);
   }
 
   const endTime = process.hrtime.bigint();
@@ -401,6 +463,10 @@ export async function explainQuery(args: {
     columns: string[];
     indexType?: string;
   }>;
+  // Connection override parameters
+  server?: string;
+  database?: string;
+  schema?: string;
 }): Promise<QueryPlan> {
   // Validate SQL input
   if (!args.sql || typeof args.sql !== 'string') {
@@ -420,7 +486,21 @@ export async function explainQuery(args: {
   }
 
   const dbManager = getDbManager();
-  const client = await dbManager.getClient();
+  const hasOverride = args.server || args.database || args.schema;
+  const override: ConnectionOverride | undefined = hasOverride
+    ? { server: args.server, database: args.database, schema: args.schema }
+    : undefined;
+
+  // Get client - either from override or main connection
+  let clientResult: OverrideClientResult | null = null;
+  let client;
+
+  if (override) {
+    clientResult = await dbManager.getClientWithOverride(override);
+    client = clientResult.client;
+  } else {
+    client = await dbManager.getClient();
+  }
 
   try {
     // If hypothetical indexes are specified, validate and create them
@@ -525,7 +605,12 @@ export async function explainQuery(args: {
       plan: result.rows.map((r: any) => r['QUERY PLAN']).join('\n')
     };
   } finally {
-    client.release();
+    // Release client properly based on connection type
+    if (clientResult) {
+      clientResult.release();
+    } else {
+      client.release();
+    }
   }
 }
 
@@ -626,6 +711,10 @@ export async function executeSqlFile(args: {
   stripAsRegex?: boolean;
   /** If true, only parse and validate the file without executing (default: false) */
   validateOnly?: boolean;
+  // Connection override parameters
+  server?: string;
+  database?: string;
+  schema?: string;
 }): Promise<ExecuteSqlFileResult> {
   // Validate file path
   if (!args.filePath || typeof args.filePath !== 'string') {
@@ -675,6 +764,12 @@ export async function executeSqlFile(args: {
   const stopOnError = args.stopOnError !== false; // Default to true
   const validateOnly = args.validateOnly === true; // Default to false
 
+  // Build connection override if specified
+  const hasOverride = args.server || args.database || args.schema;
+  const override: ConnectionOverride | undefined = hasOverride
+    ? { server: args.server, database: args.database, schema: args.schema }
+    : undefined;
+
   const startTime = process.hrtime.bigint();
 
   // Split SQL into statements with line number tracking
@@ -714,7 +809,16 @@ export async function executeSqlFile(args: {
     } as ExecuteSqlFileResult;
   }
 
-  const client = await dbManager.getClient();
+  // Get client - either from override or main connection
+  let clientResult: OverrideClientResult | null = null;
+  let client;
+
+  if (override) {
+    clientResult = await dbManager.getClientWithOverride(override);
+    client = clientResult.client;
+  } else {
+    client = await dbManager.getClient();
+  }
 
   let statementsExecuted = 0;
   let statementsFailed = 0;
@@ -815,7 +919,12 @@ export async function executeSqlFile(args: {
 
     return result;
   } finally {
-    client.release();
+    // Release client properly based on connection type
+    if (clientResult) {
+      clientResult.release();
+    } else {
+      client.release();
+    }
   }
 }
 
@@ -994,6 +1103,10 @@ export async function dryRunSqlFile(args: {
   maxStatements?: number;
   /** Stop on first error (default: false - continues to show all errors) */
   stopOnError?: boolean;
+  // Connection override parameters
+  server?: string;
+  database?: string;
+  schema?: string;
 }): Promise<SqlFileDryRunResult> {
   // Validate file path
   if (!args.filePath || typeof args.filePath !== 'string') {
@@ -1067,7 +1180,24 @@ export async function dryRunSqlFile(args: {
       : `${(stats.size / (1024 * 1024)).toFixed(2)} MB`;
 
   const dbManager = getDbManager();
-  const client = await dbManager.getClient();
+
+  // Build connection override if specified
+  const hasOverride = args.server || args.database || args.schema;
+  const override: ConnectionOverride | undefined = hasOverride
+    ? { server: args.server, database: args.database, schema: args.schema }
+    : undefined;
+
+  // Get client - either from override or main connection
+  let clientResult: OverrideClientResult | null = null;
+  let client;
+
+  if (override) {
+    clientResult = await dbManager.getClientWithOverride(override);
+    client = clientResult.client;
+  } else {
+    client = await dbManager.getClient();
+  }
+
   const startTime = process.hrtime.bigint();
 
   const statementResults: DryRunStatementResult[] = [];
@@ -1171,7 +1301,12 @@ export async function dryRunSqlFile(args: {
     }
     throw e;
   } finally {
-    client.release();
+    // Release client properly based on connection type
+    if (clientResult) {
+      clientResult.release();
+    } else {
+      client.release();
+    }
   }
 
   const endTime = process.hrtime.bigint();
@@ -1423,11 +1558,102 @@ function extractTablesFromSql(sql: string): Array<{ schema: string; table: strin
 /**
  * Gets schema hints for tables mentioned in SQL
  */
-async function getSchemaHintForSql(sql: string): Promise<SchemaHint> {
+async function getSchemaHintForSql(sql: string, override?: ConnectionOverride): Promise<SchemaHint> {
   const dbManager = getDbManager();
   const tables = extractTablesFromSql(sql);
   const tableHints: TableSchemaHint[] = [];
 
+  // If override is specified, use a single client for all queries
+  if (override) {
+    const { client, release } = await dbManager.getClientWithOverride(override);
+    try {
+      for (const { schema, table } of tables.slice(0, 10)) {
+        try {
+          const columnsResult = await client.query(`
+            SELECT
+              column_name as name,
+              data_type as type,
+              is_nullable = 'YES' as nullable
+            FROM information_schema.columns
+            WHERE table_schema = $1 AND table_name = $2
+            ORDER BY ordinal_position
+          `, [schema, table]);
+
+          const pkResult = await client.query(`
+            SELECT a.attname as column_name
+            FROM pg_index i
+            JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+            JOIN pg_class c ON c.oid = i.indrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE i.indisprimary
+              AND n.nspname = $1
+              AND c.relname = $2
+          `, [schema, table]);
+
+          const fkResult = await client.query(`
+            SELECT
+              kcu.column_name,
+              ccu.table_schema || '.' || ccu.table_name as referenced_table,
+              ccu.column_name as referenced_column
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+              ON tc.constraint_name = kcu.constraint_name
+              AND tc.table_schema = kcu.table_schema
+            JOIN information_schema.constraint_column_usage ccu
+              ON ccu.constraint_name = tc.constraint_name
+            WHERE tc.constraint_type = 'FOREIGN KEY'
+              AND tc.table_schema = $1
+              AND tc.table_name = $2
+          `, [schema, table]);
+
+          const countResult = await client.query(`
+            SELECT reltuples::bigint as estimate
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = $1 AND c.relname = $2
+          `, [schema, table]);
+
+          const hint: TableSchemaHint = {
+            schema,
+            table,
+            columns: columnsResult.rows.map(r => ({
+              name: r.name,
+              type: r.type,
+              nullable: r.nullable
+            })),
+            primaryKey: pkResult.rows.map(r => r.column_name),
+            rowCountEstimate: countResult.rows[0]?.estimate || 0
+          };
+
+          if (fkResult.rows.length > 0) {
+            const fkMap = new Map<string, { columns: string[]; referencedColumns: string[] }>();
+            for (const row of fkResult.rows) {
+              const key = row.referenced_table;
+              if (!fkMap.has(key)) {
+                fkMap.set(key, { columns: [], referencedColumns: [] });
+              }
+              fkMap.get(key)!.columns.push(row.column_name);
+              fkMap.get(key)!.referencedColumns.push(row.referenced_column);
+            }
+            hint.foreignKeys = Array.from(fkMap.entries()).map(([refTable, data]) => ({
+              columns: data.columns,
+              referencedTable: refTable,
+              referencedColumns: data.referencedColumns
+            }));
+          }
+
+          tableHints.push(hint);
+        } catch (error) {
+          console.error(`Could not get schema hint for ${schema}.${table}: ${error}`);
+        }
+      }
+    } finally {
+      release();
+    }
+    return { tables: tableHints };
+  }
+
+  // Default path: use main connection
   for (const { schema, table } of tables.slice(0, 10)) { // Limit to 10 tables
     try {
       // Get columns
@@ -1525,6 +1751,10 @@ async function getSchemaHintForSql(sql: string): Promise<SchemaHint> {
 export async function mutationPreview(args: {
   sql: string;
   sampleSize?: number;
+  // Connection override parameters
+  server?: string;
+  database?: string;
+  schema?: string;
 }): Promise<MutationPreviewResult> {
   if (!args.sql || typeof args.sql !== 'string') {
     throw new Error('sql parameter is required');
@@ -1549,10 +1779,16 @@ export async function mutationPreview(args: {
 
   const dbManager = getDbManager();
 
+  // Build connection override if specified
+  const hasOverride = args.server || args.database || args.schema;
+  const override: ConnectionOverride | undefined = hasOverride
+    ? { server: args.server, database: args.database, schema: args.schema }
+    : undefined;
+
   // For INSERT, we can't preview affected rows
   if (mutationType === 'INSERT') {
     // Use EXPLAIN to estimate rows
-    const explainResult = await dbManager.query(`EXPLAIN (FORMAT JSON) ${sql}`);
+    const explainResult = await dbManager.queryWithOverride(`EXPLAIN (FORMAT JSON) ${sql}`, undefined, override);
     const plan = explainResult.rows[0]['QUERY PLAN'][0];
 
     return {
@@ -1588,7 +1824,7 @@ export async function mutationPreview(args: {
   // Get estimated row count using EXPLAIN
   let estimatedRowsAffected = 0;
   try {
-    const explainResult = await dbManager.query(`EXPLAIN (FORMAT JSON) ${sql}`);
+    const explainResult = await dbManager.queryWithOverride(`EXPLAIN (FORMAT JSON) ${sql}`, undefined, override);
     const plan = explainResult.rows[0]['QUERY PLAN'][0];
     estimatedRowsAffected = plan?.Plan?.['Plan Rows'] || 0;
   } catch (error) {
@@ -1602,7 +1838,7 @@ export async function mutationPreview(args: {
       ? `SELECT * FROM ${targetTable} WHERE ${whereClause} LIMIT ${sampleSize}`
       : `SELECT * FROM ${targetTable} LIMIT ${sampleSize}`;
 
-    const sampleResult = await dbManager.query(selectSql);
+    const sampleResult = await dbManager.queryWithOverride(selectSql, undefined, override);
     sampleRows = sampleResult.rows;
 
     // If EXPLAIN didn't work, get count
@@ -1610,7 +1846,7 @@ export async function mutationPreview(args: {
       const countSql = whereClause
         ? `SELECT COUNT(*) as cnt FROM ${targetTable} WHERE ${whereClause}`
         : `SELECT COUNT(*) as cnt FROM ${targetTable}`;
-      const countResult = await dbManager.query(countSql);
+      const countResult = await dbManager.queryWithOverride(countSql, undefined, override);
       estimatedRowsAffected = parseInt(countResult.rows[0]?.cnt || '0', 10);
     }
   } catch (error) {
@@ -1646,6 +1882,10 @@ export async function mutationPreview(args: {
 export async function mutationDryRun(args: {
   sql: string;
   sampleSize?: number;
+  // Connection override parameters
+  server?: string;
+  database?: string;
+  schema?: string;
 }): Promise<MutationDryRunResult> {
   if (!args.sql || typeof args.sql !== 'string') {
     throw new Error('sql parameter is required');
@@ -1672,15 +1912,22 @@ export async function mutationDryRun(args: {
   const nonRollbackableWarnings = detectNonRollbackableOperations(sql);
   const mustSkipWarnings = nonRollbackableWarnings.filter(w => w.mustSkip);
 
+  const dbManager = getDbManager();
+
+  // Build connection override if specified
+  const hasOverride = args.server || args.database || args.schema;
+  const override: ConnectionOverride | undefined = hasOverride
+    ? { server: args.server, database: args.database, schema: args.schema }
+    : undefined;
+
   // Skip only if there are mustSkip warnings
   if (mustSkipWarnings.length > 0) {
     const skipReason = mustSkipWarnings.map(w => w.message).join('; ');
 
     // Run EXPLAIN to show query plan without executing
     let explainPlan: object[] | undefined;
-    const dbManager = getDbManager();
     try {
-      const explainResult = await dbManager.query(`EXPLAIN (FORMAT JSON) ${sql}`);
+      const explainResult = await dbManager.queryWithOverride(`EXPLAIN (FORMAT JSON) ${sql}`, undefined, override);
       if (explainResult.rows && explainResult.rows.length > 0) {
         explainPlan = explainResult.rows[0]['QUERY PLAN'];
       }
@@ -1719,8 +1966,17 @@ export async function mutationDryRun(args: {
     targetTable = insertMatch?.[1]?.replace(/["`]/g, '');
   }
 
-  const dbManager = getDbManager();
-  const client = await dbManager.getClient();
+  // Get client - either from override or main connection
+  let clientResult: OverrideClientResult | null = null;
+  let client;
+
+  if (override) {
+    clientResult = await dbManager.getClientWithOverride(override);
+    client = clientResult.client;
+  } else {
+    client = await dbManager.getClient();
+  }
+
   const startTime = process.hrtime.bigint();
 
   let beforeRows: any[] | undefined;
@@ -1800,7 +2056,12 @@ export async function mutationDryRun(args: {
     }
     error = extractDryRunError(e);
   } finally {
-    client.release();
+    // Release client properly based on connection type
+    if (clientResult) {
+      clientResult.release();
+    } else {
+      client.release();
+    }
   }
 
   const endTime = process.hrtime.bigint();
@@ -1853,6 +2114,10 @@ export async function mutationDryRun(args: {
 export async function batchExecute(args: {
   queries: BatchQuery[];
   stopOnError?: boolean;
+  // Connection override parameters
+  server?: string;
+  database?: string;
+  schema?: string;
 }): Promise<BatchExecuteResult> {
   if (!args.queries || !Array.isArray(args.queries)) {
     throw new Error('queries parameter is required and must be an array');
@@ -1885,6 +2150,12 @@ export async function batchExecute(args: {
   const stopOnError = args.stopOnError === true; // Default false
   const startTime = process.hrtime.bigint();
 
+  // Build connection override if specified
+  const hasOverride = args.server || args.database || args.schema;
+  const override: ConnectionOverride | undefined = hasOverride
+    ? { server: args.server, database: args.database, schema: args.schema }
+    : undefined;
+
   const results: { [name: string]: BatchQueryResult } = {};
   let successCount = 0;
   let failureCount = 0;
@@ -1894,7 +2165,7 @@ export async function batchExecute(args: {
     const queryStartTime = process.hrtime.bigint();
 
     try {
-      const result = await dbManager.query(query.sql, query.params);
+      const result = await dbManager.queryWithOverride(query.sql, query.params, override);
       const queryEndTime = process.hrtime.bigint();
       const executionTimeMs = Number(queryEndTime - queryStartTime) / 1_000_000;
 

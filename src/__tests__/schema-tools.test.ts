@@ -4,11 +4,13 @@ type MockFn = jest.Mock<any>;
 
 // Use jest.unstable_mockModule for ESM
 const mockQuery = jest.fn<MockFn>();
+const mockQueryWithOverride = jest.fn<MockFn>();
 const mockIsConnected = jest.fn<MockFn>();
 
 jest.unstable_mockModule('../db-manager.js', () => ({
   getDbManager: jest.fn(() => ({
     query: mockQuery,
+    queryWithOverride: mockQueryWithOverride,
     isConnected: mockIsConnected.mockReturnValue(true),
   })),
   resetDbManager: jest.fn(),
@@ -30,6 +32,10 @@ describe('Schema Tools', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockIsConnected.mockReturnValue(true);
+    // By default, queryWithOverride delegates to the same behavior as query
+    mockQueryWithOverride.mockImplementation(((sql: string, params?: any[], override?: any) => {
+      return mockQuery(sql, params);
+    }) as any);
   });
 
   describe('listSchemas', () => {

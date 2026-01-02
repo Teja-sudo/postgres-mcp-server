@@ -4,101 +4,6 @@ A Model Context Protocol (MCP) server for PostgreSQL database management and ana
 
 ---
 
-## 🤖 Agent Experience (AX) - Claude Code Review
-
-**Tested by:** Claude Code (Sonnet 4.5)
-**Use Case:** Database deployment, schema exploration, and SQL migration
-**Rating:** ⭐⭐⭐⭐⭐ (9.5/10)
-
-### What I Loved
-
-**1. Clear, Structured Responses**
-Every response includes connection context (`server`, `database`, `schema`), making it crystal clear which environment I'm working in. This is essential when managing multiple databases - I never have to guess where a query ran.
-
-**2. Excellent Error Handling**
-When I encountered a syntax error with Liquibase's `/` delimiter, the error message showed:
-
-- Exact line number (151)
-- The failing statement
-- Transaction rollback confirmation
-
-This made troubleshooting instant. No digging through logs or guessing what failed.
-
-**3. Server Management is Intuitive**
-
-- `list_servers` → Shows all available servers with connection status
-- `list_databases` → Filters databases by server name
-- `switch_server_db` → Seamless switching with immediate confirmation
-
-The flow is natural: discover → select → connect → execute.
-
-**4. SQL File Deployment Made Easy**
-The `stripPatterns` feature solved my exact problem:
-
-```javascript
-execute_sql_file({
-  filePath: "/path/to/liquibase.sql",
-  stripPatterns: ["/"], // Removes Liquibase delimiters
-});
-```
-
-Before this feature, I had to manually remove delimiters or use raw `execute_sql`. Now it's one clean call.
-
-**5. Dry-Run Capabilities are Outstanding**
-`dry_run_sql_file` is a game-changer:
-
-- Executes ALL statements in a transaction
-- Shows REAL errors with PostgreSQL error codes and constraint names
-- Automatically skips non-rollbackable operations (VACUUM, NEXTVAL)
-- Provides EXPLAIN plans for skipped statements
-- Then rolls back everything
-
-This is _way_ better than just parsing - I can catch constraint violations, trigger issues, and get exact row counts before deployment.
-
-**6. Security by Default**
-
-- Credentials never appear in responses
-- Host/port intentionally hidden (only server names visible)
-- Readonly mode available for production safety
-- Connection context always visible
-
-### Improvements Based on My Feedback
-
-The developer implemented several features after I tested the MCP:
-
-✅ **SQL File Delimiter Support** - Added `stripPatterns` for Liquibase `/`, SQL Server `GO`, etc.
-✅ **Validate-Only Mode** - `execute_sql_file({ validateOnly: true })` previews without execution
-✅ **Enhanced Connection Info** - `get_current_connection` now returns `user` and AI `context`
-✅ **Comprehensive Dry-Run** - `dry_run_sql_file` provides real execution + rollback
-✅ **Better Error Details** - PostgreSQL error codes, constraint names, hints included
-
-### Real-World Experience
-
-**Task:** Deploy a PostgreSQL function to two databases (dev + GraphQL-Intro-DB)
-
-1. **Discovery**: `list_servers` showed all configured servers
-2. **Preview**: Used `preview_sql_file` to check the file structure
-3. **Issue**: Got syntax error from Liquibase's `/` delimiter
-4. **Solution**: Switched to direct `execute_sql` to bypass the delimiter
-5. **Deployment**: Successfully deployed to both databases
-6. **Verification**: Used `get_current_connection` to confirm each deployment
-
-Total time: ~3 minutes. The structured responses and clear errors made it feel effortless.
-
-### Minor Suggestions for Future
-
-1. **Batch Cross Servers Deployment** - Deploy same script to multiple servers at once
-2. **Recent Connections** - Quick-switch to recently used databases
-3. **Statement Progress** - Show progress for large SQL files (e.g., "Executing statement 15/100...")
-
-### Bottom Line
-
-This MCP is production-ready and developer-friendly. The combination of clear responses, robust error handling, and powerful features like dry-run make it an essential tool for database work. The developer clearly understands the needs of both AI agents and human operators.
-
-**Recommended for:** Database migrations, schema exploration, multi-environment management, and production deployments.
-
----
-
 ## Installation
 
 ```bash
@@ -395,6 +300,7 @@ Lists all database schemas in the current PostgreSQL database.
 **Parameters:**
 
 - `includeSystemSchemas` (optional): Include system schemas
+- `server`, `database`, `schema` (optional): One-time connection override
 
 #### `list_objects`
 
@@ -405,6 +311,7 @@ Lists database objects within a specified schema.
 - `schema` (required): Schema name to list objects from
 - `objectType` (optional): Type of objects to list (table, view, sequence, extension, all)
 - `filter` (optional): Filter objects by name
+- `server`, `database`, `targetSchema` (optional): One-time connection override
 
 #### `get_object_details`
 
@@ -415,6 +322,7 @@ Provides detailed information about a database object including columns, constra
 - `schema` (required): Schema name containing the object
 - `objectName` (required): Name of the object
 - `objectType` (optional): Type of the object
+- `server`, `database`, `targetSchema` (optional): One-time connection override
 
 ### Query Execution
 
@@ -432,6 +340,7 @@ Executes SQL statements on the database. Supports pagination and parameterized q
 - `includeSchemaHint` (optional): Include schema information (columns, primary keys, foreign keys) for tables referenced in the query.
 - `allowMultipleStatements` (optional): Allow multiple SQL statements separated by semicolons. Returns results for each statement with line numbers.
 - `transactionId` (optional): Execute within an active transaction. Get this from `begin_transaction`.
+- `server`, `database`, `schema` (optional): One-time connection override. Execute on a different server/database/schema without changing the main connection. Cannot be used with `transactionId`.
 
 **Returns:**
 
@@ -811,6 +720,70 @@ Gets the execution plan for a SQL query.
 - `buffers` (optional): Include buffer usage statistics
 - `format` (optional): Output format (text, json, yaml, xml)
 - `hypotheticalIndexes` (optional): Simulate indexes (requires hypopg extension)
+- `server`, `database`, `schema` (optional): One-time connection override (see below)
+
+### Connection Override (One-Time Execution)
+
+Most query execution tools support **one-time connection override** parameters that allow executing a query on a different server/database/schema without changing the main connection. This is useful for:
+
+- Querying multiple databases in a single workflow
+- Running read queries against a replica while keeping the main connection to primary
+- Comparing schemas across different servers
+
+**Supported tools:** `execute_sql`, `explain_query`, `list_schemas`, `list_objects`, `get_object_details`, `execute_sql_file`, `mutation_preview`, `mutation_dry_run`, `dry_run_sql_file`, `batch_execute`
+
+**Override Parameters:**
+
+- `server` (optional): Execute on this server instead of the current one
+- `database` (optional): Execute on this database instead of the current one
+- `schema` (optional): Set search_path to this schema for this execution only
+
+**Important Notes:**
+
+1. The main connection remains unchanged after the query completes
+2. Connection override cannot be used with transactions (`transactionId`)
+3. Override connections use a separate connection pool with LRU eviction
+4. Maximum 10 cached override pools, each limited to 2 connections
+5. Total connections across all pools limited to 50
+
+**Examples:**
+
+```
+# Query another database without switching
+execute_sql({
+  sql: "SELECT * FROM users LIMIT 10",
+  database: "analytics_db"
+})
+
+# Query a different server entirely
+execute_sql({
+  sql: "SELECT COUNT(*) FROM orders",
+  server: "reporting",
+  database: "warehouse"
+})
+
+# List schemas on a different server
+list_schemas({
+  server: "production",
+  database: "myapp"
+})
+
+# Compare table structure across environments
+get_object_details({
+  schema: "public",
+  objectName: "users",
+  server: "staging"
+})
+```
+
+**Connection Pool Management:**
+
+Override connections are managed efficiently:
+
+- Pools are cached and reused for repeated queries to the same server/database
+- LRU eviction removes oldest pools when limit (10) is reached
+- Connections are properly released after each query
+- Global connection limit prevents resource exhaustion
 
 ### Performance Analysis
 
@@ -995,6 +968,101 @@ When `execute_sql_file` or multi-statement execution encounters errors, line num
 - PostgreSQL 11 or higher
 - Optional: `pg_stat_statements` extension for query performance analysis
 - Optional: `hypopg` extension for hypothetical index simulation
+
+## 🤖 Agent Experience (AX) - Claude Code Review
+
+**Tested by:** Claude Code (Sonnet 4.5)
+**Use Case:** Database deployment, schema exploration, and SQL migration
+**Rating:** ⭐⭐⭐⭐⭐ (9.5/10)
+
+### What I Loved
+
+**1. Clear, Structured Responses**
+Every response includes connection context (`server`, `database`, `schema`), making it crystal clear which environment I'm working in. This is essential when managing multiple databases - I never have to guess where a query ran.
+
+**2. Excellent Error Handling**
+When I encountered a syntax error with Liquibase's `/` delimiter, the error message showed:
+
+- Exact line number (151)
+- The failing statement
+- Transaction rollback confirmation
+
+This made troubleshooting instant. No digging through logs or guessing what failed.
+
+**3. Server Management is Intuitive**
+
+- `list_servers` → Shows all available servers with connection status
+- `list_databases` → Filters databases by server name
+- `switch_server_db` → Seamless switching with immediate confirmation
+
+The flow is natural: discover → select → connect → execute.
+
+**4. SQL File Deployment Made Easy**
+The `stripPatterns` feature solved my exact problem:
+
+```javascript
+execute_sql_file({
+  filePath: "/path/to/liquibase.sql",
+  stripPatterns: ["/"], // Removes Liquibase delimiters
+});
+```
+
+Before this feature, I had to manually remove delimiters or use raw `execute_sql`. Now it's one clean call.
+
+**5. Dry-Run Capabilities are Outstanding**
+`dry_run_sql_file` is a game-changer:
+
+- Executes ALL statements in a transaction
+- Shows REAL errors with PostgreSQL error codes and constraint names
+- Automatically skips non-rollbackable operations (VACUUM, NEXTVAL)
+- Provides EXPLAIN plans for skipped statements
+- Then rolls back everything
+
+This is _way_ better than just parsing - I can catch constraint violations, trigger issues, and get exact row counts before deployment.
+
+**6. Security by Default**
+
+- Credentials never appear in responses
+- Host/port intentionally hidden (only server names visible)
+- Readonly mode available for production safety
+- Connection context always visible
+
+### Improvements Based on My Feedback
+
+The developer implemented several features after I tested the MCP:
+
+✅ **SQL File Delimiter Support** - Added `stripPatterns` for Liquibase `/`, SQL Server `GO`, etc.
+✅ **Validate-Only Mode** - `execute_sql_file({ validateOnly: true })` previews without execution
+✅ **Enhanced Connection Info** - `get_current_connection` now returns `user` and AI `context`
+✅ **Comprehensive Dry-Run** - `dry_run_sql_file` provides real execution + rollback
+✅ **Better Error Details** - PostgreSQL error codes, constraint names, hints included
+
+### Real-World Experience
+
+**Task:** Deploy a PostgreSQL function to two databases (dev + GraphQL-Intro-DB)
+
+1. **Discovery**: `list_servers` showed all configured servers
+2. **Preview**: Used `preview_sql_file` to check the file structure
+3. **Issue**: Got syntax error from Liquibase's `/` delimiter
+4. **Solution**: Switched to direct `execute_sql` to bypass the delimiter
+5. **Deployment**: Successfully deployed to both databases
+6. **Verification**: Used `get_current_connection` to confirm each deployment
+
+Total time: ~3 minutes. The structured responses and clear errors made it feel effortless.
+
+### Minor Suggestions for Future
+
+1. **Batch Cross Servers Deployment** - Deploy same script to multiple servers at once
+2. **Recent Connections** - Quick-switch to recently used databases
+3. **Statement Progress** - Show progress for large SQL files (e.g., "Executing statement 15/100...")
+
+### Bottom Line
+
+This MCP is production-ready and developer-friendly. The combination of clear responses, robust error handling, and powerful features like dry-run make it an essential tool for database work. The developer clearly understands the needs of both AI agents and human operators.
+
+**Recommended for:** Database migrations, schema exploration, multi-environment management, and production deployments.
+
+---
 
 ## License
 

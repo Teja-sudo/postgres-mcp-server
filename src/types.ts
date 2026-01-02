@@ -44,6 +44,29 @@ export interface ConnectionInfo {
   user?: string;
 }
 
+/**
+ * Connection override parameters for one-time execution on a different server/database/schema.
+ * When specified, the tool will temporarily connect to the specified target without
+ * changing the main connection. If not specified, uses the current connection.
+ */
+export interface ConnectionOverride {
+  /**
+   * Target server name. Must match a configured server.
+   * If not specified, uses the currently connected server.
+   */
+  server?: string;
+  /**
+   * Target database name.
+   * If not specified, uses the server's default database or current database.
+   */
+  database?: string;
+  /**
+   * Target schema name.
+   * If not specified, uses the server's default schema or 'public'.
+   */
+  schema?: string;
+}
+
 export interface DatabaseInfo {
   name: string;
   owner: string;

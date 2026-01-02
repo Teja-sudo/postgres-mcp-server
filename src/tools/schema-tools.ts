@@ -1,11 +1,21 @@
 import { getDbManager } from '../db-manager.js';
-import { SchemaInfo, TableInfo, ColumnInfo, ConstraintInfo, IndexInfo } from '../types.js';
+import { SchemaInfo, TableInfo, ColumnInfo, ConstraintInfo, IndexInfo, ConnectionOverride } from '../types.js';
 import { validateIdentifier } from '../utils/validation.js';
 
 export async function listSchemas(args: {
   includeSystemSchemas?: boolean;
+  // Connection override parameters
+  server?: string;
+  database?: string;
+  schema?: string;
 }): Promise<SchemaInfo[]> {
   const dbManager = getDbManager();
+
+  // Build connection override if specified
+  const hasOverride = args.server || args.database || args.schema;
+  const override: ConnectionOverride | undefined = hasOverride
+    ? { server: args.server, database: args.database, schema: args.schema }
+    : undefined;
 
   let query = `
     SELECT
@@ -23,7 +33,7 @@ export async function listSchemas(args: {
 
   query += ' ORDER BY schema_name';
 
-  const result = await dbManager.query<SchemaInfo>(query);
+  const result = await dbManager.queryWithOverride<SchemaInfo>(query, undefined, override);
   return result.rows;
 }
 
@@ -31,6 +41,10 @@ export async function listObjects(args: {
   schema: string;
   objectType?: 'table' | 'view' | 'sequence' | 'extension' | 'all';
   filter?: string;
+  // Connection override parameters
+  server?: string;
+  database?: string;
+  targetSchema?: string; // Use targetSchema to avoid confusion with the required schema param
 }): Promise<TableInfo[]> {
   // Validate required parameters
   if (!args.schema) {
@@ -56,6 +70,12 @@ export async function listObjects(args: {
   const objectType = args.objectType || 'all';
   const objects: TableInfo[] = [];
 
+  // Build connection override if specified
+  const hasOverride = args.server || args.database || args.targetSchema;
+  const override: ConnectionOverride | undefined = hasOverride
+    ? { server: args.server, database: args.database, schema: args.targetSchema }
+    : undefined;
+
   // List tables
   if (objectType === 'all' || objectType === 'table') {
     const tablesQuery = `
@@ -70,7 +90,7 @@ export async function listObjects(args: {
       ORDER BY tablename
     `;
     const params = args.filter ? [args.schema, args.filter] : [args.schema];
-    const tables = await dbManager.query<TableInfo>(tablesQuery, params);
+    const tables = await dbManager.queryWithOverride<TableInfo>(tablesQuery, params, override);
     objects.push(...tables.rows);
   }
 
@@ -90,7 +110,7 @@ export async function listObjects(args: {
       ORDER BY v.table_name
     `;
     const params = args.filter ? [args.schema, args.filter] : [args.schema];
-    const views = await dbManager.query<TableInfo>(viewsQuery, params);
+    const views = await dbManager.queryWithOverride<TableInfo>(viewsQuery, params, override);
     objects.push(...views.rows);
   }
 
@@ -110,7 +130,7 @@ export async function listObjects(args: {
       ORDER BY s.sequence_name
     `;
     const params = args.filter ? [args.schema, args.filter] : [args.schema];
-    const sequences = await dbManager.query<TableInfo>(sequencesQuery, params);
+    const sequences = await dbManager.queryWithOverride<TableInfo>(sequencesQuery, params, override);
     objects.push(...sequences.rows);
   }
 
@@ -129,7 +149,7 @@ export async function listObjects(args: {
       ORDER BY extname
     `;
     const params = args.filter ? [args.schema, args.filter] : [args.schema];
-    const extensions = await dbManager.query<TableInfo>(extensionsQuery, params);
+    const extensions = await dbManager.queryWithOverride<TableInfo>(extensionsQuery, params, override);
     objects.push(...extensions.rows);
   }
 
@@ -140,6 +160,10 @@ export async function getObjectDetails(args: {
   schema: string;
   objectName: string;
   objectType?: 'table' | 'view' | 'sequence';
+  // Connection override parameters
+  server?: string;
+  database?: string;
+  targetSchema?: string; // Use targetSchema to avoid confusion with the required schema param
 }): Promise<{
   columns?: ColumnInfo[];
   constraints?: ConstraintInfo[];
@@ -161,6 +185,13 @@ export async function getObjectDetails(args: {
   validateIdentifier(args.objectName, 'objectName');
 
   const dbManager = getDbManager();
+
+  // Build connection override if specified
+  const hasOverride = args.server || args.database || args.targetSchema;
+  const override: ConnectionOverride | undefined = hasOverride
+    ? { server: args.server, database: args.database, schema: args.targetSchema }
+    : undefined;
+
   const result: {
     columns?: ColumnInfo[];
     constraints?: ConstraintInfo[];
@@ -182,7 +213,7 @@ export async function getObjectDetails(args: {
     WHERE table_schema = $1 AND table_name = $2
     ORDER BY ordinal_position
   `;
-  const columns = await dbManager.query<ColumnInfo>(columnsQuery, [args.schema, args.objectName]);
+  const columns = await dbManager.queryWithOverride<ColumnInfo>(columnsQuery, [args.schema, args.objectName], override);
   result.columns = columns.rows;
 
   // Get constraints - using parameterized query
@@ -204,7 +235,7 @@ export async function getObjectDetails(args: {
     WHERE tc.table_schema = $1 AND tc.table_name = $2
     ORDER BY tc.constraint_type, tc.constraint_name
   `;
-  const constraints = await dbManager.query<ConstraintInfo>(constraintsQuery, [args.schema, args.objectName]);
+  const constraints = await dbManager.queryWithOverride<ConstraintInfo>(constraintsQuery, [args.schema, args.objectName], override);
   result.constraints = constraints.rows;
 
   // Get indexes - using parameterized query
@@ -221,7 +252,7 @@ export async function getObjectDetails(args: {
     WHERE n.nspname = $1 AND t.relname = $2
     ORDER BY i.relname
   `;
-  const indexes = await dbManager.query<IndexInfo>(indexesQuery, [args.schema, args.objectName]);
+  const indexes = await dbManager.queryWithOverride<IndexInfo>(indexesQuery, [args.schema, args.objectName], override);
   result.indexes = indexes.rows;
 
   // Get table size and row count using safe approach
@@ -234,7 +265,7 @@ export async function getObjectDetails(args: {
       JOIN pg_namespace n ON n.oid = c.relnamespace
       WHERE n.nspname = $1 AND c.relname = $2
     `;
-    const sizeResult = await dbManager.query<{ size: string; row_count: number }>(sizeQuery, [args.schema, args.objectName]);
+    const sizeResult = await dbManager.queryWithOverride<{ size: string; row_count: number }>(sizeQuery, [args.schema, args.objectName], override);
     if (sizeResult.rows.length > 0) {
       result.size = sizeResult.rows[0].size;
       result.rowCount = sizeResult.rows[0].row_count;
@@ -252,7 +283,7 @@ export async function getObjectDetails(args: {
         JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'v'
       `;
-      const viewDef = await dbManager.query<{ definition: string }>(viewDefQuery, [args.schema, args.objectName]);
+      const viewDef = await dbManager.queryWithOverride<{ definition: string }>(viewDefQuery, [args.schema, args.objectName], override);
       if (viewDef.rows.length > 0) {
         result.definition = viewDef.rows[0].definition;
       }

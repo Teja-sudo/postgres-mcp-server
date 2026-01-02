@@ -5,7 +5,9 @@ type MockFn = jest.Mock<any>;
 
 // Use jest.unstable_mockModule for ESM
 const mockQuery = jest.fn<MockFn>();
+const mockQueryWithOverride = jest.fn<MockFn>();
 const mockGetClient = jest.fn<MockFn>();
+const mockGetClientWithOverride = jest.fn<MockFn>();
 const mockIsConnected = jest.fn<MockFn>();
 const mockBeginTransaction = jest.fn<MockFn>();
 const mockCommitTransaction = jest.fn<MockFn>();
@@ -16,7 +18,9 @@ const mockGetConnectionContext = jest.fn<MockFn>();
 jest.unstable_mockModule('../db-manager.js', () => ({
   getDbManager: jest.fn(() => ({
     query: mockQuery,
+    queryWithOverride: mockQueryWithOverride,
     getClient: mockGetClient,
+    getClientWithOverride: mockGetClientWithOverride,
     isConnected: mockIsConnected.mockReturnValue(true),
     beginTransaction: mockBeginTransaction,
     commitTransaction: mockCommitTransaction,
@@ -29,6 +33,7 @@ jest.unstable_mockModule('../db-manager.js', () => ({
     }),
   })),
   resetDbManager: jest.fn(),
+  OverrideClientResult: {} // Export type placeholder
 }));
 
 // Dynamic import after mock
@@ -60,7 +65,13 @@ describe('SQL Tools', () => {
     jest.clearAllMocks();
     // Reset mock implementations to avoid leakage between tests
     mockQuery.mockReset();
+    mockQueryWithOverride.mockReset();
+    mockGetClientWithOverride.mockReset();
     mockIsConnected.mockReturnValue(true);
+    // By default, queryWithOverride delegates to the same behavior as query
+    mockQueryWithOverride.mockImplementation(((sql: string, params?: any[], override?: any) => {
+      return mockQuery(sql, params);
+    }) as any);
   });
 
   describe('executeSql', () => {
@@ -1142,7 +1153,7 @@ SELECT * FROM ins;
       expect(result.nonRollbackableWarnings!.some(w => w.operation === 'SEQUENCE' && w.mustSkip === true)).toBe(true);
       // Should have EXPLAIN plan
       expect(result.explainPlan).toBeDefined();
-      expect(mockQuery).toHaveBeenCalledWith(expect.stringContaining('EXPLAIN'));
+      expect(mockQuery).toHaveBeenCalledWith(expect.stringContaining('EXPLAIN'), undefined);
     });
 
     it('should capture before and after rows for UPDATE', async () => {
@@ -1694,6 +1705,7 @@ SELECT 2;`,
       // The query should use LIMIT 20 (max)
       expect(mockQuery).toHaveBeenCalledWith(
         expect.stringContaining('LIMIT 20'),
+        undefined
       );
     });
   });

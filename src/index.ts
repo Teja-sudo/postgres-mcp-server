@@ -169,13 +169,26 @@ server.registerTool(
   "list_schemas",
   {
     description:
-      "List all schemas in the current database. Requires active connection (use switch_server_db first).",
+      "List all schemas in the current database. Requires active connection (use switch_server_db first). Optionally use server/database/schema params for one-time execution on a different server without changing the main connection.",
     inputSchema: z.object({
       includeSystemSchemas: z
         .boolean()
         .optional()
         .default(false)
         .describe("Include system schemas (pg_catalog, information_schema, etc.)"),
+      // Connection override parameters
+      server: z
+        .string()
+        .optional()
+        .describe("One-time server override. Execute on this server without changing main connection."),
+      database: z
+        .string()
+        .optional()
+        .describe("One-time database override. Uses this database for execution without changing main connection."),
+      schema: z
+        .string()
+        .optional()
+        .describe("One-time schema override. Sets search_path for this execution only."),
     }),
   },
   async (args) => {
@@ -188,9 +201,9 @@ server.registerTool(
   "list_objects",
   {
     description:
-      "List tables, views, sequences, or extensions in a schema. Requires active connection.",
+      "List tables, views, sequences, or extensions in a schema. Requires active connection. Optionally use server/database/targetSchema params for one-time execution on a different server.",
     inputSchema: z.object({
-      schema: z.string().describe("Schema name (e.g., 'public')"),
+      schema: z.string().describe("Schema name to list objects from (e.g., 'public')"),
       objectType: z
         .enum(["table", "view", "sequence", "extension", "all"])
         .optional()
@@ -200,6 +213,19 @@ server.registerTool(
         .string()
         .optional()
         .describe("Filter objects by name (case-insensitive partial match)"),
+      // Connection override parameters
+      server: z
+        .string()
+        .optional()
+        .describe("One-time server override. Execute on this server without changing main connection."),
+      database: z
+        .string()
+        .optional()
+        .describe("One-time database override. Uses this database for execution."),
+      targetSchema: z
+        .string()
+        .optional()
+        .describe("One-time schema override. Sets search_path for this execution only."),
     }),
   },
   async (args) => {
@@ -212,7 +238,7 @@ server.registerTool(
   "get_object_details",
   {
     description:
-      "Get detailed info about a table/view/sequence: columns, data types, constraints, indexes, size, row count. Use this to understand table structure before writing queries.",
+      "Get detailed info about a table/view/sequence: columns, data types, constraints, indexes, size, row count. Use this to understand table structure before writing queries. Optionally use server/database/targetSchema params for one-time execution on a different server.",
     inputSchema: z.object({
       schema: z.string().describe("Schema name containing the object"),
       objectName: z.string().describe("Name of the table, view, or sequence"),
@@ -220,6 +246,19 @@ server.registerTool(
         .enum(["table", "view", "sequence"])
         .optional()
         .describe("Object type (auto-detected if not specified)"),
+      // Connection override parameters
+      server: z
+        .string()
+        .optional()
+        .describe("One-time server override. Execute on this server without changing main connection."),
+      database: z
+        .string()
+        .optional()
+        .describe("One-time database override. Uses this database for execution."),
+      targetSchema: z
+        .string()
+        .optional()
+        .describe("One-time schema override. Sets search_path for this execution only."),
     }),
   },
   async (args) => {
@@ -232,7 +271,7 @@ server.registerTool(
   "execute_sql",
   {
     description:
-      "Execute SQL queries. Supports SELECT, INSERT, UPDATE, DELETE (if not in readonly mode). Use $1, $2 placeholders with params array to prevent SQL injection. Use allowMultipleStatements to run multiple statements separated by semicolons. Use transactionId to run within a transaction.",
+      "Execute SQL queries. Supports SELECT, INSERT, UPDATE, DELETE (if not in readonly mode). Use $1, $2 placeholders with params array to prevent SQL injection. Use allowMultipleStatements to run multiple statements separated by semicolons. Use transactionId to run within a transaction. Optionally use server/database/schema params for one-time execution on a different server without changing the main connection.",
     inputSchema: z.object({
       sql: z
         .string()
@@ -270,6 +309,19 @@ server.registerTool(
         .string()
         .optional()
         .describe("Execute within an active transaction. Get this from begin_transaction."),
+      // Connection override parameters for one-time execution
+      server: z
+        .string()
+        .optional()
+        .describe("One-time server override. Execute on this server without changing main connection. Cannot be used with transactionId."),
+      database: z
+        .string()
+        .optional()
+        .describe("One-time database override. Uses this database for execution without changing main connection."),
+      schema: z
+        .string()
+        .optional()
+        .describe("One-time schema override. Sets search_path for this execution only."),
     }),
   },
   async (args) => {
@@ -303,7 +355,7 @@ server.registerTool(
   "execute_sql_file",
   {
     description:
-      "Execute a .sql file from the filesystem. Useful for running migration scripts, schema changes, or data imports. Supports transaction mode for atomic execution. Max file size: 50MB. Use validateOnly=true to preview without executing. Use stripPatterns to remove delimiters like '/' (Liquibase) or 'GO' (SQL Server).",
+      "Execute a .sql file from the filesystem. Useful for running migration scripts, schema changes, or data imports. Supports transaction mode for atomic execution. Max file size: 50MB. Use validateOnly=true to preview without executing. Use stripPatterns to remove delimiters like '/' (Liquibase) or 'GO' (SQL Server). Optionally use server/database/schema params for one-time execution on a different server.",
     inputSchema: z.object({
       filePath: z
         .string()
@@ -332,6 +384,19 @@ server.registerTool(
         .optional()
         .default(false)
         .describe("If true, parse and preview the file without executing (default: false). Returns statement count and types."),
+      // Connection override parameters
+      server: z
+        .string()
+        .optional()
+        .describe("One-time server override. Execute on this server without changing main connection."),
+      database: z
+        .string()
+        .optional()
+        .describe("One-time database override. Uses this database for execution."),
+      schema: z
+        .string()
+        .optional()
+        .describe("One-time schema override. Sets search_path for this execution only."),
     }),
   },
   async (args) => {
@@ -375,7 +440,7 @@ server.registerTool(
   "mutation_preview",
   {
     description:
-      "Preview the effect of INSERT/UPDATE/DELETE without executing. Shows estimated rows affected and sample of rows that would be modified. Use this before running destructive queries to verify the impact.",
+      "Preview the effect of INSERT/UPDATE/DELETE without executing. Shows estimated rows affected and sample of rows that would be modified. Use this before running destructive queries to verify the impact. Optionally use server/database/schema params for one-time execution on a different server.",
     inputSchema: z.object({
       sql: z
         .string()
@@ -385,6 +450,19 @@ server.registerTool(
         .optional()
         .default(5)
         .describe("Number of sample rows to show (default: 5, max: 20)"),
+      // Connection override parameters
+      server: z
+        .string()
+        .optional()
+        .describe("One-time server override. Execute on this server without changing main connection."),
+      database: z
+        .string()
+        .optional()
+        .describe("One-time database override. Uses this database for execution."),
+      schema: z
+        .string()
+        .optional()
+        .describe("One-time schema override. Sets search_path for this execution only."),
     }),
   },
   async (args) => {
@@ -397,7 +475,7 @@ server.registerTool(
   "mutation_dry_run",
   {
     description:
-      "Execute INSERT/UPDATE/DELETE in dry-run mode - actually runs the SQL within a transaction, captures REAL results (exact row counts, actual errors, before/after data), then ROLLBACK so nothing persists. More accurate than mutation_preview. Use this to verify mutations will work correctly before committing. Returns detailed PostgreSQL error info (code, constraint, hint) on failure.",
+      "Execute INSERT/UPDATE/DELETE in dry-run mode - actually runs the SQL within a transaction, captures REAL results (exact row counts, actual errors, before/after data), then ROLLBACK so nothing persists. More accurate than mutation_preview. Use this to verify mutations will work correctly before committing. Returns detailed PostgreSQL error info (code, constraint, hint) on failure. Optionally use server/database/schema params for one-time execution on a different server.",
     inputSchema: z.object({
       sql: z
         .string()
@@ -407,6 +485,19 @@ server.registerTool(
         .optional()
         .default(10)
         .describe("Number of sample rows to return (default: 10, max: 20)"),
+      // Connection override parameters
+      server: z
+        .string()
+        .optional()
+        .describe("One-time server override. Execute on this server without changing main connection."),
+      database: z
+        .string()
+        .optional()
+        .describe("One-time database override. Uses this database for execution."),
+      schema: z
+        .string()
+        .optional()
+        .describe("One-time schema override. Sets search_path for this execution only."),
     }),
   },
   async (args) => {
@@ -419,7 +510,7 @@ server.registerTool(
   "dry_run_sql_file",
   {
     description:
-      "Execute a SQL file in dry-run mode - actually runs ALL statements within a transaction, captures REAL results for each (row counts, errors with line numbers, constraint violations), then ROLLBACK so nothing persists. Perfect for testing migrations before deploying. Returns detailed error info including PostgreSQL error codes, constraint names, and hints to help quickly fix issues. Warns about non-rollbackable operations (sequences, VACUUM, etc.).",
+      "Execute a SQL file in dry-run mode - actually runs ALL statements within a transaction, captures REAL results for each (row counts, errors with line numbers, constraint violations), then ROLLBACK so nothing persists. Perfect for testing migrations before deploying. Returns detailed error info including PostgreSQL error codes, constraint names, and hints to help quickly fix issues. Warns about non-rollbackable operations (sequences, VACUUM, etc.). Optionally use server/database/schema params for one-time execution on a different server.",
     inputSchema: z.object({
       filePath: z
         .string()
@@ -443,6 +534,19 @@ server.registerTool(
         .optional()
         .default(false)
         .describe("Stop on first error (default: false - continues to show ALL errors)"),
+      // Connection override parameters
+      server: z
+        .string()
+        .optional()
+        .describe("One-time server override. Execute on this server without changing main connection."),
+      database: z
+        .string()
+        .optional()
+        .describe("One-time database override. Uses this database for execution."),
+      schema: z
+        .string()
+        .optional()
+        .describe("One-time schema override. Sets search_path for this execution only."),
     }),
   },
   async (args) => {
@@ -455,7 +559,7 @@ server.registerTool(
   "batch_execute",
   {
     description:
-      "Execute multiple SQL queries in parallel. Returns all results keyed by query name. Efficient for fetching multiple independent pieces of data in one call.",
+      "Execute multiple SQL queries in parallel. Returns all results keyed by query name. Efficient for fetching multiple independent pieces of data in one call. Optionally use server/database/schema params for one-time execution on a different server.",
     inputSchema: z.object({
       queries: z
         .array(
@@ -471,6 +575,19 @@ server.registerTool(
         .optional()
         .default(false)
         .describe("Stop on first error (default: false, continues with all queries)"),
+      // Connection override parameters
+      server: z
+        .string()
+        .optional()
+        .describe("One-time server override. Execute on this server without changing main connection."),
+      database: z
+        .string()
+        .optional()
+        .describe("One-time database override. Uses this database for execution."),
+      schema: z
+        .string()
+        .optional()
+        .describe("One-time schema override. Sets search_path for this execution only."),
     }),
   },
   async (args) => {
@@ -565,7 +682,7 @@ server.registerTool(
   "explain_query",
   {
     description:
-      "Show PostgreSQL's execution plan for a query. Use this to understand query performance and identify missing indexes. analyze=true runs the query to get actual timings (SELECT only).",
+      "Show PostgreSQL's execution plan for a query. Use this to understand query performance and identify missing indexes. analyze=true runs the query to get actual timings (SELECT only). Optionally use server/database/schema params for one-time execution on a different server.",
     inputSchema: z.object({
       sql: z.string().describe("SQL query to explain"),
       analyze: z
@@ -593,6 +710,19 @@ server.registerTool(
         )
         .optional()
         .describe("Test hypothetical indexes (requires hypopg extension)"),
+      // Connection override parameters
+      server: z
+        .string()
+        .optional()
+        .describe("One-time server override. Execute on this server without changing main connection."),
+      database: z
+        .string()
+        .optional()
+        .describe("One-time database override. Uses this database for execution."),
+      schema: z
+        .string()
+        .optional()
+        .describe("One-time schema override. Sets search_path for this execution only."),
     }),
   },
   async (args) => {

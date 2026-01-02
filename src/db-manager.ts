@@ -8,6 +8,7 @@ import {
   DatabaseInfo,
   ConnectionContext,
   TransactionInfo,
+  ConnectionOverride,
 } from "./types.js";
 import { isReadOnlySql } from "./utils/validation.js";
 
@@ -16,6 +17,39 @@ const DEFAULT_DATABASE = "postgres";
 const DEFAULT_SCHEMA = "public";
 const DEFAULT_QUERY_TIMEOUT_MS = 30000; // 30 seconds
 const MAX_QUERY_TIMEOUT_MS = 300000; // 5 minutes
+
+// Pool cache configuration
+const MAX_CACHED_POOLS = 10; // Maximum number of cached pools for override connections
+const POOL_IDLE_TIMEOUT_MS = 300000; // 5 minutes - idle pools are closed after this time
+const POOL_CLEANUP_INTERVAL_MS = 60000; // 1 minute - interval for checking and cleaning up idle pools
+const MAX_POOL_SIZE_MAIN = 10; // Max connections for main pool
+const MAX_POOL_SIZE_CACHED = 5; // Max connections per cached pool
+const MAX_TOTAL_CONNECTIONS = 50; // Global limit across all pools
+
+/**
+ * Represents a cached connection pool with metadata for LRU eviction and idle cleanup
+ */
+interface CachedPool {
+  pool: Pool;
+  serverName: string;
+  database: string;
+  lastUsed: number;
+  createdAt: number;
+  activeConnections: number; // Track active connections for this pool
+}
+
+/**
+ * Result from getClientWithOverride containing the client, release function, and resolved schema
+ */
+export interface OverrideClientResult {
+  client: PoolClient;
+  release: () => void;
+  server: string;
+  database: string;
+  schema: string;
+  context?: string;
+  isOverride: boolean;
+}
 
 /**
  * Converts the ServerConfig ssl option to pg Pool ssl config format.
@@ -183,7 +217,22 @@ export class DatabaseManager {
   private currentPool: Pool | null = null;
   private readOnlyMode: boolean;
   private queryTimeoutMs: number;
-  private activeTransactions: Map<string, { client: PoolClient; info: TransactionInfo }> = new Map();
+  private activeTransactions: Map<
+    string,
+    { client: PoolClient; info: TransactionInfo }
+  > = new Map();
+
+  // Pool cache for connection overrides (keyed by "serverName:database")
+  private poolCache: Map<string, CachedPool> = new Map();
+  private poolCleanupInterval: ReturnType<typeof setInterval> | null = null;
+
+  // Track pool creation promises to prevent race conditions
+  // When multiple concurrent requests need the same pool, they all wait for the same Promise
+  private poolCreationPromises: Map<string, Promise<CachedPool>> = new Map();
+
+  // Track total active connections across all pools for global limit enforcement
+  private totalActiveConnections: number = 0;
+  private mainPoolActiveConnections: number = 0;
 
   constructor(
     readOnlyMode: boolean = true,
@@ -197,6 +246,87 @@ export class DatabaseManager {
     };
     this.readOnlyMode = readOnlyMode;
     this.queryTimeoutMs = Math.min(queryTimeoutMs, MAX_QUERY_TIMEOUT_MS);
+
+    // Start pool cleanup interval
+    this.startPoolCleanup();
+  }
+
+  /**
+   * Starts the periodic cleanup of idle cached pools
+   */
+  private startPoolCleanup(): void {
+    if (this.poolCleanupInterval) {
+      return;
+    }
+
+    this.poolCleanupInterval = setInterval(() => {
+      this.cleanupIdlePools();
+    }, POOL_CLEANUP_INTERVAL_MS);
+
+    // Allow the process to exit even if the interval is running
+    if (this.poolCleanupInterval.unref) {
+      this.poolCleanupInterval.unref();
+    }
+  }
+
+  /**
+   * Cleans up pools that have been idle for too long
+   */
+  private cleanupIdlePools(): void {
+    const now = Date.now();
+    const poolsToRemove: string[] = [];
+
+    for (const [key, cached] of this.poolCache.entries()) {
+      if (now - cached.lastUsed > POOL_IDLE_TIMEOUT_MS) {
+        poolsToRemove.push(key);
+      }
+    }
+
+    for (const key of poolsToRemove) {
+      const cached = this.poolCache.get(key);
+      if (cached) {
+        cached.pool.end().catch((err) => {
+          console.error(`Error closing idle pool ${key}:`, err);
+        });
+        this.poolCache.delete(key);
+      }
+    }
+  }
+
+  /**
+   * Generates a cache key for a server/database combination
+   */
+  private getPoolCacheKey(serverName: string, database: string): string {
+    return `${serverName}:${database}`;
+  }
+
+  /**
+   * Evicts the least recently used pool when cache is full
+   */
+  private evictLruPool(): void {
+    if (this.poolCache.size < MAX_CACHED_POOLS) {
+      return;
+    }
+
+    let oldestKey: string | null = null;
+    let oldestTime = Infinity;
+
+    for (const [key, cached] of this.poolCache.entries()) {
+      if (cached.lastUsed < oldestTime) {
+        oldestTime = cached.lastUsed;
+        oldestKey = key;
+      }
+    }
+
+    if (oldestKey) {
+      const cached = this.poolCache.get(oldestKey);
+      if (cached) {
+        cached.pool.end().catch((err) => {
+          console.error(`Error closing evicted pool ${oldestKey}:`, err);
+        });
+        this.poolCache.delete(oldestKey);
+      }
+    }
   }
 
   private loadServersConfig(): ServersConfig {
@@ -332,7 +462,9 @@ export class DatabaseManager {
 
   public getConnectionInfo(): ConnectionInfo {
     const currentServer = this.connectionState.currentServer;
-    const serverConfig = currentServer ? this.serversConfig[currentServer] : null;
+    const serverConfig = currentServer
+      ? this.serversConfig[currentServer]
+      : null;
 
     return {
       isConnected: this.isConnected(),
@@ -424,7 +556,467 @@ export class DatabaseManager {
     return this.currentPool.connect();
   }
 
+  /**
+   * Checks if we can acquire a new connection without exceeding global limits
+   */
+  private canAcquireConnection(): boolean {
+    return this.totalActiveConnections < MAX_TOTAL_CONNECTIONS;
+  }
+
+  /**
+   * Acquires a client from the main pool with proper tracking
+   */
+  private async acquireMainPoolClient(): Promise<{ client: PoolClient; release: () => void }> {
+    if (!this.currentPool) {
+      throw new Error(
+        "No database connection. Please switch to a server and database first."
+      );
+    }
+
+    if (!this.canAcquireConnection()) {
+      throw new Error(
+        `Connection limit reached (${MAX_TOTAL_CONNECTIONS} max). Please wait for existing operations to complete.`
+      );
+    }
+
+    const client = await this.currentPool.connect();
+    this.totalActiveConnections++;
+    this.mainPoolActiveConnections++;
+
+    const release = () => {
+      this.totalActiveConnections = Math.max(0, this.totalActiveConnections - 1);
+      this.mainPoolActiveConnections = Math.max(0, this.mainPoolActiveConnections - 1);
+      client.release();
+    };
+
+    return { client, release };
+  }
+
+  /**
+   * Acquires a client from a cached pool with proper tracking
+   */
+  private async acquireCachedPoolClient(
+    cached: CachedPool
+  ): Promise<{ client: PoolClient; release: () => void }> {
+    if (!this.canAcquireConnection()) {
+      throw new Error(
+        `Connection limit reached (${MAX_TOTAL_CONNECTIONS} max). Please wait for existing operations to complete.`
+      );
+    }
+
+    const client = await cached.pool.connect();
+    this.totalActiveConnections++;
+    cached.activeConnections++;
+    cached.lastUsed = Date.now();
+
+    const release = () => {
+      this.totalActiveConnections = Math.max(0, this.totalActiveConnections - 1);
+      cached.activeConnections = Math.max(0, cached.activeConnections - 1);
+      client.release();
+    };
+
+    return { client, release };
+  }
+
+  /**
+   * Creates a new cached pool. This method handles concurrent creation requests
+   * by storing the creation promise so multiple callers wait for the same pool.
+   */
+  private async getOrCreateCachedPool(
+    serverName: string,
+    database: string,
+    serverConfig: ServerConfig
+  ): Promise<CachedPool> {
+    const cacheKey = this.getPoolCacheKey(serverName, database);
+
+    // Check if pool already exists
+    const existing = this.poolCache.get(cacheKey);
+    if (existing) {
+      return existing;
+    }
+
+    // Check if pool creation is already in progress (handles concurrent requests)
+    const inProgress = this.poolCreationPromises.get(cacheKey);
+    if (inProgress) {
+      return inProgress;
+    }
+
+    // Create pool - wrap in promise and store it so concurrent requests wait
+    const creationPromise = (async (): Promise<CachedPool> => {
+      try {
+        // Double-check after acquiring "lock" (in case another request completed)
+        const existingAfterLock = this.poolCache.get(cacheKey);
+        if (existingAfterLock) {
+          return existingAfterLock;
+        }
+
+        // Evict LRU pool if cache is full
+        this.evictLruPool();
+
+        // Create new pool with smaller size for cached connections
+        const sslConfig = getSslConfig(serverConfig.ssl);
+        const pool = new Pool({
+          host: serverConfig.host,
+          port: parseInt(serverConfig.port || DEFAULT_PORT, 10),
+          user: serverConfig.username,
+          password: serverConfig.password,
+          database,
+          max: MAX_POOL_SIZE_CACHED,
+          idleTimeoutMillis: 30000,
+          connectionTimeoutMillis: 10000,
+          statement_timeout: this.queryTimeoutMs,
+          ...(sslConfig && { ssl: sslConfig }),
+        });
+
+        // Handle pool errors - remove from cache on critical errors
+        pool.on("error", (err) => {
+          console.error(`Pool error for ${cacheKey}:`, err);
+          this.poolCache.delete(cacheKey);
+        });
+
+        // Test connection before caching
+        const testClient = await pool.connect();
+        testClient.release();
+
+        const cached: CachedPool = {
+          pool,
+          serverName,
+          database,
+          lastUsed: Date.now(),
+          createdAt: Date.now(),
+          activeConnections: 0,
+        };
+
+        this.poolCache.set(cacheKey, cached);
+        return cached;
+      } finally {
+        // Always remove the creation promise when done (success or failure)
+        this.poolCreationPromises.delete(cacheKey);
+      }
+    })();
+
+    // Store the promise so concurrent requests can wait for it
+    this.poolCreationPromises.set(cacheKey, creationPromise);
+
+    return creationPromise;
+  }
+
+  /**
+   * Gets a client with optional connection override for one-time execution.
+   * Handles concurrent calls efficiently by:
+   * - Reusing existing pools for the same server/database
+   * - Preventing duplicate pool creation through promise caching
+   * - Tracking active connections for resource management
+   * - Enforcing global connection limits
+   *
+   * @param override - Optional connection override parameters
+   * @returns Object containing the client, release function, and resolved connection info
+   * @throws Error if no connection and no override, or if override server not found
+   */
+  public async getClientWithOverride(
+    override?: ConnectionOverride
+  ): Promise<OverrideClientResult> {
+    // If no override, use current connection
+    if (!override || (!override.server && !override.database && !override.schema)) {
+      if (!this.currentPool) {
+        throw new Error(
+          "No database connection. Please switch to a server and database first, or provide server/database/schema override parameters."
+        );
+      }
+
+      const { client, release } = await this.acquireMainPoolClient();
+      const serverConfig = this.connectionState.currentServer
+        ? this.serversConfig[this.connectionState.currentServer]
+        : null;
+
+      // Set search_path to current schema
+      const schema = this.connectionState.currentSchema || DEFAULT_SCHEMA;
+      try {
+        await client.query(`SET search_path TO ${this.escapeIdentifier(schema)}`);
+      } catch (error) {
+        release();
+        throw new Error(
+          `Failed to set schema '${schema}': ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+
+      return {
+        client,
+        release,
+        server: this.connectionState.currentServer || "",
+        database: this.connectionState.currentDatabase || "",
+        schema,
+        context: serverConfig?.context,
+        isOverride: false,
+      };
+    }
+
+    // Resolve server - use override or current
+    const serverName = override.server || this.connectionState.currentServer;
+    if (!serverName) {
+      throw new Error(
+        "No server specified and no current connection. Provide 'server' parameter or connect first."
+      );
+    }
+
+    const serverConfig = this.getServerConfig(serverName);
+    if (!serverConfig) {
+      const availableServers = this.getServerNames();
+      throw new Error(
+        `Server '${serverName}' not found. Available servers: ${availableServers.join(", ") || "none configured"}`
+      );
+    }
+
+    // Resolve database - use override, or if same server use current, or use server default
+    let database: string;
+    if (override.database) {
+      database = override.database;
+    } else if (serverName === this.connectionState.currentServer && this.connectionState.currentDatabase) {
+      database = this.connectionState.currentDatabase;
+    } else {
+      database = serverConfig.defaultDatabase || DEFAULT_DATABASE;
+    }
+
+    // Validate database name
+    if (!/^[a-zA-Z_][a-zA-Z0-9_-]*$/.test(database) || /--|;|'|"|`/.test(database)) {
+      throw new Error(
+        "Invalid database name. Allowed: letters, digits, underscores, hyphens. Cannot contain SQL characters."
+      );
+    }
+
+    // Resolve schema
+    let schema: string;
+    if (override.schema) {
+      schema = override.schema;
+    } else if (serverName === this.connectionState.currentServer && this.connectionState.currentSchema) {
+      schema = this.connectionState.currentSchema;
+    } else {
+      schema = serverConfig.defaultSchema || DEFAULT_SCHEMA;
+    }
+
+    // Validate schema name
+    if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(schema)) {
+      throw new Error(
+        "Invalid schema name. Only alphanumeric characters and underscores are allowed."
+      );
+    }
+
+    // Check if this is the same as current connection (can use main pool)
+    const isSameAsMain =
+      serverName === this.connectionState.currentServer &&
+      database === this.connectionState.currentDatabase;
+
+    if (isSameAsMain && this.currentPool) {
+      // Use main pool but with potentially different schema
+      const { client, release } = await this.acquireMainPoolClient();
+
+      try {
+        await client.query(`SET search_path TO ${this.escapeIdentifier(schema)}`);
+      } catch (error) {
+        release();
+        throw new Error(
+          `Failed to set schema '${schema}': ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+
+      return {
+        client,
+        release,
+        server: serverName,
+        database,
+        schema,
+        context: serverConfig.context,
+        isOverride: override.schema !== undefined && override.schema !== this.connectionState.currentSchema,
+      };
+    }
+
+    // Get or create cached pool for the override connection
+    // This handles concurrent requests efficiently
+    const cached = await this.getOrCreateCachedPool(serverName, database, serverConfig);
+    const { client, release } = await this.acquireCachedPoolClient(cached);
+
+    try {
+      await client.query(`SET search_path TO ${this.escapeIdentifier(schema)}`);
+    } catch (error) {
+      release();
+      throw new Error(
+        `Failed to set schema '${schema}': ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+
+    return {
+      client,
+      release,
+      server: serverName,
+      database,
+      schema,
+      context: serverConfig.context,
+      isOverride: true,
+    };
+  }
+
+  /**
+   * Executes a query with optional connection override.
+   * Convenience method that handles client lifecycle automatically.
+   *
+   * @param sql - SQL query to execute
+   * @param params - Query parameters
+   * @param override - Optional connection override parameters
+   * @returns Query result with connection info
+   */
+  public async queryWithOverride<T extends QueryResultRow = any>(
+    sql: string,
+    params?: any[],
+    override?: ConnectionOverride
+  ): Promise<QueryResult<T> & { connectionInfo: { server: string; database: string; schema: string } }> {
+    if (!sql || typeof sql !== "string") {
+      throw new Error("SQL query is required and must be a string");
+    }
+
+    // Check for read-only mode violations
+    if (this.readOnlyMode) {
+      const { isReadOnly, reason } = isReadOnlySql(sql);
+      if (!isReadOnly) {
+        throw new Error(`Read-only mode violation: ${reason}`);
+      }
+    }
+
+    const { client, release, server, database, schema } =
+      await this.getClientWithOverride(override);
+
+    try {
+      const result = await client.query<T>(sql, params);
+      return {
+        ...result,
+        connectionInfo: { server, database, schema },
+      };
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Escapes a PostgreSQL identifier to prevent SQL injection
+   */
+  private escapeIdentifier(identifier: string): string {
+    // Double any double quotes and wrap in double quotes
+    return `"${identifier.replace(/"/g, '""')}"`;
+  }
+
+  /**
+   * Closes all cached pools and cleans up resources
+   */
+  public async closeAllCachedPools(): Promise<void> {
+    const closePromises: Promise<void>[] = [];
+
+    for (const [key, cached] of this.poolCache.entries()) {
+      closePromises.push(
+        cached.pool.end().catch((err) => {
+          console.error(`Error closing pool ${key}:`, err);
+        })
+      );
+    }
+
+    await Promise.all(closePromises);
+    this.poolCache.clear();
+  }
+
+  /**
+   * Gets comprehensive statistics about all connection pools (for monitoring/debugging)
+   */
+  public getConnectionStats(): {
+    totalActiveConnections: number;
+    maxTotalConnections: number;
+    mainPool: {
+      activeConnections: number;
+      maxSize: number;
+      isConnected: boolean;
+    };
+    cachedPools: {
+      count: number;
+      maxCount: number;
+      totalActiveConnections: number;
+      pools: Array<{
+        key: string;
+        serverName: string;
+        database: string;
+        activeConnections: number;
+        maxSize: number;
+        lastUsed: Date;
+        createdAt: Date;
+        idleTimeRemaining: number;
+      }>;
+    };
+    pendingPoolCreations: number;
+  } {
+    const now = Date.now();
+    const pools = Array.from(this.poolCache.entries()).map(([key, cached]) => ({
+      key,
+      serverName: cached.serverName,
+      database: cached.database,
+      activeConnections: cached.activeConnections,
+      maxSize: MAX_POOL_SIZE_CACHED,
+      lastUsed: new Date(cached.lastUsed),
+      createdAt: new Date(cached.createdAt),
+      idleTimeRemaining: Math.max(0, POOL_IDLE_TIMEOUT_MS - (now - cached.lastUsed)),
+    }));
+
+    const cachedPoolsTotalActive = Array.from(this.poolCache.values())
+      .reduce((sum, cached) => sum + cached.activeConnections, 0);
+
+    return {
+      totalActiveConnections: this.totalActiveConnections,
+      maxTotalConnections: MAX_TOTAL_CONNECTIONS,
+      mainPool: {
+        activeConnections: this.mainPoolActiveConnections,
+        maxSize: MAX_POOL_SIZE_MAIN,
+        isConnected: this.currentPool !== null,
+      },
+      cachedPools: {
+        count: this.poolCache.size,
+        maxCount: MAX_CACHED_POOLS,
+        totalActiveConnections: cachedPoolsTotalActive,
+        pools,
+      },
+      pendingPoolCreations: this.poolCreationPromises.size,
+    };
+  }
+
+  /**
+   * @deprecated Use getConnectionStats() instead
+   * Gets statistics about cached pools (for monitoring/debugging)
+   */
+  public getCachedPoolStats(): {
+    count: number;
+    maxSize: number;
+    pools: Array<{ key: string; serverName: string; database: string; lastUsed: Date; createdAt: Date }>;
+  } {
+    const pools = Array.from(this.poolCache.entries()).map(([key, cached]) => ({
+      key,
+      serverName: cached.serverName,
+      database: cached.database,
+      lastUsed: new Date(cached.lastUsed),
+      createdAt: new Date(cached.createdAt),
+    }));
+
+    return {
+      count: this.poolCache.size,
+      maxSize: MAX_CACHED_POOLS,
+      pools,
+    };
+  }
+
   public async close(): Promise<void> {
+    // Stop cleanup interval
+    if (this.poolCleanupInterval) {
+      clearInterval(this.poolCleanupInterval);
+      this.poolCleanupInterval = null;
+    }
+
+    // Close all cached pools
+    await this.closeAllCachedPools();
+
+    // Close main pool
     if (this.currentPool) {
       await this.currentPool.end();
       this.currentPool = null;
@@ -518,6 +1110,8 @@ export class DatabaseManager {
       "no connection to the server",
       "server conn crashed",
       "database removed",
+      "timed out",
+      "idle",
     ];
 
     // Check error codes
