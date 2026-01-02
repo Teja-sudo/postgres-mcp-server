@@ -49,7 +49,7 @@ export function isReadOnlySql(sql: string): { isReadOnly: boolean; reason?: stri
   }
 
   // Normalize: remove comments, extra whitespace
-  let normalizedSql = sql
+  const normalizedSql = sql
     // Remove single-line comments
     .replace(/--[^\n]*/g, '')
     // Remove multi-line comments

@@ -77,10 +77,10 @@ describe('SQL Tools', () => {
   describe('executeSql', () => {
     it('should require sql parameter', async () => {
       await expect(executeSql({ sql: '' }))
-        .rejects.toThrow('sql parameter cannot be empty');
+        .rejects.toThrow('sql parameter is required and must be a string');
 
       await expect(executeSql({ sql: null as any }))
-        .rejects.toThrow('sql parameter is required');
+        .rejects.toThrow('sql parameter is required and must be a string');
     });
 
     it('should reject SQL that is too long', async () => {
@@ -638,6 +638,39 @@ INVALID;`);
       expect(result.errors!.length).toBe(1);
       // The INVALID statement starts on line 8
       expect(result.errors![0].lineNumber).toBe(8);
+    });
+
+    it('should validate only without executing when validateOnly is true', async () => {
+      fs.writeFileSync(testFile, 'SELECT 1; SELECT 2;');
+
+      const result = await executeSqlFile({ filePath: testFile, validateOnly: true });
+
+      expect(result.success).toBe(true);
+      expect(result.statementsExecuted).toBe(0); // Not executed
+      expect(result.totalStatements).toBe(2); // Parsed
+      expect(result.preview).toBeDefined();
+      expect(result.preview!.length).toBe(2);
+      expect(mockClient.query).not.toHaveBeenCalled(); // No queries run
+    });
+
+    it('should preprocess SQL with strip patterns', async () => {
+      fs.writeFileSync(testFile, `-- TODO: Remove this line
+SELECT 1;
+-- TODO: And this one
+SELECT 2;`);
+      mockClient.query
+        .mockResolvedValueOnce({}) // BEGIN
+        .mockResolvedValueOnce({ rowCount: 1 }) // SELECT 1
+        .mockResolvedValueOnce({ rowCount: 1 }) // SELECT 2
+        .mockResolvedValueOnce({}); // COMMIT
+
+      const result = await executeSqlFile({
+        filePath: testFile,
+        stripPatterns: ['-- TODO: Remove this line', '-- TODO: And this one'],
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.statementsExecuted).toBe(2);
     });
   });
 
@@ -2249,13 +2282,15 @@ SELECT 2;`,
 
   describe('Edge Cases in Statement Splitting', () => {
     it('should handle empty SQL gracefully', async () => {
+      // Empty string is falsy, caught by first validation
       await expect(executeSql({ sql: '' }))
-        .rejects.toThrow('cannot be empty');
+        .rejects.toThrow('sql parameter is required and must be a string');
     });
 
     it('should handle SQL with only whitespace', async () => {
+      // Whitespace-only becomes empty after trim
       await expect(executeSql({ sql: '   \n\t  ' }))
-        .rejects.toThrow('cannot be empty');
+        .rejects.toThrow('sql parameter cannot be empty');
     });
 
     it('should handle SQL with only comments', async () => {

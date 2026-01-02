@@ -10,16 +10,15 @@ import {
   BatchExecuteResult,
   ConnectionContext,
   ConnectionOverride,
-  ParsedStatement,
   MultiStatementResult,
   ExecuteSqlMultiResult,
   TransactionResult,
   TransactionInfo,
-  DryRunError,
   DryRunStatementResult,
   NonRollbackableWarning,
   MutationDryRunResult,
   SqlFileDryRunResult,
+  DryRunError,
 } from '../types.js';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -27,166 +26,51 @@ import * as os from 'os';
 import { v4 as uuidv4 } from 'uuid';
 import { validateIdentifier, validateIndexType, isReadOnlySql, validatePositiveInteger } from '../utils/validation.js';
 
-const MAX_OUTPUT_CHARS = 50000; // Maximum characters before writing to file
-const MAX_ROWS_DEFAULT = 1000; // Default max rows in direct response
-const MAX_ROWS_LIMIT = 100000; // Absolute maximum rows
-const DEFAULT_SQL_LENGTH_LIMIT = 100000; // Default SQL query length limit (100KB)
-const MAX_PARAMS = 100; // Maximum number of query parameters
-const MAX_SQL_FILE_SIZE = 50 * 1024 * 1024; // Maximum SQL file size (50MB)
-const MAX_DRY_RUN_SAMPLE_ROWS = 10; // Maximum sample rows to return in dry-run
+// Import utilities from modular structure
+import {
+  MAX_OUTPUT_CHARS,
+  MAX_ROWS_DEFAULT,
+  MAX_ROWS_LIMIT,
+  DEFAULT_SQL_LENGTH_LIMIT,
+  MAX_PARAMS,
+  MAX_SQL_FILE_SIZE,
+  MAX_DRY_RUN_SAMPLE_ROWS,
+  MAX_BATCH_QUERIES,
+  MAX_MUTATION_SAMPLE_SIZE,
+  DEFAULT_MUTATION_SAMPLE_SIZE,
+  MAX_HYPOTHETICAL_INDEXES,
+  MAX_DRY_RUN_STATEMENTS,
+  DEFAULT_DRY_RUN_STATEMENTS,
+  MAX_PREVIEW_STATEMENTS,
+  DEFAULT_PREVIEW_STATEMENTS,
+  MAX_ROWS_PER_STATEMENT,
+  SQL_TRUNCATION_SHORT,
+  SQL_TRUNCATION_LONG,
+  MAX_TABLES_TO_ANALYZE,
+} from './sql/utils/constants.js';
 
-/**
- * Extract detailed error information from a PostgreSQL error.
- * Captures all available fields to help AI quickly identify and fix issues.
- */
-function extractDryRunError(error: unknown): DryRunError {
-  const result: DryRunError = {
-    message: error instanceof Error ? error.message : String(error)
-  };
+import {
+  extractDryRunError,
+  detectNonRollbackableOperations,
+} from './sql/utils/dry-run-utils.js';
 
-  // PostgreSQL errors have additional properties
-  if (error && typeof error === 'object') {
-    const pgError = error as Record<string, unknown>;
+import {
+  splitSqlStatementsWithLineNumbers,
+  stripLeadingComments,
+  detectStatementType,
+  extractTablesFromSql,
+} from './sql/utils/sql-parser.js';
 
-    if (pgError.code) result.code = String(pgError.code);
-    if (pgError.severity) result.severity = String(pgError.severity);
-    if (pgError.detail) result.detail = String(pgError.detail);
-    if (pgError.hint) result.hint = String(pgError.hint);
-    if (pgError.position) result.position = Number(pgError.position);
-    if (pgError.internalPosition) result.internalPosition = Number(pgError.internalPosition);
-    if (pgError.internalQuery) result.internalQuery = String(pgError.internalQuery);
-    if (pgError.where) result.where = String(pgError.where);
-    if (pgError.schema) result.schema = String(pgError.schema);
-    if (pgError.table) result.table = String(pgError.table);
-    if (pgError.column) result.column = String(pgError.column);
-    if (pgError.dataType) result.dataType = String(pgError.dataType);
-    if (pgError.constraint) result.constraint = String(pgError.constraint);
-    if (pgError.file) result.file = String(pgError.file);
-    if (pgError.line) result.line = String(pgError.line);
-    if (pgError.routine) result.routine = String(pgError.routine);
-  }
+import {
+  preprocessSqlContent,
+} from './sql/utils/file-handler.js';
 
-  return result;
-}
+// Connection utilities are handled inline for explicit control flow
 
-/**
- * Check if a SQL statement contains operations that cannot be fully rolled back
- * or have side effects even within a transaction.
- */
-function detectNonRollbackableOperations(
-  sql: string,
-  statementIndex?: number,
-  lineNumber?: number
-): NonRollbackableWarning[] {
-  const warnings: NonRollbackableWarning[] = [];
-  const upperSql = sql.toUpperCase().trim();
-
-  // Operations that cannot run inside a transaction at all - MUST SKIP
-  if (upperSql.match(/\bVACUUM\b/)) {
-    warnings.push({
-      operation: 'VACUUM',
-      message: 'VACUUM cannot run inside a transaction block. Statement skipped.',
-      statementIndex,
-      lineNumber,
-      mustSkip: true
-    });
-  }
-
-  if (upperSql.match(/\bCLUSTER\b/) && !upperSql.includes('CREATE')) {
-    warnings.push({
-      operation: 'CLUSTER',
-      message: 'CLUSTER cannot run inside a transaction block. Statement skipped.',
-      statementIndex,
-      lineNumber,
-      mustSkip: true
-    });
-  }
-
-  if (upperSql.match(/\bREINDEX\b.*\bCONCURRENTLY\b/)) {
-    warnings.push({
-      operation: 'REINDEX_CONCURRENTLY',
-      message: 'REINDEX CONCURRENTLY cannot run inside a transaction block. Statement skipped.',
-      statementIndex,
-      lineNumber,
-      mustSkip: true
-    });
-  }
-
-  if (upperSql.match(/\bCREATE\s+INDEX\b.*\bCONCURRENTLY\b/)) {
-    warnings.push({
-      operation: 'CREATE_INDEX_CONCURRENTLY',
-      message: 'CREATE INDEX CONCURRENTLY cannot run inside a transaction block. Statement skipped.',
-      statementIndex,
-      lineNumber,
-      mustSkip: true
-    });
-  }
-
-  if (upperSql.match(/\bCREATE\s+DATABASE\b/)) {
-    warnings.push({
-      operation: 'CREATE_DATABASE',
-      message: 'CREATE DATABASE cannot run inside a transaction block. Statement skipped.',
-      statementIndex,
-      lineNumber,
-      mustSkip: true
-    });
-  }
-
-  if (upperSql.match(/\bDROP\s+DATABASE\b/)) {
-    warnings.push({
-      operation: 'DROP_DATABASE',
-      message: 'DROP DATABASE cannot run inside a transaction block. Statement skipped.',
-      statementIndex,
-      lineNumber,
-      mustSkip: true
-    });
-  }
-
-  // Operations that have side effects even when rolled back - MUST SKIP
-  if (upperSql.match(/\bNEXTVAL\s*\(/)) {
-    warnings.push({
-      operation: 'SEQUENCE',
-      message: 'NEXTVAL increments sequence even when transaction is rolled back. Statement skipped to prevent sequence consumption.',
-      statementIndex,
-      lineNumber,
-      mustSkip: true
-    });
-  }
-
-  if (upperSql.match(/\bSETVAL\s*\(/)) {
-    warnings.push({
-      operation: 'SEQUENCE',
-      message: 'SETVAL modifies sequence. Statement skipped to prevent side effects.',
-      statementIndex,
-      lineNumber,
-      mustSkip: true
-    });
-  }
-
-  // INSERT with SERIAL/BIGSERIAL columns may consume sequence values - WARNING ONLY (not skipped)
-  if (upperSql.match(/\bINSERT\s+INTO\b/)) {
-    warnings.push({
-      operation: 'SEQUENCE',
-      message: 'INSERT may consume sequence values (for SERIAL/BIGSERIAL columns) even when rolled back.',
-      statementIndex,
-      lineNumber,
-      mustSkip: false  // Warning only, do not skip
-    });
-  }
-
-  // NOTIFY only sends on commit, so safe in dry-run (rollback prevents notification)
-  if (upperSql.match(/\bNOTIFY\b/)) {
-    warnings.push({
-      operation: 'NOTIFY',
-      message: 'NOTIFY sends notifications on commit. Since dry-run rolls back, notifications will NOT be sent.',
-      statementIndex,
-      lineNumber,
-      mustSkip: false  // Safe to execute in dry-run since we rollback
-    });
-  }
-
-  return warnings;
-}
+import {
+  calculateExecutionTime,
+  getStartTime,
+} from './sql/utils/result-formatter.js';
 
 export async function executeSql(args: {
   sql: string;
@@ -203,12 +87,8 @@ export async function executeSql(args: {
   schema?: string;
 }): Promise<ExecuteSqlResult | ExecuteSqlMultiResult> {
   // Validate SQL input
-  if (args.sql === undefined || args.sql === null) {
-    throw new Error('sql parameter is required');
-  }
-
-  if (typeof args.sql !== 'string') {
-    throw new Error('sql parameter must be a string');
+  if (!args.sql || typeof args.sql !== 'string') {
+    throw new Error('sql parameter is required and must be a string');
   }
 
   const sql = args.sql.trim();
@@ -263,7 +143,7 @@ export async function executeSql(args: {
   }
 
   // Record start time for execution timing
-  const startTime = process.hrtime.bigint();
+  const startTime = getStartTime();
 
   // Execute query with optional parameters
   let result;
@@ -285,9 +165,8 @@ export async function executeSql(args: {
     result = await dbManager.query(sql, args.params);
   }
 
-  // Calculate execution time in milliseconds
-  const endTime = process.hrtime.bigint();
-  const executionTimeMs = Number(endTime - startTime) / 1_000_000;
+  // Calculate execution time in milliseconds (already rounded to 2 decimal places)
+  const executionTimeMs = calculateExecutionTime(startTime, getStartTime());
 
   // Defensive: ensure result has expected structure
   if (!result || typeof result !== 'object') {
@@ -320,7 +199,7 @@ export async function executeSql(args: {
       offset: startIndex,
       fields,
       rows: paginatedRows,
-      executionTimeMs: Math.round(executionTimeMs * 100) / 100,
+      executionTimeMs,
       generatedAt: new Date().toISOString()
     };
 
@@ -332,7 +211,7 @@ export async function executeSql(args: {
       fields,
       outputFile: filePath,
       truncated: true,
-      executionTimeMs: Math.round(executionTimeMs * 100) / 100,
+      executionTimeMs,
       offset: startIndex,
       hasMore: endIndex < totalRows,
       ...(schemaHint && { schemaHint })
@@ -343,7 +222,7 @@ export async function executeSql(args: {
     rows: paginatedRows,
     rowCount: totalRows,
     fields,
-    executionTimeMs: Math.round(executionTimeMs * 100) / 100,
+    executionTimeMs,
     offset: startIndex,
     hasMore: endIndex < totalRows,
     ...(schemaHint && { schemaHint })
@@ -360,7 +239,7 @@ async function executeMultipleStatements(
   override?: ConnectionOverride
 ): Promise<ExecuteSqlMultiResult> {
   const dbManager = getDbManager();
-  const startTime = process.hrtime.bigint();
+  const startTime = getStartTime();
 
   // Parse statements with line numbers
   const parsedStatements = splitSqlStatementsWithLineNumbers(sql);
@@ -385,7 +264,7 @@ async function executeMultipleStatements(
         const stmt = executableStatements[i];
         const stmtResult: MultiStatementResult = {
           statementIndex: i + 1,
-          sql: stmt.sql.length > 200 ? stmt.sql.substring(0, 200) + '...' : stmt.sql,
+          sql: stmt.sql.length > SQL_TRUNCATION_SHORT ? stmt.sql.substring(0, SQL_TRUNCATION_SHORT) + '...' : stmt.sql,
           lineNumber: stmt.lineNumber,
           success: false,
         };
@@ -393,7 +272,7 @@ async function executeMultipleStatements(
         try {
           const result = await client.query(stmt.sql);
           stmtResult.success = true;
-          stmtResult.rows = result.rows?.slice(0, 100);
+          stmtResult.rows = result.rows?.slice(0, MAX_ROWS_PER_STATEMENT);
           stmtResult.rowCount = result.rowCount ?? result.rows?.length ?? 0;
           successCount++;
         } catch (error) {
@@ -413,7 +292,7 @@ async function executeMultipleStatements(
       const stmt = executableStatements[i];
       const stmtResult: MultiStatementResult = {
         statementIndex: i + 1,
-        sql: stmt.sql.length > 200 ? stmt.sql.substring(0, 200) + '...' : stmt.sql,
+        sql: stmt.sql.length > SQL_TRUNCATION_SHORT ? stmt.sql.substring(0, SQL_TRUNCATION_SHORT) + '...' : stmt.sql,
         lineNumber: stmt.lineNumber,
         success: false,
       };
@@ -427,7 +306,7 @@ async function executeMultipleStatements(
         }
 
         stmtResult.success = true;
-        stmtResult.rows = result.rows?.slice(0, 100); // Limit rows per statement
+        stmtResult.rows = result.rows?.slice(0, MAX_ROWS_PER_STATEMENT); // Limit rows per statement
         stmtResult.rowCount = result.rowCount ?? result.rows?.length ?? 0;
         successCount++;
       } catch (error) {
@@ -440,15 +319,14 @@ async function executeMultipleStatements(
     }
   }
 
-  const endTime = process.hrtime.bigint();
-  const executionTimeMs = Number(endTime - startTime) / 1_000_000;
+  const executionTimeMs = calculateExecutionTime(startTime, getStartTime());
 
   return {
     results,
     totalStatements: executableStatements.length,
     successCount,
     failureCount,
-    executionTimeMs: Math.round(executionTimeMs * 100) / 100,
+    executionTimeMs,
     ...(schemaHint && { schemaHint })
   };
 }
@@ -506,8 +384,8 @@ export async function explainQuery(args: {
     // If hypothetical indexes are specified, validate and create them
     if (args.hypotheticalIndexes && args.hypotheticalIndexes.length > 0) {
       // Limit number of hypothetical indexes
-      if (args.hypotheticalIndexes.length > 10) {
-        throw new Error('Maximum 10 hypothetical indexes allowed');
+      if (args.hypotheticalIndexes.length > MAX_HYPOTHETICAL_INDEXES) {
+        throw new Error(`Maximum ${MAX_HYPOTHETICAL_INDEXES} hypothetical indexes allowed`);
       }
 
       // Check if hypopg extension is available
@@ -591,7 +469,8 @@ export async function explainQuery(args: {
       try {
         await client.query('SELECT hypopg_reset()');
       } catch (e) {
-        // Ignore if hypopg not available
+        // hypopg extension may not be available
+        console.debug('Could not reset hypopg:', e);
       }
     }
 
@@ -668,36 +547,6 @@ export interface SqlFilePreviewResult {
 }
 
 /**
- * Preprocess SQL content by removing patterns.
- * Supports both literal string matching and regex patterns.
- *
- * @param sql - The SQL content to preprocess
- * @param patterns - Array of patterns to remove from SQL content
- * @param isRegex - If true, patterns are treated as regex; if false, as literal strings
- */
-function preprocessSqlContent(sql: string, patterns: string[], isRegex: boolean = false): string {
-  let result = sql;
-  for (const pattern of patterns) {
-    try {
-      if (isRegex) {
-        // Treat as regex pattern (multiline by default)
-        const regex = new RegExp(pattern, 'gm');
-        result = result.replace(regex, '');
-      } else {
-        // Treat as literal string - escape and match on its own line
-        const escapedPattern = pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const regex = new RegExp(`^\\s*${escapedPattern}\\s*$`, 'gm');
-        result = result.replace(regex, '');
-      }
-    } catch (error) {
-      // Invalid regex - skip this pattern
-      console.error(`Warning: Invalid pattern "${pattern}": ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
-  return result;
-}
-
-/**
  * Execute a SQL file from the filesystem.
  * Supports transaction mode for atomic execution.
  */
@@ -770,7 +619,7 @@ export async function executeSqlFile(args: {
     ? { server: args.server, database: args.database, schema: args.schema }
     : undefined;
 
-  const startTime = process.hrtime.bigint();
+  const startTime = getStartTime();
 
   // Split SQL into statements with line number tracking
   const parsedStatements = splitSqlStatementsWithLineNumbers(sqlContent);
@@ -784,14 +633,13 @@ export async function executeSqlFile(args: {
 
   // If validateOnly mode, return preview without execution
   if (validateOnly) {
-    const endTime = process.hrtime.bigint();
-    const executionTimeMs = Number(endTime - startTime) / 1_000_000;
+    const executionTimeMs = calculateExecutionTime(startTime, getStartTime());
 
     // Create preview of statements
     const preview = executableStatements.map((stmt, idx) => ({
       index: idx + 1,
       lineNumber: stmt.lineNumber,
-      sql: stmt.sql.length > 300 ? stmt.sql.substring(0, 300) + '...' : stmt.sql,
+      sql: stmt.sql.length > SQL_TRUNCATION_LONG ? stmt.sql.substring(0, SQL_TRUNCATION_LONG) + '...' : stmt.sql,
       type: detectStatementType(stmt.sql)
     }));
 
@@ -802,7 +650,7 @@ export async function executeSqlFile(args: {
       totalStatements,
       statementsExecuted: 0,
       statementsFailed: 0,
-      executionTimeMs: Math.round(executionTimeMs * 100) / 100,
+      executionTimeMs,
       rowsAffected: 0,
       validateOnly: true,
       preview
@@ -854,7 +702,7 @@ export async function executeSqlFile(args: {
           collectedErrors.push({
             statementIndex: statementIndex + 1,
             lineNumber: stmt.lineNumber,
-            sql: trimmed.length > 200 ? trimmed.substring(0, 200) + '...' : trimmed,
+            sql: trimmed.length > SQL_TRUNCATION_SHORT ? trimmed.substring(0, SQL_TRUNCATION_SHORT) + '...' : trimmed,
             error: errorMessage
           });
           throw error;
@@ -864,7 +712,7 @@ export async function executeSqlFile(args: {
         collectedErrors.push({
           statementIndex: statementIndex + 1,
           lineNumber: stmt.lineNumber,
-          sql: trimmed.length > 200 ? trimmed.substring(0, 200) + '...' : trimmed,
+          sql: trimmed.length > SQL_TRUNCATION_SHORT ? trimmed.substring(0, SQL_TRUNCATION_SHORT) + '...' : trimmed,
           error: errorMessage
         });
         console.error(`Warning: Statement ${statementIndex + 1} at line ${stmt.lineNumber} failed: ${errorMessage}`);
@@ -875,8 +723,7 @@ export async function executeSqlFile(args: {
       await client.query('COMMIT');
     }
 
-    const endTime = process.hrtime.bigint();
-    const executionTimeMs = Number(endTime - startTime) / 1_000_000;
+    const executionTimeMs = calculateExecutionTime(startTime, getStartTime());
 
     const result: ExecuteSqlFileResult = {
       success: statementsFailed === 0,
@@ -885,7 +732,7 @@ export async function executeSqlFile(args: {
       totalStatements,
       statementsExecuted,
       statementsFailed,
-      executionTimeMs: Math.round(executionTimeMs * 100) / 100,
+      executionTimeMs,
       rowsAffected: totalRowsAffected
     };
 
@@ -897,8 +744,7 @@ export async function executeSqlFile(args: {
     return result;
 
   } catch (error) {
-    const endTime = process.hrtime.bigint();
-    const executionTimeMs = Number(endTime - startTime) / 1_000_000;
+    const executionTimeMs = calculateExecutionTime(startTime, getStartTime());
 
     const result: ExecuteSqlFileResult = {
       success: false,
@@ -907,7 +753,7 @@ export async function executeSqlFile(args: {
       totalStatements,
       statementsExecuted,
       statementsFailed,
-      executionTimeMs: Math.round(executionTimeMs * 100) / 100,
+      executionTimeMs,
       rowsAffected: totalRowsAffected,
       error: error instanceof Error ? error.message : String(error),
       rollback: rolledBack
@@ -926,38 +772,6 @@ export async function executeSqlFile(args: {
       client.release();
     }
   }
-}
-
-/**
- * Detect the type of SQL statement (SELECT, INSERT, UPDATE, DELETE, CREATE, etc.)
- */
-function detectStatementType(sql: string): string {
-  const trimmed = stripLeadingComments(sql).toUpperCase();
-
-  // Common statement types
-  const types = [
-    'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP',
-    'TRUNCATE', 'GRANT', 'REVOKE', 'BEGIN', 'COMMIT', 'ROLLBACK',
-    'SET', 'SHOW', 'EXPLAIN', 'ANALYZE', 'VACUUM', 'REINDEX',
-    'COMMENT', 'WITH', 'DO', 'CALL', 'EXECUTE'
-  ];
-
-  for (const type of types) {
-    if (trimmed.startsWith(type + ' ') || trimmed.startsWith(type + '\n') ||
-        trimmed.startsWith(type + '\t') || trimmed === type) {
-      // Special case for WITH - check if it's a CTE followed by SELECT/INSERT/UPDATE/DELETE
-      if (type === 'WITH') {
-        if (trimmed.includes('SELECT')) return 'WITH SELECT';
-        if (trimmed.includes('INSERT')) return 'WITH INSERT';
-        if (trimmed.includes('UPDATE')) return 'WITH UPDATE';
-        if (trimmed.includes('DELETE')) return 'WITH DELETE';
-        return 'WITH';
-      }
-      return type;
-    }
-  }
-
-  return 'UNKNOWN';
 }
 
 /**
@@ -1016,7 +830,7 @@ export async function previewSqlFile(args: {
     sqlContent = preprocessSqlContent(sqlContent, args.stripPatterns, args.stripAsRegex === true);
   }
 
-  const maxStatements = Math.min(args.maxStatements || 20, 100);
+  const maxStatements = Math.min(args.maxStatements || DEFAULT_PREVIEW_STATEMENTS, MAX_PREVIEW_STATEMENTS);
 
   // Split SQL into statements with line number tracking
   const parsedStatements = splitSqlStatementsWithLineNumbers(sqlContent);
@@ -1054,16 +868,19 @@ export async function previewSqlFile(args: {
   const statements = executableStatements.slice(0, maxStatements).map((stmt, idx) => ({
     index: idx + 1,
     lineNumber: stmt.lineNumber,
-    sql: stmt.sql.length > 300 ? stmt.sql.substring(0, 300) + '...' : stmt.sql,
+    sql: stmt.sql.length > SQL_TRUNCATION_LONG ? stmt.sql.substring(0, SQL_TRUNCATION_LONG) + '...' : stmt.sql,
     type: detectStatementType(stmt.sql)
   }));
 
   // Format file size
-  const fileSizeFormatted = stats.size < 1024
-    ? `${stats.size} bytes`
-    : stats.size < 1024 * 1024
-      ? `${(stats.size / 1024).toFixed(1)} KB`
-      : `${(stats.size / (1024 * 1024)).toFixed(2)} MB`;
+  let fileSizeFormatted: string;
+  if (stats.size < 1024) {
+    fileSizeFormatted = `${stats.size} bytes`;
+  } else if (stats.size < 1024 * 1024) {
+    fileSizeFormatted = `${(stats.size / 1024).toFixed(1)} KB`;
+  } else {
+    fileSizeFormatted = `${(stats.size / (1024 * 1024)).toFixed(2)} MB`;
+  }
 
   // Generate summary
   const typeEntries = Object.entries(statementsByType).sort((a, b) => b[1] - a[1]);
@@ -1151,7 +968,7 @@ export async function dryRunSqlFile(args: {
     sqlContent = preprocessSqlContent(sqlContent, args.stripPatterns, args.stripAsRegex === true);
   }
 
-  const maxStatements = Math.min(args.maxStatements || 50, 200);
+  const maxStatements = Math.min(args.maxStatements || DEFAULT_DRY_RUN_STATEMENTS, MAX_DRY_RUN_STATEMENTS);
   const stopOnError = args.stopOnError === true;
 
   // Split SQL into statements with line number tracking
@@ -1173,11 +990,14 @@ export async function dryRunSqlFile(args: {
   });
 
   // Format file size
-  const fileSizeFormatted = stats.size < 1024
-    ? `${stats.size} bytes`
-    : stats.size < 1024 * 1024
-      ? `${(stats.size / 1024).toFixed(1)} KB`
-      : `${(stats.size / (1024 * 1024)).toFixed(2)} MB`;
+  let fileSizeFormatted: string;
+  if (stats.size < 1024) {
+    fileSizeFormatted = `${stats.size} bytes`;
+  } else if (stats.size < 1024 * 1024) {
+    fileSizeFormatted = `${(stats.size / 1024).toFixed(1)} KB`;
+  } else {
+    fileSizeFormatted = `${(stats.size / (1024 * 1024)).toFixed(2)} MB`;
+  }
 
   const dbManager = getDbManager();
 
@@ -1198,7 +1018,7 @@ export async function dryRunSqlFile(args: {
     client = await dbManager.getClient();
   }
 
-  const startTime = process.hrtime.bigint();
+  const startTime = getStartTime();
 
   const statementResults: DryRunStatementResult[] = [];
   const statementsByType: { [type: string]: number } = {};
@@ -1217,11 +1037,11 @@ export async function dryRunSqlFile(args: {
       const stmtType = detectStatementType(stmt.sql);
       statementsByType[stmtType] = (statementsByType[stmtType] || 0) + 1;
 
-      const stmtStartTime = process.hrtime.bigint();
+      const stmtStartTime = getStartTime();
       const result: DryRunStatementResult = {
         index: idx + 1,
         lineNumber: stmt.lineNumber,
-        sql: stmt.sql.length > 300 ? stmt.sql.substring(0, 300) + '...' : stmt.sql,
+        sql: stmt.sql.length > SQL_TRUNCATION_LONG ? stmt.sql.substring(0, SQL_TRUNCATION_LONG) + '...' : stmt.sql,
         type: stmtType,
         success: false
       };
@@ -1280,8 +1100,7 @@ export async function dryRunSqlFile(args: {
         }
       }
 
-      const stmtEndTime = process.hrtime.bigint();
-      result.executionTimeMs = Math.round(Number(stmtEndTime - stmtStartTime) / 1_000_000 * 100) / 100;
+      result.executionTimeMs = calculateExecutionTime(stmtStartTime, getStartTime());
 
       // Only include results up to maxStatements
       if (statementResults.length < maxStatements) {
@@ -1309,8 +1128,7 @@ export async function dryRunSqlFile(args: {
     }
   }
 
-  const endTime = process.hrtime.bigint();
-  const executionTimeMs = Math.round(Number(endTime - startTime) / 1_000_000 * 100) / 100;
+  const executionTimeMs = calculateExecutionTime(startTime, getStartTime());
 
   // Generate summary
   const typeEntries = Object.entries(statementsByType).sort((a, b) => b[1] - a[1]);
@@ -1348,214 +1166,6 @@ export async function dryRunSqlFile(args: {
 }
 
 /**
- * Strips leading line comments and block comments from SQL to check if there's actual SQL.
- * Returns empty string if the entire content is just comments.
- */
-function stripLeadingComments(sql: string): string {
-  let result = sql.trim();
-
-  while (result.length > 0) {
-    // Strip leading line comments
-    if (result.startsWith('--')) {
-      const newlineIndex = result.indexOf('\n');
-      if (newlineIndex === -1) {
-        return ''; // Entire string is a line comment
-      }
-      result = result.substring(newlineIndex + 1).trim();
-      continue;
-    }
-
-    // Strip leading block comments
-    if (result.startsWith('/*')) {
-      const endIndex = result.indexOf('*/');
-      if (endIndex === -1) {
-        return ''; // Unclosed block comment
-      }
-      result = result.substring(endIndex + 2).trim();
-      continue;
-    }
-
-    // No more leading comments
-    break;
-  }
-
-  return result;
-}
-
-/**
- * Split SQL content into individual statements with line number tracking.
- * Returns ParsedStatement objects with SQL and line number info.
- */
-function splitSqlStatementsWithLineNumbers(sql: string): ParsedStatement[] {
-  const statements: ParsedStatement[] = [];
-  let current = '';
-  let currentLineNumber = 1;
-  let statementStartLine = 1;
-  let inString = false;
-  let stringChar = '';
-  let inLineComment = false;
-  let inBlockComment = false;
-  let i = 0;
-
-  while (i < sql.length) {
-    const char = sql[i];
-    const nextChar = sql[i + 1] || '';
-
-    // Track line numbers
-    if (char === '\n') {
-      currentLineNumber++;
-    }
-
-    // If starting a new statement (current is empty/whitespace), record line number
-    if (current.trim() === '' && char.trim() !== '') {
-      statementStartLine = currentLineNumber;
-    }
-
-    // Handle line comments
-    if (!inString && !inBlockComment && char === '-' && nextChar === '-') {
-      inLineComment = true;
-      current += char;
-      i++;
-      continue;
-    }
-
-    if (inLineComment && (char === '\n' || char === '\r')) {
-      inLineComment = false;
-      current += char;
-      i++;
-      continue;
-    }
-
-    // Handle block comments
-    if (!inString && !inLineComment && char === '/' && nextChar === '*') {
-      inBlockComment = true;
-      current += char + nextChar;
-      i += 2;
-      continue;
-    }
-
-    if (inBlockComment && char === '*' && nextChar === '/') {
-      inBlockComment = false;
-      current += char + nextChar;
-      i += 2;
-      continue;
-    }
-
-    // Handle string literals
-    if (!inLineComment && !inBlockComment && (char === "'" || char === '"')) {
-      if (!inString) {
-        inString = true;
-        stringChar = char;
-      } else if (char === stringChar) {
-        if (nextChar === stringChar) {
-          current += char + nextChar;
-          i += 2;
-          continue;
-        }
-        inString = false;
-        stringChar = '';
-      }
-    }
-
-    // Handle dollar-quoted strings (PostgreSQL specific)
-    if (!inString && !inLineComment && !inBlockComment && char === '$') {
-      const dollarMatch = sql.slice(i).match(/^(\$[a-zA-Z0-9_]*\$)/);
-      if (dollarMatch) {
-        const dollarTag = dollarMatch[1];
-        const endIndex = sql.indexOf(dollarTag, i + dollarTag.length);
-        if (endIndex !== -1) {
-          const dollarContent = sql.slice(i, endIndex + dollarTag.length);
-          // Count newlines in dollar-quoted content
-          const newlines = (dollarContent.match(/\n/g) || []).length;
-          currentLineNumber += newlines;
-          current += dollarContent;
-          i = endIndex + dollarTag.length;
-          continue;
-        }
-      }
-    }
-
-    // Handle statement separator
-    if (!inString && !inLineComment && !inBlockComment && char === ';') {
-      current += char;
-      const trimmed = current.trim();
-      if (trimmed) {
-        statements.push({ sql: trimmed, lineNumber: statementStartLine });
-      }
-      current = '';
-      statementStartLine = currentLineNumber;
-      i++;
-      continue;
-    }
-
-    current += char;
-    i++;
-  }
-
-  // Add remaining content if any
-  const trimmed = current.trim();
-  if (trimmed) {
-    statements.push({ sql: trimmed, lineNumber: statementStartLine });
-  }
-
-  return statements;
-}
-
-/**
- * Extracts table names from a SQL query.
- * Handles common patterns: FROM, JOIN, INTO, UPDATE, DELETE FROM
- */
-function extractTablesFromSql(sql: string): Array<{ schema: string; table: string }> {
-  const tables: Array<{ schema: string; table: string }> = [];
-  const seen = new Set<string>();
-
-  // Normalize SQL: remove comments and extra whitespace
-  const normalized = sql
-    .replace(/--[^\n]*/g, '') // Remove line comments
-    .replace(/\/\*[\s\S]*?\*\//g, '') // Remove block comments
-    .replace(/\s+/g, ' ') // Normalize whitespace
-    .trim();
-
-  // Patterns to find table references
-  const patterns = [
-    /\bFROM\s+(["`]?[\w]+["`]?(?:\s*\.\s*["`]?[\w]+["`]?)?)/gi,
-    /\bJOIN\s+(["`]?[\w]+["`]?(?:\s*\.\s*["`]?[\w]+["`]?)?)/gi,
-    /\bINTO\s+(["`]?[\w]+["`]?(?:\s*\.\s*["`]?[\w]+["`]?)?)/gi,
-    /\bUPDATE\s+(["`]?[\w]+["`]?(?:\s*\.\s*["`]?[\w]+["`]?)?)/gi,
-    /\bDELETE\s+FROM\s+(["`]?[\w]+["`]?(?:\s*\.\s*["`]?[\w]+["`]?)?)/gi,
-  ];
-
-  for (const pattern of patterns) {
-    let match;
-    while ((match = pattern.exec(normalized)) !== null) {
-      const tableRef = match[1].replace(/["`]/g, '').trim();
-
-      // Skip common SQL keywords that might be matched
-      if (['SELECT', 'WHERE', 'SET', 'VALUES', 'AND', 'OR'].includes(tableRef.toUpperCase())) {
-        continue;
-      }
-
-      let schema = 'public';
-      let table = tableRef;
-
-      if (tableRef.includes('.')) {
-        const parts = tableRef.split('.');
-        schema = parts[0].trim();
-        table = parts[1].trim();
-      }
-
-      const key = `${schema}.${table}`.toLowerCase();
-      if (!seen.has(key)) {
-        seen.add(key);
-        tables.push({ schema, table });
-      }
-    }
-  }
-
-  return tables;
-}
-
-/**
  * Gets schema hints for tables mentioned in SQL
  */
 async function getSchemaHintForSql(sql: string, override?: ConnectionOverride): Promise<SchemaHint> {
@@ -1567,7 +1177,7 @@ async function getSchemaHintForSql(sql: string, override?: ConnectionOverride): 
   if (override) {
     const { client, release } = await dbManager.getClientWithOverride(override);
     try {
-      for (const { schema, table } of tables.slice(0, 10)) {
+      for (const { schema, table } of tables.slice(0, MAX_TABLES_TO_ANALYZE)) {
         try {
           const columnsResult = await client.query(`
             SELECT
@@ -1654,7 +1264,7 @@ async function getSchemaHintForSql(sql: string, override?: ConnectionOverride): 
   }
 
   // Default path: use main connection
-  for (const { schema, table } of tables.slice(0, 10)) { // Limit to 10 tables
+  for (const { schema, table } of tables.slice(0, MAX_TABLES_TO_ANALYZE)) { // Limit to 10 tables
     try {
       // Get columns
       const columnsResult = await dbManager.query(`
@@ -1761,11 +1371,11 @@ export async function mutationPreview(args: {
   }
 
   const sql = args.sql.trim();
-  const sampleSize = Math.min(args.sampleSize || 5, 20); // Default 5, max 20
+  const sampleSize = Math.min(args.sampleSize || DEFAULT_MUTATION_SAMPLE_SIZE, MAX_MUTATION_SAMPLE_SIZE);
 
   // Detect mutation type
   const upperSql = sql.toUpperCase();
-  let mutationType: 'INSERT' | 'UPDATE' | 'DELETE' | 'UNKNOWN' = 'UNKNOWN';
+  let mutationType: 'INSERT' | 'UPDATE' | 'DELETE';
 
   if (upperSql.startsWith('UPDATE')) {
     mutationType = 'UPDATE';
@@ -1803,18 +1413,23 @@ export async function mutationPreview(args: {
   let targetTable: string | undefined;
   let whereClause: string | undefined;
 
+  // Extract WHERE clause using string search (avoids regex backtracking)
+  const whereIdx = sql.toUpperCase().lastIndexOf('WHERE');
+  if (whereIdx !== -1) {
+    whereClause = sql.substring(whereIdx + 5).trim();
+  }
+
+  const updatePattern = /UPDATE\s+(["`]?\w[\w.]*["`]?)\s+SET/i;
+  const deletePattern = /DELETE\s+FROM\s+(["`]?\w[\w.]*["`]?)/i;
+
   if (mutationType === 'UPDATE') {
     // Pattern: UPDATE table SET ... WHERE ...
-    const updateMatch = sql.match(/UPDATE\s+(["`]?[\w.]+["`]?)\s+SET/i);
-    const whereMatch = sql.match(/\bWHERE\s+(.+)$/is);
+    const updateMatch = updatePattern.exec(sql);
     targetTable = updateMatch?.[1]?.replace(/["`]/g, '');
-    whereClause = whereMatch?.[1];
   } else if (mutationType === 'DELETE') {
     // Pattern: DELETE FROM table WHERE ...
-    const deleteMatch = sql.match(/DELETE\s+FROM\s+(["`]?[\w.]+["`]?)/i);
-    const whereMatch = sql.match(/\bWHERE\s+(.+)$/is);
+    const deleteMatch = deletePattern.exec(sql);
     targetTable = deleteMatch?.[1]?.replace(/["`]/g, '');
-    whereClause = whereMatch?.[1];
   }
 
   if (!targetTable) {
@@ -1828,7 +1443,8 @@ export async function mutationPreview(args: {
     const plan = explainResult.rows[0]['QUERY PLAN'][0];
     estimatedRowsAffected = plan?.Plan?.['Plan Rows'] || 0;
   } catch (error) {
-    // EXPLAIN might fail, continue with count query
+    // EXPLAIN might fail for complex queries, continue with count query
+    console.debug('Could not get EXPLAIN plan:', error);
   }
 
   // Build SELECT query to get sample of affected rows
@@ -1892,17 +1508,21 @@ export async function mutationDryRun(args: {
   }
 
   const sql = args.sql.trim();
-  const sampleSize = Math.min(args.sampleSize || MAX_DRY_RUN_SAMPLE_ROWS, 20);
+  const sampleSize = Math.min(args.sampleSize || MAX_DRY_RUN_SAMPLE_ROWS, MAX_MUTATION_SAMPLE_SIZE);
 
   // Detect mutation type
   const upperSql = sql.toUpperCase();
-  let mutationType: 'INSERT' | 'UPDATE' | 'DELETE' | 'UNKNOWN' = 'UNKNOWN';
+  let mutationType: 'INSERT' | 'UPDATE' | 'DELETE';
 
-  if (upperSql.startsWith('UPDATE') || upperSql.match(/^WITH\b.*\bUPDATE\b/s)) {
+  const withUpdatePattern = /^WITH\b.*\bUPDATE\b/s;
+  const withDeletePattern = /^WITH\b.*\bDELETE\b/s;
+  const withInsertPattern = /^WITH\b.*\bINSERT\b/s;
+
+  if (upperSql.startsWith('UPDATE') || withUpdatePattern.test(upperSql)) {
     mutationType = 'UPDATE';
-  } else if (upperSql.startsWith('DELETE') || upperSql.match(/^WITH\b.*\bDELETE\b/s)) {
+  } else if (upperSql.startsWith('DELETE') || withDeletePattern.test(upperSql)) {
     mutationType = 'DELETE';
-  } else if (upperSql.startsWith('INSERT') || upperSql.match(/^WITH\b.*\bINSERT\b/s)) {
+  } else if (upperSql.startsWith('INSERT') || withInsertPattern.test(upperSql)) {
     mutationType = 'INSERT';
   } else {
     throw new Error('SQL must be an INSERT, UPDATE, or DELETE statement');
@@ -1951,18 +1571,27 @@ export async function mutationDryRun(args: {
   let targetTable: string | undefined;
   let whereClause: string | undefined;
 
+  // Extract WHERE clause using string search (avoids regex backtracking)
+  const upperSqlForWhere = sql.toUpperCase();
+  const whereIdx = upperSqlForWhere.lastIndexOf('WHERE');
+  if (whereIdx !== -1) {
+    let endIdx = upperSqlForWhere.indexOf('RETURNING', whereIdx);
+    if (endIdx === -1) endIdx = sql.length;
+    whereClause = sql.substring(whereIdx + 5, endIdx).trim();
+  }
+
+  const updateTablePattern = /UPDATE\s+(["`]?\w[\w.]*["`]?)\s+SET/i;
+  const deleteTablePattern = /DELETE\s+FROM\s+(["`]?\w[\w.]*["`]?)/i;
+  const insertTablePattern = /INSERT\s+INTO\s+(["`]?\w[\w.]*["`]?)/i;
+
   if (mutationType === 'UPDATE') {
-    const updateMatch = sql.match(/UPDATE\s+(["`]?[\w.]+["`]?)\s+SET/i);
-    const whereMatch = sql.match(/\bWHERE\s+(.+?)(?:RETURNING|$)/is);
+    const updateMatch = updateTablePattern.exec(sql);
     targetTable = updateMatch?.[1]?.replace(/["`]/g, '');
-    whereClause = whereMatch?.[1]?.trim();
   } else if (mutationType === 'DELETE') {
-    const deleteMatch = sql.match(/DELETE\s+FROM\s+(["`]?[\w.]+["`]?)/i);
-    const whereMatch = sql.match(/\bWHERE\s+(.+?)(?:RETURNING|$)/is);
+    const deleteMatch = deleteTablePattern.exec(sql);
     targetTable = deleteMatch?.[1]?.replace(/["`]/g, '');
-    whereClause = whereMatch?.[1]?.trim();
   } else if (mutationType === 'INSERT') {
-    const insertMatch = sql.match(/INSERT\s+INTO\s+(["`]?[\w.]+["`]?)/i);
+    const insertMatch = insertTablePattern.exec(sql);
     targetTable = insertMatch?.[1]?.replace(/["`]/g, '');
   }
 
@@ -1977,7 +1606,7 @@ export async function mutationDryRun(args: {
     client = await dbManager.getClient();
   }
 
-  const startTime = process.hrtime.bigint();
+  const startTime = getStartTime();
 
   let beforeRows: any[] | undefined;
   let affectedRows: any[] = [];
@@ -2064,14 +1693,13 @@ export async function mutationDryRun(args: {
     }
   }
 
-  const endTime = process.hrtime.bigint();
-  const executionTimeMs = Number(endTime - startTime) / 1_000_000;
+  const executionTimeMs = calculateExecutionTime(startTime, getStartTime());
 
   const result: MutationDryRunResult = {
     mutationType,
     success,
     rowsAffected,
-    executionTimeMs: Math.round(executionTimeMs * 100) / 100
+    executionTimeMs
   };
 
   if (beforeRows && beforeRows.length > 0) {
@@ -2127,8 +1755,8 @@ export async function batchExecute(args: {
     throw new Error('queries array cannot be empty');
   }
 
-  if (args.queries.length > 20) {
-    throw new Error('Maximum 20 queries allowed in a batch');
+  if (args.queries.length > MAX_BATCH_QUERIES) {
+    throw new Error(`Maximum ${MAX_BATCH_QUERIES} queries allowed in a batch`);
   }
 
   // Validate each query
@@ -2148,7 +1776,7 @@ export async function batchExecute(args: {
 
   const dbManager = getDbManager();
   const stopOnError = args.stopOnError === true; // Default false
-  const startTime = process.hrtime.bigint();
+  const startTime = getStartTime();
 
   // Build connection override if specified
   const hasOverride = args.server || args.database || args.schema;
@@ -2162,12 +1790,11 @@ export async function batchExecute(args: {
 
   // Execute all queries in parallel
   const promises = args.queries.map(async (query) => {
-    const queryStartTime = process.hrtime.bigint();
+    const queryStartTime = getStartTime();
 
     try {
       const result = await dbManager.queryWithOverride(query.sql, query.params, override);
-      const queryEndTime = process.hrtime.bigint();
-      const executionTimeMs = Number(queryEndTime - queryStartTime) / 1_000_000;
+      const executionTimeMs = calculateExecutionTime(queryStartTime, getStartTime());
 
       return {
         name: query.name,
@@ -2175,19 +1802,18 @@ export async function batchExecute(args: {
           success: true,
           rows: result.rows,
           rowCount: result.rowCount ?? result.rows.length,
-          executionTimeMs: Math.round(executionTimeMs * 100) / 100
+          executionTimeMs
         } as BatchQueryResult
       };
     } catch (error) {
-      const queryEndTime = process.hrtime.bigint();
-      const executionTimeMs = Number(queryEndTime - queryStartTime) / 1_000_000;
+      const executionTimeMs = calculateExecutionTime(queryStartTime, getStartTime());
 
       return {
         name: query.name,
         result: {
           success: false,
           error: error instanceof Error ? error.message : String(error),
-          executionTimeMs: Math.round(executionTimeMs * 100) / 100
+          executionTimeMs
         } as BatchQueryResult
       };
     }
@@ -2210,14 +1836,13 @@ export async function batchExecute(args: {
     }
   }
 
-  const endTime = process.hrtime.bigint();
-  const totalExecutionTimeMs = Number(endTime - startTime) / 1_000_000;
+  const totalExecutionTimeMs = calculateExecutionTime(startTime, getStartTime());
 
   return {
     totalQueries: args.queries.length,
     successCount,
     failureCount,
-    totalExecutionTimeMs: Math.round(totalExecutionTimeMs * 100) / 100,
+    totalExecutionTimeMs,
     results
   };
 }
@@ -2231,11 +1856,13 @@ export async function beginTransaction(args?: {
   const dbManager = getDbManager();
   const info = await dbManager.beginTransaction(args?.name);
 
+  const namePart = info.name ? ` "${info.name}"` : '';
+
   return {
     transactionId: info.transactionId,
     name: info.name,
     status: 'started',
-    message: `Transaction${info.name ? ` "${info.name}"` : ''} started. Use transactionId "${info.transactionId}" with execute_sql or commit/rollback.`
+    message: `Transaction${namePart} started. Use transactionId "${info.transactionId}" with execute_sql or commit/rollback.`
   };
 }
 

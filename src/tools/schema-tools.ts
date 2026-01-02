@@ -272,6 +272,7 @@ export async function getObjectDetails(args: {
     }
   } catch (error) {
     // Size query might fail for views or non-existent objects
+    console.debug('Could not get object size:', error);
   }
 
   // Get view definition if it's a view - using safe parameterized approach
@@ -289,6 +290,7 @@ export async function getObjectDetails(args: {
       }
     } catch (error) {
       // Might fail if not a view
+      console.debug('Could not get view definition:', error);
     }
   }
 

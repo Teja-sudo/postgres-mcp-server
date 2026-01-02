@@ -75,18 +75,26 @@ async function createTempConnection(serverName: string, config: any): Promise<an
   };
 }
 
+/** SSL configuration object for pg Pool */
+interface SslConfigObject {
+  rejectUnauthorized?: boolean;
+  ca?: string;
+  [key: string]: unknown;
+}
+
 /**
  * Helper to get SSL config for temporary connections.
+ * Returns undefined for disabled SSL, or an SSL config object for enabled SSL.
  */
-function getSslConfigForTemp(ssl: any): boolean | object | undefined {
+function getSslConfigForTemp(ssl: unknown): SslConfigObject | undefined {
   if (ssl === undefined || ssl === false || ssl === 'disable') {
     return undefined;
   }
   if (ssl === true || ssl === 'require' || ssl === 'prefer' || ssl === 'allow') {
     return { rejectUnauthorized: false };
   }
-  if (typeof ssl === 'object') {
-    return ssl;
+  if (typeof ssl === 'object' && ssl !== null) {
+    return ssl as SslConfigObject;
   }
   return undefined;
 }
@@ -220,9 +228,12 @@ export async function switchServerDb(args: {
     await dbManager.switchServer(args.server, args.database, args.schema);
     const connectionInfo = dbManager.getConnectionInfo();
 
+    const dbPart = args.database ? `, database '${args.database}'` : '';
+    const schemaPart = args.schema ? `, schema '${args.schema}'` : '';
+
     return {
       success: true,
-      message: `Successfully connected to server '${args.server}'${args.database ? `, database '${args.database}'` : ''}${args.schema ? `, schema '${args.schema}'` : ''}`,
+      message: `Successfully connected to server '${args.server}'${dbPart}${schemaPart}`,
       currentServer: connectionInfo.server!,
       currentDatabase: connectionInfo.database!,
       currentSchema: connectionInfo.schema!,

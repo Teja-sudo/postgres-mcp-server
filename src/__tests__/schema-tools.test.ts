@@ -218,5 +218,33 @@ describe('Schema Tools', () => {
 
       expect(result.definition).toBe('SELECT * FROM users');
     });
+
+    it('should handle size query failure gracefully', async () => {
+      mockQuery
+        .mockResolvedValueOnce({ rows: [] }) // columns
+        .mockResolvedValueOnce({ rows: [] }) // constraints
+        .mockResolvedValueOnce({ rows: [] }) // indexes
+        .mockRejectedValueOnce(new Error('Size query failed')); // size query fails
+
+      const result = await getObjectDetails({ schema: 'public', objectName: 'special_view' });
+
+      // Should not throw, just skip size info
+      expect(result.size).toBeUndefined();
+      expect(result.rowCount).toBeUndefined();
+    });
+
+    it('should handle view definition query failure gracefully', async () => {
+      mockQuery
+        .mockResolvedValueOnce({ rows: [] }) // columns
+        .mockResolvedValueOnce({ rows: [] }) // constraints
+        .mockResolvedValueOnce({ rows: [] }) // indexes
+        .mockResolvedValueOnce({ rows: [] }) // size
+        .mockRejectedValueOnce(new Error('View definition failed')); // view def query fails
+
+      const result = await getObjectDetails({ schema: 'public', objectName: 'broken_view', objectType: 'view' });
+
+      // Should not throw, just skip definition
+      expect(result.definition).toBeUndefined();
+    });
   });
 });

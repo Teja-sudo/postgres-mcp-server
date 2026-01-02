@@ -11,12 +11,20 @@ import {
   ConnectionOverride,
 } from "./types.js";
 import { isReadOnlySql } from "./utils/validation.js";
+import { validateDatabaseName, validateSchemaName } from "./db-manager/validation.js";
 
 const DEFAULT_PORT = "5432";
 const DEFAULT_DATABASE = "postgres";
 const DEFAULT_SCHEMA = "public";
 const DEFAULT_QUERY_TIMEOUT_MS = 30000; // 30 seconds
 const MAX_QUERY_TIMEOUT_MS = 300000; // 5 minutes
+
+/** SSL configuration object for pg Pool */
+interface SslConfigObject {
+  rejectUnauthorized?: boolean;
+  ca?: string;
+  [key: string]: unknown;
+}
 
 // Pool cache configuration
 const MAX_CACHED_POOLS = 10; // Maximum number of cached pools for override connections
@@ -53,23 +61,20 @@ export interface OverrideClientResult {
 
 /**
  * Converts the ServerConfig ssl option to pg Pool ssl config format.
+ * Returns undefined for disabled SSL, or an SSL config object for enabled SSL.
  */
-function getSslConfig(ssl: ServerConfig["ssl"]): boolean | object | undefined {
+function getSslConfig(ssl: ServerConfig["ssl"]): SslConfigObject | undefined {
   if (ssl === undefined || ssl === false || ssl === "disable") {
     return undefined;
   }
 
-  if (ssl === true || ssl === "require") {
+  if (ssl === true || ssl === "require" || ssl === "prefer" || ssl === "allow") {
     // Most cloud providers need rejectUnauthorized: false for self-signed certs
     return { rejectUnauthorized: false };
   }
 
-  if (ssl === "prefer" || ssl === "allow") {
-    return { rejectUnauthorized: false };
-  }
-
   if (typeof ssl === "object") {
-    return ssl;
+    return ssl as SslConfigObject;
   }
 
   return undefined;
@@ -81,17 +86,15 @@ function getSslConfig(ssl: ServerConfig["ssl"]): boolean | object | undefined {
  */
 function getAccessModeFromEnv(): boolean {
   const mode = process.env.POSTGRES_ACCESS_MODE?.toLowerCase().trim();
-  if (mode === "readonly" || mode === "read-only" || mode === "ro") {
-    return true; // read-only mode
-  }
-  // Default is 'full' access (read-only = false)
-  return false;
+  return mode === "readonly" || mode === "read-only" || mode === "ro";
 }
 
 /**
  * Parses SSL configuration from environment variable string.
  * Accepts: "true", "false", "require", "prefer", "allow", "disable", or JSON object
+ * Note: Returns union type intentionally - this is a parser function
  */
+// eslint-disable-next-line sonarjs/function-return-type
 function parseSslFromEnv(sslValue: string | undefined): ServerConfig["ssl"] {
   if (!sslValue) return undefined;
 
@@ -400,16 +403,8 @@ export class DatabaseManager {
     // Use provided database, server's default, or system default
     const dbName = database || serverConfig.defaultDatabase || DEFAULT_DATABASE;
 
-    // Validate database name - allow alphanumeric, underscores, hyphens, but block SQL injection
-    // PostgreSQL allows hyphens in database names when quoted (pg library handles this)
-    if (
-      !/^[a-zA-Z_][a-zA-Z0-9_-]*$/.test(dbName) ||
-      /--|;|'|"|`/.test(dbName)
-    ) {
-      throw new Error(
-        "Invalid database name. Allowed: letters, digits, underscores, hyphens. Cannot contain SQL characters (;, --, quotes)."
-      );
-    }
+    // Validate database name for SQL injection prevention
+    validateDatabaseName(dbName);
 
     const sslConfig = getSslConfig(serverConfig.ssl);
 
@@ -452,11 +447,7 @@ export class DatabaseManager {
   }
 
   public setCurrentSchema(schema: string): void {
-    if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(schema)) {
-      throw new Error(
-        "Invalid schema name. Only alphanumeric characters and underscores are allowed."
-      );
-    }
+    validateSchemaName(schema);
     this.connectionState.currentSchema = schema;
   }
 
@@ -777,12 +768,8 @@ export class DatabaseManager {
       database = serverConfig.defaultDatabase || DEFAULT_DATABASE;
     }
 
-    // Validate database name
-    if (!/^[a-zA-Z_][a-zA-Z0-9_-]*$/.test(database) || /--|;|'|"|`/.test(database)) {
-      throw new Error(
-        "Invalid database name. Allowed: letters, digits, underscores, hyphens. Cannot contain SQL characters."
-      );
-    }
+    // Validate database name for SQL injection prevention
+    validateDatabaseName(database);
 
     // Resolve schema
     let schema: string;
@@ -795,11 +782,7 @@ export class DatabaseManager {
     }
 
     // Validate schema name
-    if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(schema)) {
-      throw new Error(
-        "Invalid schema name. Only alphanumeric characters and underscores are allowed."
-      );
-    }
+    validateSchemaName(schema);
 
     // Check if this is the same as current connection (can use main pool)
     const isSameAsMain =

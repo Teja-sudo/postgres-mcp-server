@@ -359,4 +359,279 @@ describe('Analysis Tools', () => {
       expect((unusedIndexes?.details as any)?.indexes).toHaveLength(1);
     });
   });
+
+  describe('analyzeQueryIndexes - edge cases', () => {
+    it('should handle null or undefined query in array', async () => {
+      mockQuery.mockReset();
+      mockQuery.mockResolvedValue({ rows: [] });
+
+      const result = await analyzeQueryIndexes({
+        queries: [null as any, 'SELECT * FROM users']
+      });
+
+      expect(result.queryAnalysis[0].error).toBe('Invalid query');
+      expect(result.queryAnalysis[1].recommendations).toBeDefined();
+    });
+
+    it('should handle empty EXPLAIN result', async () => {
+      mockQuery.mockReset();
+      mockQuery.mockResolvedValue({ rows: [] });
+
+      const result = await analyzeQueryIndexes({
+        queries: ['SELECT * FROM users']
+      });
+
+      expect(result.queryAnalysis[0].recommendations).toEqual([]);
+    });
+
+    it('should handle malformed QUERY PLAN', async () => {
+      mockQuery.mockReset();
+      mockQuery.mockResolvedValue({
+        rows: [{ 'QUERY PLAN': [null] }]
+      });
+
+      const result = await analyzeQueryIndexes({
+        queries: ['SELECT * FROM users']
+      });
+
+      expect(result.queryAnalysis[0].recommendations).toEqual([]);
+    });
+
+    it('should handle plan without Plan property', async () => {
+      mockQuery.mockReset();
+      mockQuery.mockResolvedValue({
+        rows: [{ 'QUERY PLAN': [{}] }]
+      });
+
+      const result = await analyzeQueryIndexes({
+        queries: ['SELECT * FROM users']
+      });
+
+      expect(result.queryAnalysis[0].recommendations).toEqual([]);
+    });
+
+    it('should generate sort-based index recommendations', async () => {
+      mockQuery.mockResolvedValue({
+        rows: [{
+          'QUERY PLAN': [{
+            Plan: {
+              'Node Type': 'Sort',
+              'Sort Key': ['created_at DESC'],
+              'Relation Name': 'orders',
+              'Plans': [{
+                'Node Type': 'Seq Scan',
+                'Relation Name': 'orders'
+              }]
+            }
+          }]
+        }]
+      });
+
+      const result = await analyzeQueryIndexes({
+        queries: ['SELECT * FROM orders ORDER BY created_at DESC']
+      });
+
+      expect(result.queryAnalysis[0].recommendations.some(
+        (r: any) => r.reason.includes('Sort operation')
+      )).toBe(true);
+    });
+
+    it('should handle nested child plans', async () => {
+      mockQuery.mockReset();
+      mockQuery.mockResolvedValue({
+        rows: [{
+          'QUERY PLAN': [{
+            Plan: {
+              'Node Type': 'Nested Loop',
+              'Plans': [
+                {
+                  'Node Type': 'Seq Scan',
+                  'Relation Name': 'users',
+                  'Filter': '(status = 1)'
+                },
+                {
+                  'Node Type': 'Index Scan',
+                  'Relation Name': 'orders'
+                }
+              ]
+            }
+          }]
+        }]
+      });
+
+      const result = await analyzeQueryIndexes({
+        queries: ['SELECT * FROM users u JOIN orders o ON u.id = o.user_id WHERE u.status = 1']
+      });
+
+      expect(result.queryAnalysis[0].recommendations.some(
+        (r: any) => r.table === 'users'
+      )).toBe(true);
+    });
+  });
+
+  describe('analyzeWorkloadIndexes - edge cases', () => {
+    it('should handle query analysis failure gracefully', async () => {
+      mockQuery.mockReset();
+      mockQuery
+        .mockResolvedValueOnce({ rows: [{ has_extension: true }] })
+        .mockResolvedValueOnce({
+          rows: [{ query: 'SELECT * FROM users', calls: 100, total_time: 5000, mean_time: 50, rows: 1000 }]
+        })
+        .mockRejectedValue(new Error('Query analysis failed'));
+
+      const result = await analyzeWorkloadIndexes({});
+
+      // Should still return queries even if analysis fails
+      expect(result.queries).toBeDefined();
+      expect(result.recommendations).toBeDefined();
+    });
+
+    it('should skip write queries from pg_stat_statements', async () => {
+      mockQuery.mockReset();
+      mockQuery
+        .mockResolvedValueOnce({ rows: [{ has_extension: true }] })
+        .mockResolvedValueOnce({
+          rows: [
+            { query: 'UPDATE users SET name = $1', calls: 100, total_time: 5000, mean_time: 50, rows: 1000 },
+            { query: 'DELETE FROM logs WHERE id = $1', calls: 50, total_time: 3000, mean_time: 60, rows: 500 }
+          ]
+        });
+
+      const result = await analyzeWorkloadIndexes({});
+
+      // Should still return queries but skip the write queries for index recommendations
+      expect(result.queries).toHaveLength(2);
+      expect(result.recommendations).toBeDefined();
+    });
+  });
+
+  describe('analyzeDbHealth - error handling', () => {
+    it('should handle connection health query failure', async () => {
+      mockQuery.mockReset();
+      mockQuery
+        .mockResolvedValueOnce({ rows: [{ heap_read: 100, heap_hit: 900, ratio: 0.9 }] }) // cache OK
+        .mockRejectedValueOnce(new Error('Connection query failed')) // connections fail
+        .mockResolvedValueOnce({ rows: [] }) // invalid indexes
+        .mockResolvedValueOnce({ rows: [] }) // unused indexes
+        .mockResolvedValueOnce({ rows: [] }) // duplicate indexes
+        .mockResolvedValueOnce({ rows: [] }) // vacuum
+        .mockResolvedValueOnce({ rows: [] }) // sequences
+        .mockResolvedValueOnce({ rows: [] }); // constraints
+
+      const result = await analyzeDbHealth();
+
+      const connHealth = result.find((r: any) => r.category === 'Connection Health');
+      expect(connHealth?.status).toBe('warning');
+      expect(connHealth?.message).toContain('Could not check');
+    });
+
+    it('should handle invalid indexes query failure', async () => {
+      mockQuery.mockReset();
+      mockQuery
+        .mockResolvedValueOnce({ rows: [{ heap_read: 100, heap_hit: 900, ratio: 0.9 }] })
+        .mockResolvedValueOnce({ rows: [{ total_connections: 10, active: 5, idle: 5, idle_in_transaction: 0, max_connections: 100 }] })
+        .mockRejectedValueOnce(new Error('Invalid index query failed')) // invalid indexes fail
+        .mockResolvedValueOnce({ rows: [] }) // unused indexes
+        .mockResolvedValueOnce({ rows: [] }) // duplicate indexes
+        .mockResolvedValueOnce({ rows: [] }) // vacuum
+        .mockResolvedValueOnce({ rows: [] }) // sequences
+        .mockResolvedValueOnce({ rows: [] }); // constraints
+
+      const result = await analyzeDbHealth();
+
+      const indexHealth = result.find((r: any) => r.category === 'Invalid Indexes');
+      expect(indexHealth?.status).toBe('healthy'); // Defaults to healthy on error
+    });
+
+    it('should handle unused indexes query failure', async () => {
+      mockQuery.mockReset();
+      mockQuery
+        .mockResolvedValueOnce({ rows: [{ heap_read: 100, heap_hit: 900, ratio: 0.9 }] })
+        .mockResolvedValueOnce({ rows: [{ total_connections: 10, active: 5, idle: 5, idle_in_transaction: 0, max_connections: 100 }] })
+        .mockResolvedValueOnce({ rows: [] }) // invalid indexes
+        .mockRejectedValueOnce(new Error('Unused index query failed')) // unused indexes fail
+        .mockResolvedValueOnce({ rows: [] }) // duplicate indexes
+        .mockResolvedValueOnce({ rows: [] }) // vacuum
+        .mockResolvedValueOnce({ rows: [] }) // sequences
+        .mockResolvedValueOnce({ rows: [] }); // constraints
+
+      const result = await analyzeDbHealth();
+
+      const unusedHealth = result.find((r: any) => r.category === 'Unused Indexes');
+      expect(unusedHealth?.status).toBe('warning');
+      expect(unusedHealth?.message).toContain('Could not check');
+    });
+
+    it('should handle duplicate indexes query failure', async () => {
+      mockQuery.mockReset();
+      mockQuery
+        .mockResolvedValueOnce({ rows: [{ heap_read: 100, heap_hit: 900, ratio: 0.9 }] })
+        .mockResolvedValueOnce({ rows: [{ total_connections: 10, active: 5, idle: 5, idle_in_transaction: 0, max_connections: 100 }] })
+        .mockResolvedValueOnce({ rows: [] }) // invalid indexes
+        .mockResolvedValueOnce({ rows: [] }) // unused indexes
+        .mockRejectedValueOnce(new Error('Duplicate index query failed')) // duplicate indexes fail
+        .mockResolvedValueOnce({ rows: [] }) // vacuum
+        .mockResolvedValueOnce({ rows: [] }) // sequences
+        .mockResolvedValueOnce({ rows: [] }); // constraints
+
+      const result = await analyzeDbHealth();
+
+      const dupHealth = result.find((r: any) => r.category === 'Duplicate Indexes');
+      expect(dupHealth?.status).toBe('healthy'); // Defaults to healthy on error
+    });
+
+    it('should handle vacuum health query failure', async () => {
+      mockQuery.mockReset();
+      mockQuery
+        .mockResolvedValueOnce({ rows: [{ heap_read: 100, heap_hit: 900, ratio: 0.9 }] })
+        .mockResolvedValueOnce({ rows: [{ total_connections: 10, active: 5, idle: 5, idle_in_transaction: 0, max_connections: 100 }] })
+        .mockResolvedValueOnce({ rows: [] }) // invalid indexes
+        .mockResolvedValueOnce({ rows: [] }) // unused indexes
+        .mockResolvedValueOnce({ rows: [] }) // duplicate indexes
+        .mockRejectedValueOnce(new Error('Vacuum query failed')) // vacuum fail
+        .mockResolvedValueOnce({ rows: [] }) // sequences
+        .mockResolvedValueOnce({ rows: [] }); // constraints
+
+      const result = await analyzeDbHealth();
+
+      const vacuumHealth = result.find((r: any) => r.category === 'Vacuum Health');
+      expect(vacuumHealth).toBeDefined();
+    });
+
+    it('should handle sequence limits query failure', async () => {
+      mockQuery.mockReset();
+      mockQuery
+        .mockResolvedValueOnce({ rows: [{ heap_read: 100, heap_hit: 900, ratio: 0.9 }] })
+        .mockResolvedValueOnce({ rows: [{ total_connections: 10, active: 5, idle: 5, idle_in_transaction: 0, max_connections: 100 }] })
+        .mockResolvedValueOnce({ rows: [] }) // invalid indexes
+        .mockResolvedValueOnce({ rows: [] }) // unused indexes
+        .mockResolvedValueOnce({ rows: [] }) // duplicate indexes
+        .mockResolvedValueOnce({ rows: [] }) // vacuum
+        .mockRejectedValueOnce(new Error('Sequence query failed')) // sequences fail
+        .mockResolvedValueOnce({ rows: [] }); // constraints
+
+      const result = await analyzeDbHealth();
+
+      const seqHealth = result.find((r: any) => r.category === 'Sequence Limits');
+      expect(seqHealth).toBeDefined();
+    });
+
+    it('should handle constraint validation query failure', async () => {
+      mockQuery.mockReset();
+      mockQuery
+        .mockResolvedValueOnce({ rows: [{ heap_read: 100, heap_hit: 900, ratio: 0.9 }] })
+        .mockResolvedValueOnce({ rows: [{ total_connections: 10, active: 5, idle: 5, idle_in_transaction: 0, max_connections: 100 }] })
+        .mockResolvedValueOnce({ rows: [] }) // invalid indexes
+        .mockResolvedValueOnce({ rows: [] }) // unused indexes
+        .mockResolvedValueOnce({ rows: [] }) // duplicate indexes
+        .mockResolvedValueOnce({ rows: [] }) // vacuum
+        .mockResolvedValueOnce({ rows: [] }) // sequences
+        .mockRejectedValueOnce(new Error('Constraint query failed')); // constraints fail
+
+      const result = await analyzeDbHealth();
+
+      const constraintHealth = result.find((r: any) => r.category === 'Constraint Validation');
+      expect(constraintHealth).toBeDefined();
+    });
+  });
 });

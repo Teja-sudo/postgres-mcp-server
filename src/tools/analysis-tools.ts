@@ -53,7 +53,8 @@ export async function getTopQueries(args: {
     const result = await dbManager.query<SlowQuery>(query, [minCalls, limit]);
     return result.rows;
   } catch (error) {
-    // Try older column names (PostgreSQL < 13)
+    // PostgreSQL < 13 uses different column names, try legacy format
+    console.debug('Falling back to legacy pg_stat_statements columns:', error);
     const legacyOrderColumnMap: Record<string, string> = {
       'total_time': 'total_time',
       'mean_time': 'mean_time',
@@ -101,7 +102,8 @@ export async function analyzeWorkloadIndexes(args: {
       const queryRecs = await analyzeQueryForIndexes(query.query);
       recommendations.push(...queryRecs);
     } catch (error) {
-      // Skip queries that fail analysis
+      // Some queries may fail analysis (e.g., DDL, complex CTEs)
+      console.debug('Skipping query analysis:', error);
       continue;
     }
   }
@@ -182,52 +184,47 @@ async function analyzeQueryForIndexes(query: string): Promise<IndexRecommendatio
     throw new Error(`Cannot analyze write query: ${reason}`);
   }
 
-  try {
-    // Get the execution plan - EXPLAIN without ANALYZE is safe
-    const explainResult = await dbManager.query(`EXPLAIN (FORMAT JSON) ${query}`);
+  // Get the execution plan - EXPLAIN without ANALYZE is safe
+  const explainResult = await dbManager.query(`EXPLAIN (FORMAT JSON) ${query}`);
 
-    if (!explainResult.rows.length || !explainResult.rows[0]['QUERY PLAN']) {
-      return recommendations;
-    }
+  if (!explainResult.rows.length || !explainResult.rows[0]['QUERY PLAN']) {
+    return recommendations;
+  }
 
-    const plan = explainResult.rows[0]['QUERY PLAN'][0];
+  const plan = explainResult.rows[0]['QUERY PLAN'][0];
 
-    if (!plan || !plan.Plan) {
-      return recommendations;
-    }
+  if (!plan || !plan.Plan) {
+    return recommendations;
+  }
 
-    // Analyze the plan for sequential scans on large tables
-    const seqScans = findSequentialScans(plan.Plan);
+  // Analyze the plan for sequential scans on large tables
+  const seqScans = findSequentialScans(plan.Plan);
 
-    for (const scan of seqScans) {
-      // Check if there's a filter condition that could benefit from an index
-      if (scan.filter && scan.table) {
-        const columns = extractColumnsFromFilter(scan.filter);
-        if (columns.length > 0) {
-          recommendations.push({
-            table: scan.table,
-            columns,
-            index_type: 'btree',
-            reason: `Sequential scan with filter on ${columns.join(', ')}. Estimated cost: ${scan.cost || 'unknown'}`,
-            estimated_improvement: 'Could significantly reduce query time for filtered queries'
-          });
-        }
-      }
-
-      // Check for sort operations that could use indexes
-      if (scan.sortKey && scan.table) {
+  for (const scan of seqScans) {
+    // Check if there's a filter condition that could benefit from an index
+    if (scan.filter && scan.table) {
+      const columns = extractColumnsFromFilter(scan.filter);
+      if (columns.length > 0) {
         recommendations.push({
           table: scan.table,
-          columns: [scan.sortKey],
+          columns,
           index_type: 'btree',
-          reason: `Sort operation on ${scan.sortKey}`,
-          estimated_improvement: 'Could eliminate sorting overhead'
+          reason: `Sequential scan with filter on ${columns.join(', ')}. Estimated cost: ${scan.cost || 'unknown'}`,
+          estimated_improvement: 'Could significantly reduce query time for filtered queries'
         });
       }
     }
-  } catch (error) {
-    // Query analysis failed, skip this query
-    throw error;
+
+    // Check for sort operations that could use indexes
+    if (scan.sortKey && scan.table) {
+      recommendations.push({
+        table: scan.table,
+        columns: [scan.sortKey],
+        index_type: 'btree',
+        reason: `Sort operation on ${scan.sortKey}`,
+        estimated_improvement: 'Could eliminate sorting overhead'
+      });
+    }
   }
 
   return recommendations;
@@ -247,8 +244,13 @@ function findSequentialScans(node: any, scans: any[] = []): any[] {
 
   if (node['Sort Key'] && Array.isArray(node['Sort Key']) && node['Sort Key'].length > 0) {
     const sortKey = String(node['Sort Key'][0]);
-    // Clean up the sort key to extract column name
-    const cleanSortKey = sortKey.replace(/\s+(ASC|DESC|NULLS\s+(FIRST|LAST))/gi, '').trim();
+    // Clean up the sort key by removing ORDER BY modifiers
+    const orderModifiers = new Set(['ASC', 'DESC', 'NULLS', 'FIRST', 'LAST']);
+    const cleanSortKey = sortKey
+      .split(/\s+/)
+      .filter(word => !orderModifiers.has(word.toUpperCase()))
+      .join(' ')
+      .trim();
 
     if (cleanSortKey && node['Relation Name']) {
       scans.push({
@@ -276,15 +278,14 @@ function extractColumnsFromFilter(filter: string): string[] {
   const columns: string[] = [];
 
   // Match patterns like (column_name = ...) or (column_name > ...)
-  const matches = filter.match(/\((\w+)\s*[=<>!]+/g);
-  if (matches) {
-    for (const match of matches) {
-      const col = match.match(/\((\w+)/);
-      if (col && col[1]) {
-        // Basic validation - only alphanumeric and underscore
-        if (/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(col[1])) {
-          columns.push(col[1]);
-        }
+  const filterRegex = /\((\w+)\s*[=<>!]+/g;
+  let match;
+  while ((match = filterRegex.exec(filter)) !== null) {
+    const colMatch = /\((\w+)/.exec(match[0]);
+    if (colMatch && colMatch[1]) {
+      // Basic validation - only alphanumeric and underscore
+      if (/^[a-zA-Z_]\w*$/.test(colMatch[1])) {
+        columns.push(colMatch[1]);
       }
     }
   }
@@ -298,7 +299,7 @@ function deduplicateRecommendations(recommendations: IndexRecommendation[]): Ind
   for (const rec of recommendations) {
     if (!rec.table || !rec.columns || !Array.isArray(rec.columns)) continue;
 
-    const key = `${rec.table}:${[...rec.columns].sort().join(',')}:${rec.index_type}`;
+    const key = `${rec.table}:${[...rec.columns].sort((a, b) => a.localeCompare(b)).join(',')}:${rec.index_type}`;
     if (!seen.has(key)) {
       seen.set(key, rec);
     }
@@ -414,6 +415,7 @@ export async function analyzeDbHealth(): Promise<HealthCheckResult[]> {
       details: indexResult.rows.length > 0 ? { indexes: indexResult.rows } : undefined
     });
   } catch (error) {
+    console.debug('Could not check invalid indexes:', error);
     results.push({
       category: 'Invalid Indexes',
       status: 'healthy',
@@ -480,6 +482,7 @@ export async function analyzeDbHealth(): Promise<HealthCheckResult[]> {
       details: dupResult.rows.length > 0 ? { duplicates: dupResult.rows } : undefined
     });
   } catch (error) {
+    console.debug('Could not check duplicate indexes:', error);
     results.push({
       category: 'Duplicate Indexes',
       status: 'healthy',
@@ -556,6 +559,7 @@ export async function analyzeDbHealth(): Promise<HealthCheckResult[]> {
       details: seqResult.rows.length > 0 ? { sequences: seqResult.rows } : undefined
     });
   } catch (error) {
+    console.debug('Could not check sequence limits:', error);
     results.push({
       category: 'Sequence Limits',
       status: 'healthy',
@@ -583,6 +587,7 @@ export async function analyzeDbHealth(): Promise<HealthCheckResult[]> {
       details: constraintResult.rows.length > 0 ? { constraints: constraintResult.rows } : undefined
     });
   } catch (error) {
+    console.debug('Could not check constraint validation:', error);
     results.push({
       category: 'Constraint Validation',
       status: 'healthy',
