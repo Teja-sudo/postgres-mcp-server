@@ -150,12 +150,15 @@ export POSTGRES_SERVERS='{
 
 **Note:** If both formats are used, individual `PG_*` variables take precedence over `POSTGRES_SERVERS`.
 
-#### POSTGRES_ACCESS_MODE (optional)
+#### Access Mode Configuration
 
-Controls whether write operations are allowed:
+Access modes control whether write operations are allowed. You can configure access at three levels with the following priority:
 
-- `full` (default): Full access - allows all SQL operations including INSERT, UPDATE, DELETE, CREATE, DROP, etc.
-- `readonly` / `read-only` / `ro`: Read-only mode - only SELECT and other read operations are allowed
+**Priority:** Database-level > Server-level > Global > default (full)
+
+##### Global Access Mode (POSTGRES_ACCESS_MODE)
+
+Sets the default access mode for all servers and databases:
 
 ```bash
 # For read-only access (recommended for production)
@@ -163,6 +166,59 @@ export POSTGRES_ACCESS_MODE="readonly"
 
 # For full access (use with caution)
 export POSTGRES_ACCESS_MODE="full"
+```
+
+**Supported values:**
+- `full` / `rw` / `readwrite`: Full access - allows all SQL operations
+- `readonly` / `ro` / `read-only`: Read-only mode - only SELECT and read operations allowed
+
+##### Server-Level Access Mode (PG_ACCESS_MODE_*)
+
+Override global access mode for specific servers:
+
+```bash
+# Server 1: read-only (production)
+export PG_ACCESS_MODE_1="readonly"
+
+# Server 2: full access (development)
+export PG_ACCESS_MODE_DEV="full"
+```
+
+##### Database-Level Access Mode (PG_DB_ACCESS_MODES_*)
+
+Override server access mode for specific databases. Format: `dbname:mode,dbname:mode`
+
+```bash
+# For server 1: production db is readonly, analytics has full access
+export PG_DB_ACCESS_MODES_1="production:readonly,analytics:full,staging:rw"
+
+# For server PROD: specific database overrides
+export PG_DB_ACCESS_MODES_PROD="users_db:ro,logs:readonly,dev_db:full"
+```
+
+##### JSON Configuration (POSTGRES_SERVERS)
+
+Access modes can also be configured in the JSON format:
+
+```json
+{
+  "production": {
+    "host": "prod.example.com",
+    "username": "user",
+    "password": "pass",
+    "accessMode": "readonly",
+    "databaseAccessModes": {
+      "analytics": "full",
+      "reporting": "readonly"
+    }
+  },
+  "development": {
+    "host": "dev.example.com",
+    "username": "user",
+    "password": "pass",
+    "accessMode": "full"
+  }
+}
 ```
 
 ### Claude Desktop Configuration
@@ -176,15 +232,16 @@ Add the server to your Claude Desktop MCP configuration (`claude_desktop_config.
       "command": "npx",
       "args": ["@tejasanik/postgres-mcp-server"],
       "env": {
-        "PG_NAME_1": "dev",
-        "PG_HOST_1": "your-host.com",
+        "PG_NAME_1": "prod",
+        "PG_HOST_1": "prod.example.com",
         "PG_PORT_1": "5432",
         "PG_USERNAME_1": "user",
         "PG_PASSWORD_1": "pass",
         "PG_DATABASE_1": "mydb",
         "PG_SSL_1": "true",
         "PG_DEFAULT_1": "true",
-        "POSTGRES_ACCESS_MODE": "readonly"
+        "PG_ACCESS_MODE_1": "readonly",
+        "PG_DB_ACCESS_MODES_1": "analytics:full,staging:rw"
       }
     }
   }
@@ -200,20 +257,22 @@ claude mcp add-json postgres_dbs --scope user '{
   "command": "npx",
   "args": ["-y","@tejasanik/postgres-mcp-server"],
   "env": {
-    "PG_NAME_1": "dev",
-    "PG_HOST_1": "dev.example.com",
+    "PG_NAME_1": "prod",
+    "PG_HOST_1": "prod.example.com",
     "PG_PORT_1": "5432",
     "PG_USERNAME_1": "user",
     "PG_PASSWORD_1": "pass",
     "PG_DATABASE_1": "mydb",
     "PG_SSL_1": "true",
     "PG_DEFAULT_1": "true",
-    "PG_NAME_2": "staging",
-    "PG_HOST_2": "staging.example.com",
+    "PG_ACCESS_MODE_1": "readonly",
+    "PG_DB_ACCESS_MODES_1": "analytics:full",
+    "PG_NAME_2": "dev",
+    "PG_HOST_2": "dev.example.com",
     "PG_USERNAME_2": "user",
     "PG_PASSWORD_2": "pass",
     "PG_SSL_2": "true",
-    "POSTGRES_ACCESS_MODE": "readonly"
+    "PG_ACCESS_MODE_2": "full"
   }
 }'
 ```
@@ -955,7 +1014,7 @@ When `execute_sql_file` or multi-statement execution encounters errors, line num
 
 ## Security
 
-- **Access Mode**: By default, the server runs in **full access mode**. Set `POSTGRES_ACCESS_MODE=readonly` to prevent write operations (INSERT, UPDATE, DELETE, DROP, etc.). Recommended for production environments.
+- **Access Mode**: By default, the server runs in **full access mode**. Configure access at global (`POSTGRES_ACCESS_MODE`), server (`PG_ACCESS_MODE_*`), or database (`PG_DB_ACCESS_MODES_*`) levels. Database-level settings override server-level, which override global. Recommended: set production servers/databases to `readonly`.
 - **SQL Injection Protection**: All user inputs are validated and parameterized queries are used where possible.
 - **Query Timeout**: Default 30-second timeout prevents runaway queries.
 - **Credentials**: Managed via environment variables and never logged or exposed through the MCP interface.

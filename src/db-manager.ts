@@ -1,6 +1,7 @@
 import { Pool, PoolClient, QueryResult, QueryResultRow } from "pg";
 import { v4 as uuidv4 } from "uuid";
 import {
+  AccessMode,
   ServerConfig,
   ServersConfig,
   ConnectionState,
@@ -93,12 +94,77 @@ function getSslConfig(ssl: ServerConfig["ssl"]): SslConfigObject | undefined {
 }
 
 /**
- * Determines the access mode from environment variable.
+ * Parses access mode from a string value.
+ * Accepts: 'readonly', 'read-only', 'ro' for readonly mode
+ *          'full', 'readwrite', 'read-write', 'rw' for full mode
+ * Returns undefined if the value is not a valid access mode.
+ */
+function parseAccessMode(value: string | undefined): AccessMode | undefined {
+  if (!value) return undefined;
+  const mode = value.toLowerCase().trim();
+  if (mode === "readonly" || mode === "read-only" || mode === "ro") {
+    return "readonly";
+  }
+  if (mode === "full" || mode === "readwrite" || mode === "read-write" || mode === "rw") {
+    return "full";
+  }
+  return undefined;
+}
+
+/**
+ * Parses database access modes from a comma-separated string.
+ * Format: "dbname:readonly,otherdb:full" or "mydb:ro,staging:rw"
+ * Supported mode values: readonly, read-only, ro, full, readwrite, read-write, rw
+ */
+function parseDatabaseAccessModes(
+  value: string | undefined
+): { [databaseName: string]: AccessMode } | undefined {
+  if (!value) return undefined;
+
+  const result: { [databaseName: string]: AccessMode } = {};
+  const pairs = value.split(",");
+
+  for (const pair of pairs) {
+    const trimmed = pair.trim();
+    if (!trimmed) continue;
+
+    const colonIndex = trimmed.lastIndexOf(":");
+    if (colonIndex === -1) {
+      console.error(
+        `Warning: Invalid database access mode format '${trimmed}', expected 'dbname:mode'`
+      );
+      continue;
+    }
+
+    const dbName = trimmed.substring(0, colonIndex).trim();
+    const modeStr = trimmed.substring(colonIndex + 1).trim();
+
+    if (!dbName) {
+      console.error(`Warning: Empty database name in '${trimmed}'`);
+      continue;
+    }
+
+    const parsedMode = parseAccessMode(modeStr);
+    if (parsedMode) {
+      result[dbName] = parsedMode;
+    } else {
+      console.error(
+        `Warning: Invalid access mode '${modeStr}' for database '${dbName}', ` +
+          `expected: readonly, ro, full, rw`
+      );
+    }
+  }
+
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
+/**
+ * Determines the global access mode from environment variable.
  * POSTGRES_ACCESS_MODE can be 'readonly' or 'full' (default).
  */
-function getAccessModeFromEnv(): boolean {
-  const mode = process.env.POSTGRES_ACCESS_MODE?.toLowerCase().trim();
-  return mode === "readonly" || mode === "read-only" || mode === "ro";
+function getGlobalAccessModeFromEnv(): boolean {
+  const mode = parseAccessMode(process.env.POSTGRES_ACCESS_MODE);
+  return mode === "readonly";
 }
 
 /**
@@ -136,7 +202,8 @@ function parseSslFromEnv(sslValue: string | undefined): ServerConfig["ssl"] {
 /**
  * Loads server configurations from individual PG_* environment variables.
  * Pattern: PG_NAME_1, PG_HOST_1, PG_PORT_1, PG_USERNAME_1, PG_PASSWORD_1,
- *          PG_DATABASE_1, PG_SCHEMA_1, PG_SSL_1, PG_DEFAULT_1, PG_CONTEXT_1
+ *          PG_DATABASE_1, PG_SCHEMA_1, PG_SSL_1, PG_DEFAULT_1, PG_CONTEXT_1,
+ *          PG_ACCESS_MODE_1, PG_DB_ACCESS_MODES_1
  */
 function loadServersFromEnvVars(): ServersConfig {
   const servers: ServersConfig = {};
@@ -183,6 +250,10 @@ function loadServersFromEnvVars(): ServersConfig {
       isDefault: process.env[`PG_DEFAULT${suffix}`]?.toLowerCase() === "true",
       ssl: parseSslFromEnv(process.env[`PG_SSL${suffix}`]),
       context: process.env[`PG_CONTEXT${suffix}`],
+      accessMode: parseAccessMode(process.env[`PG_ACCESS_MODE${suffix}`]),
+      databaseAccessModes: parseDatabaseAccessModes(
+        process.env[`PG_DB_ACCESS_MODES${suffix}`]
+      ),
     };
 
     servers[name] = config;
@@ -193,7 +264,7 @@ function loadServersFromEnvVars(): ServersConfig {
 
 /**
  * Loads server configurations from POSTGRES_SERVERS JSON environment variable.
- * (Legacy format for backward compatibility)
+ * Supports accessMode and databaseAccessModes for per-server and per-database access control.
  */
 function loadServersFromJson(): ServersConfig {
   const configEnv = process.env.POSTGRES_SERVERS;
@@ -213,9 +284,53 @@ function loadServersFromJson(): ServersConfig {
       if (!config || typeof config !== "object") {
         throw new Error(`Server '${name}' configuration is invalid`);
       }
-      const serverConfig = config as any;
+      const serverConfig = config as Record<string, unknown>;
       if (!serverConfig.host || typeof serverConfig.host !== "string") {
         throw new Error(`Server '${name}' must have a valid 'host' string`);
+      }
+
+      // Validate accessMode if provided
+      if (serverConfig.accessMode !== undefined) {
+        const validModes = ["full", "readonly"];
+        if (!validModes.includes(serverConfig.accessMode as string)) {
+          console.error(
+            `Warning: Invalid accessMode '${serverConfig.accessMode}' for server '${name}', ` +
+              `must be 'full' or 'readonly'. Using default.`
+          );
+          delete serverConfig.accessMode;
+        }
+      }
+
+      // Validate databaseAccessModes if provided
+      if (serverConfig.databaseAccessModes !== undefined) {
+        // Support both string format ("db:mode,db2:mode") and object format
+        if (typeof serverConfig.databaseAccessModes === "string") {
+          const parsed = parseDatabaseAccessModes(serverConfig.databaseAccessModes);
+          if (parsed) {
+            serverConfig.databaseAccessModes = parsed;
+          } else {
+            delete serverConfig.databaseAccessModes;
+          }
+        } else {
+          const dbModes = serverConfig.databaseAccessModes as Record<string, unknown>;
+          if (typeof dbModes !== "object" || dbModes === null) {
+            console.error(
+              `Warning: Invalid databaseAccessModes for server '${name}', must be an object or string. Ignoring.`
+            );
+            delete serverConfig.databaseAccessModes;
+          } else {
+            const validModes = ["full", "readonly"];
+            for (const [dbName, mode] of Object.entries(dbModes)) {
+              if (!validModes.includes(mode as string)) {
+                console.error(
+                  `Warning: Invalid accessMode '${mode}' for database '${dbName}' on server '${name}', ` +
+                    `must be 'full' or 'readonly'. Ignoring.`
+                );
+                delete dbModes[dbName];
+              }
+            }
+          }
+        }
       }
     }
 
@@ -571,6 +686,7 @@ export class DatabaseManager {
 
   public getConnectionInfo(): ConnectionInfo {
     const currentServer = this.connectionState.currentServer;
+    const currentDatabase = this.connectionState.currentDatabase;
     const serverConfig = currentServer
       ? this.serversConfig[currentServer]
       : null;
@@ -578,9 +694,9 @@ export class DatabaseManager {
     return {
       isConnected: this.isConnected(),
       server: currentServer,
-      database: this.connectionState.currentDatabase,
+      database: currentDatabase,
       schema: this.connectionState.currentSchema,
-      accessMode: this.readOnlyMode ? "readonly" : "full",
+      accessMode: this.getEffectiveAccessMode(currentServer, currentDatabase),
       context: serverConfig?.context,
       user: serverConfig?.username,
     };
@@ -638,7 +754,7 @@ export class DatabaseManager {
     }
 
     // Check for read-only mode violations using improved validation
-    if (this.readOnlyMode) {
+    if (this.isReadOnlyFor()) {
       const { isReadOnly, reason } = isReadOnlySql(sql);
       if (!isReadOnly) {
         throw new Error(`Read-only mode violation: ${reason}`);
@@ -1035,8 +1151,10 @@ export class DatabaseManager {
       throw new Error("SQL query is required and must be a string");
     }
 
-    // Check for read-only mode violations
-    if (this.readOnlyMode) {
+    // Check for read-only mode violations using the target server/database
+    const targetServer = override?.server ?? this.connectionState.currentServer;
+    const targetDatabase = override?.database ?? this.connectionState.currentDatabase;
+    if (this.isReadOnlyFor(targetServer, targetDatabase)) {
       const { isReadOnly, reason } = isReadOnlySql(sql);
       if (!isReadOnly) {
         throw new Error(`Read-only mode violation: ${reason}`);
@@ -1336,12 +1454,61 @@ export class DatabaseManager {
     return false;
   }
 
+  /**
+   * Returns whether global read-only mode is enabled.
+   * For context-aware access mode, use getEffectiveAccessMode().
+   */
   public isReadOnly(): boolean {
     return this.readOnlyMode;
   }
 
   public setReadOnlyMode(readOnly: boolean): void {
     this.readOnlyMode = readOnly;
+  }
+
+  /**
+   * Gets the effective access mode for a specific server/database combination.
+   * Priority: Database-level > Server-level > Global env > default (full)
+   *
+   * @param serverName The server name (or null to use current server)
+   * @param database The database name (or null to use current database)
+   * @returns The effective access mode ('full' or 'readonly')
+   */
+  public getEffectiveAccessMode(
+    serverName?: string | null,
+    database?: string | null
+  ): AccessMode {
+    const server = serverName ?? this.connectionState.currentServer;
+    const db = database ?? this.connectionState.currentDatabase;
+
+    if (server) {
+      const serverConfig = this.serversConfig[server];
+      if (serverConfig) {
+        // Check database-level access mode first
+        if (db && serverConfig.databaseAccessModes?.[db]) {
+          return serverConfig.databaseAccessModes[db];
+        }
+        // Fall back to server-level access mode
+        if (serverConfig.accessMode) {
+          return serverConfig.accessMode;
+        }
+      }
+    }
+
+    // Fall back to global mode
+    return this.readOnlyMode ? "readonly" : "full";
+  }
+
+  /**
+   * Checks if access mode is read-only for a specific server/database combination.
+   * @param serverName The server name (or null to use current server)
+   * @param database The database name (or null to use current database)
+   */
+  public isReadOnlyFor(
+    serverName?: string | null,
+    database?: string | null
+  ): boolean {
+    return this.getEffectiveAccessMode(serverName, database) === "readonly";
   }
 
   public setQueryTimeout(timeoutMs: number): void {
@@ -1443,8 +1610,8 @@ export class DatabaseManager {
       throw new Error(`Transaction not found: ${transactionId}`);
     }
 
-    // Check for read-only mode violations
-    if (this.readOnlyMode) {
+    // Check for read-only mode violations using the transaction's server/database
+    if (this.isReadOnlyFor(transaction.info.server, transaction.info.database)) {
       const { isReadOnly, reason } = isReadOnlySql(sql);
       if (!isReadOnly) {
         throw new Error(`Read-only mode violation: ${reason}`);
@@ -1505,16 +1672,19 @@ let dbManager: DatabaseManager | null = null;
 
 /**
  * Gets the singleton DatabaseManager instance.
- * The access mode is determined by the POSTGRES_ACCESS_MODE environment variable:
+ * The global access mode is determined by the POSTGRES_ACCESS_MODE environment variable:
  * - 'readonly', 'read-only', 'ro': Read-only mode (prevents write operations)
  * - 'full' (default): Full access mode (allows all operations)
+ *
+ * Note: Server-level and database-level access modes can override the global setting.
+ * Use PG_ACCESS_MODE_{suffix} for server-level and PG_DB_ACCESS_MODES_{suffix} for database-level.
  */
 export function getDbManager(): DatabaseManager {
   if (!dbManager) {
-    const readOnlyMode = getAccessModeFromEnv();
+    const readOnlyMode = getGlobalAccessModeFromEnv();
     dbManager = new DatabaseManager(readOnlyMode);
     console.error(
-      `PostgreSQL MCP: Access mode = ${readOnlyMode ? "readonly" : "full"}`
+      `PostgreSQL MCP: Global access mode = ${readOnlyMode ? "readonly" : "full"}`
     );
   }
   return dbManager;

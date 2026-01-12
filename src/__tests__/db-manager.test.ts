@@ -307,6 +307,223 @@ describe('DatabaseManager', () => {
     });
   });
 
+  describe('server-level access mode', () => {
+    it('should use server-level access mode from PG_ACCESS_MODE_*', () => {
+      process.env.PG_NAME_1 = 'prod';
+      process.env.PG_HOST_1 = 'localhost';
+      process.env.PG_USERNAME_1 = 'user';
+      process.env.PG_PASSWORD_1 = 'pass';
+      process.env.PG_ACCESS_MODE_1 = 'readonly';
+
+      const manager = new DatabaseManager();
+      expect(manager.getEffectiveAccessMode('prod', null)).toBe('readonly');
+    });
+
+    it('should support full access mode at server level', () => {
+      process.env.PG_NAME_1 = 'dev';
+      process.env.PG_HOST_1 = 'localhost';
+      process.env.PG_USERNAME_1 = 'user';
+      process.env.PG_PASSWORD_1 = 'pass';
+      process.env.PG_ACCESS_MODE_1 = 'full';
+
+      const manager = new DatabaseManager();
+      expect(manager.getEffectiveAccessMode('dev', null)).toBe('full');
+    });
+
+    it('should support short access mode values (ro, rw)', () => {
+      process.env.PG_NAME_1 = 'prod';
+      process.env.PG_HOST_1 = 'localhost';
+      process.env.PG_USERNAME_1 = 'user';
+      process.env.PG_PASSWORD_1 = 'pass';
+      process.env.PG_ACCESS_MODE_1 = 'ro';
+
+      process.env.PG_NAME_2 = 'dev';
+      process.env.PG_HOST_2 = 'localhost';
+      process.env.PG_USERNAME_2 = 'user';
+      process.env.PG_PASSWORD_2 = 'pass';
+      process.env.PG_ACCESS_MODE_2 = 'rw';
+
+      const manager = new DatabaseManager();
+      expect(manager.getEffectiveAccessMode('prod', null)).toBe('readonly');
+      expect(manager.getEffectiveAccessMode('dev', null)).toBe('full');
+    });
+
+    it('should override global access mode with server-level', () => {
+      process.env.POSTGRES_ACCESS_MODE = 'readonly';
+      process.env.PG_NAME_1 = 'dev';
+      process.env.PG_HOST_1 = 'localhost';
+      process.env.PG_USERNAME_1 = 'user';
+      process.env.PG_PASSWORD_1 = 'pass';
+      process.env.PG_ACCESS_MODE_1 = 'full';
+
+      const manager = new DatabaseManager(true); // global readonly
+      expect(manager.getEffectiveAccessMode('dev', null)).toBe('full'); // server overrides
+      expect(manager.isReadOnly()).toBe(true); // global still readonly
+    });
+
+    it('should fallback to global when server has no access mode', () => {
+      process.env.POSTGRES_ACCESS_MODE = 'readonly';
+      process.env.PG_NAME_1 = 'prod';
+      process.env.PG_HOST_1 = 'localhost';
+      process.env.PG_USERNAME_1 = 'user';
+      process.env.PG_PASSWORD_1 = 'pass';
+      // No PG_ACCESS_MODE_1
+
+      const manager = new DatabaseManager(true); // global readonly
+      expect(manager.getEffectiveAccessMode('prod', null)).toBe('readonly');
+    });
+  });
+
+  describe('database-level access mode', () => {
+    it('should parse database access modes from PG_DB_ACCESS_MODES_*', () => {
+      process.env.PG_NAME_1 = 'prod';
+      process.env.PG_HOST_1 = 'localhost';
+      process.env.PG_USERNAME_1 = 'user';
+      process.env.PG_PASSWORD_1 = 'pass';
+      process.env.PG_DB_ACCESS_MODES_1 = 'analytics:full,users:readonly';
+
+      const manager = new DatabaseManager();
+      expect(manager.getEffectiveAccessMode('prod', 'analytics')).toBe('full');
+      expect(manager.getEffectiveAccessMode('prod', 'users')).toBe('readonly');
+    });
+
+    it('should support short mode values in database access modes', () => {
+      process.env.PG_NAME_1 = 'prod';
+      process.env.PG_HOST_1 = 'localhost';
+      process.env.PG_USERNAME_1 = 'user';
+      process.env.PG_PASSWORD_1 = 'pass';
+      process.env.PG_DB_ACCESS_MODES_1 = 'dev_db:rw,prod_db:ro';
+
+      const manager = new DatabaseManager();
+      expect(manager.getEffectiveAccessMode('prod', 'dev_db')).toBe('full');
+      expect(manager.getEffectiveAccessMode('prod', 'prod_db')).toBe('readonly');
+    });
+
+    it('should override server-level with database-level', () => {
+      process.env.PG_NAME_1 = 'prod';
+      process.env.PG_HOST_1 = 'localhost';
+      process.env.PG_USERNAME_1 = 'user';
+      process.env.PG_PASSWORD_1 = 'pass';
+      process.env.PG_ACCESS_MODE_1 = 'readonly'; // server is readonly
+      process.env.PG_DB_ACCESS_MODES_1 = 'analytics:full'; // but analytics is full
+
+      const manager = new DatabaseManager();
+      expect(manager.getEffectiveAccessMode('prod', 'analytics')).toBe('full');
+      expect(manager.getEffectiveAccessMode('prod', 'users')).toBe('readonly'); // fallback to server
+    });
+
+    it('should handle spaces in database access modes', () => {
+      process.env.PG_NAME_1 = 'prod';
+      process.env.PG_HOST_1 = 'localhost';
+      process.env.PG_USERNAME_1 = 'user';
+      process.env.PG_PASSWORD_1 = 'pass';
+      process.env.PG_DB_ACCESS_MODES_1 = 'db1:full , db2:readonly , db3:ro';
+
+      const manager = new DatabaseManager();
+      expect(manager.getEffectiveAccessMode('prod', 'db1')).toBe('full');
+      expect(manager.getEffectiveAccessMode('prod', 'db2')).toBe('readonly');
+      expect(manager.getEffectiveAccessMode('prod', 'db3')).toBe('readonly');
+    });
+
+    it('should handle invalid database access mode entries gracefully', () => {
+      process.env.PG_NAME_1 = 'prod';
+      process.env.PG_HOST_1 = 'localhost';
+      process.env.PG_USERNAME_1 = 'user';
+      process.env.PG_PASSWORD_1 = 'pass';
+      process.env.PG_DB_ACCESS_MODES_1 = 'valid:full,invalid,alsoInvalid:badmode';
+
+      const manager = new DatabaseManager(false); // global full access
+      expect(manager.getEffectiveAccessMode('prod', 'valid')).toBe('full');
+      // Invalid entries should be ignored, fallback to global default
+      expect(manager.getEffectiveAccessMode('prod', 'invalid')).toBe('full');
+    });
+  });
+
+  describe('access mode priority', () => {
+    it('should follow priority: database > server > global', () => {
+      process.env.POSTGRES_ACCESS_MODE = 'readonly'; // global
+      process.env.PG_NAME_1 = 'myserver';
+      process.env.PG_HOST_1 = 'localhost';
+      process.env.PG_USERNAME_1 = 'user';
+      process.env.PG_PASSWORD_1 = 'pass';
+      process.env.PG_ACCESS_MODE_1 = 'full'; // server overrides global
+      process.env.PG_DB_ACCESS_MODES_1 = 'protected:readonly'; // db overrides server
+
+      const manager = new DatabaseManager(true); // global readonly
+
+      // database-level takes highest priority
+      expect(manager.getEffectiveAccessMode('myserver', 'protected')).toBe('readonly');
+      // server-level for unspecified databases
+      expect(manager.getEffectiveAccessMode('myserver', 'other_db')).toBe('full');
+      // unknown server falls back to global
+      expect(manager.getEffectiveAccessMode('unknown', 'any_db')).toBe('readonly');
+    });
+
+    it('should use isReadOnlyFor for context-aware checks', () => {
+      process.env.PG_NAME_1 = 'prod';
+      process.env.PG_HOST_1 = 'localhost';
+      process.env.PG_USERNAME_1 = 'user';
+      process.env.PG_PASSWORD_1 = 'pass';
+      process.env.PG_ACCESS_MODE_1 = 'readonly';
+      process.env.PG_DB_ACCESS_MODES_1 = 'analytics:full';
+
+      const manager = new DatabaseManager();
+      expect(manager.isReadOnlyFor('prod', 'users')).toBe(true);
+      expect(manager.isReadOnlyFor('prod', 'analytics')).toBe(false);
+    });
+  });
+
+  describe('JSON config access mode', () => {
+    it('should support accessMode in JSON config', () => {
+      process.env.POSTGRES_SERVERS = JSON.stringify({
+        prod: {
+          host: 'localhost',
+          username: 'user',
+          password: 'pass',
+          accessMode: 'readonly'
+        }
+      });
+
+      const manager = new DatabaseManager();
+      expect(manager.getEffectiveAccessMode('prod', null)).toBe('readonly');
+    });
+
+    it('should support databaseAccessModes object in JSON config', () => {
+      process.env.POSTGRES_SERVERS = JSON.stringify({
+        prod: {
+          host: 'localhost',
+          username: 'user',
+          password: 'pass',
+          accessMode: 'readonly',
+          databaseAccessModes: {
+            analytics: 'full',
+            users: 'readonly'
+          }
+        }
+      });
+
+      const manager = new DatabaseManager();
+      expect(manager.getEffectiveAccessMode('prod', 'analytics')).toBe('full');
+      expect(manager.getEffectiveAccessMode('prod', 'users')).toBe('readonly');
+      expect(manager.getEffectiveAccessMode('prod', 'other')).toBe('readonly'); // server fallback
+    });
+
+    it('should support databaseAccessModes string format in JSON config', () => {
+      process.env.POSTGRES_SERVERS = JSON.stringify({
+        prod: {
+          host: 'localhost',
+          username: 'user',
+          password: 'pass',
+          databaseAccessModes: 'analytics:full,users:ro'
+        }
+      });
+
+      const manager = new DatabaseManager();
+      expect(manager.getEffectiveAccessMode('prod', 'analytics')).toBe('full');
+      expect(manager.getEffectiveAccessMode('prod', 'users')).toBe('readonly');
+    });
+  });
+
   describe('connection state', () => {
     it('should start with no connection', () => {
       const manager = new DatabaseManager();

@@ -1,3 +1,6 @@
+/** Access mode type */
+export type AccessMode = 'full' | 'readonly';
+
 export interface ServerConfig {
   host: string;
   port: string;
@@ -20,6 +23,18 @@ export interface ServerConfig {
    * - Any instructions to help AI agents use this server effectively
    */
   context?: string;
+  /**
+   * Access mode for this server. Overrides global POSTGRES_ACCESS_MODE.
+   * - 'full': Allow all SQL operations (default)
+   * - 'readonly': Only allow read-only operations (SELECT, EXPLAIN, etc.)
+   */
+  accessMode?: AccessMode;
+  /**
+   * Per-database access mode overrides. Overrides server-level accessMode.
+   * Key is database name, value is access mode.
+   * Example: { "production": "readonly", "staging": "full" }
+   */
+  databaseAccessModes?: { [databaseName: string]: AccessMode };
 }
 
 export interface ServersConfig {
@@ -37,7 +52,7 @@ export interface ConnectionInfo {
   server: string | null;
   database: string | null;
   schema: string | null;
-  accessMode: 'full' | 'readonly';
+  accessMode: AccessMode;
   /** AI context/guidance for the current server */
   context?: string;
   /** Current database user name */
