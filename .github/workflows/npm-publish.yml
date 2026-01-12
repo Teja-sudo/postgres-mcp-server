@@ -30,6 +30,9 @@ jobs:
     runs-on: ubuntu-latest
     # Only publish on release OR when manually triggered with publish=true
     if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.publish == true)
+    permissions:
+      contents: read
+      id-token: write # Required for provenance/OIDC
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -37,4 +40,4 @@ jobs:
           node-version: 20
           registry-url: https://registry.npmjs.org/
       - run: npm ci
-      - run: npm publish
+      - run: npm publish --provenance --access public
