@@ -16,7 +16,7 @@
     "lint": "eslint src --ignore-pattern '__tests__'",
     "lint:fix": "eslint src --ignore-pattern '__tests__' --fix",
     "prepare": "npm run build",
-    "prepublishOnly": "npm run build && npm test"
+    "prepublishOnly": "npm i && npm run build && npm test"
   },
   "keywords": [
     "mcp",
