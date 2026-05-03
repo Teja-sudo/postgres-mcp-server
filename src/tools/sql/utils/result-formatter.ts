@@ -8,7 +8,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { v4 as uuidv4 } from 'uuid';
+import { v7 as uuidv7 } from 'uuid';
 import { MAX_OUTPUT_CHARS } from './constants.js';
 
 /**
@@ -59,7 +59,7 @@ export function handleLargeOutput(
 
   // Write to temp file
   const tempDir = os.tmpdir();
-  const fileName = `sql-result-${uuidv4()}.json`;
+  const fileName = `sql-result-${uuidv7()}.json`;
   const filePath = path.join(tempDir, fileName);
 
   fs.writeFileSync(filePath, output, { mode: 0o600 });

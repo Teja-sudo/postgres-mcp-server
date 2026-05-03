@@ -240,7 +240,7 @@ export async function switchServerDb(args: {
       context: connectionInfo.context
     };
   } catch (error) {
-    throw new Error(`Failed to switch: ${error}`);
+    throw new Error(`Failed to switch: ${error}`, { cause: error });
   }
 }
 

@@ -1,5 +1,5 @@
 import { Pool, PoolClient, QueryResult, QueryResultRow } from "pg";
-import { v4 as uuidv4 } from "uuid";
+import { v7 as uuidv7 } from "uuid";
 import {
   AccessMode,
   ServerConfig,
@@ -311,23 +311,21 @@ function loadServersFromJson(): ServersConfig {
           } else {
             delete serverConfig.databaseAccessModes;
           }
+        } else if (typeof serverConfig.databaseAccessModes !== "object" || serverConfig.databaseAccessModes === null) {
+          console.error(
+            `Warning: Invalid databaseAccessModes for server '${name}', must be an object or string. Ignoring.`
+          );
+          delete serverConfig.databaseAccessModes;
         } else {
           const dbModes = serverConfig.databaseAccessModes as Record<string, unknown>;
-          if (typeof dbModes !== "object" || dbModes === null) {
-            console.error(
-              `Warning: Invalid databaseAccessModes for server '${name}', must be an object or string. Ignoring.`
-            );
-            delete serverConfig.databaseAccessModes;
-          } else {
-            const validModes = ["full", "readonly"];
-            for (const [dbName, mode] of Object.entries(dbModes)) {
-              if (!validModes.includes(mode as string)) {
-                console.error(
-                  `Warning: Invalid accessMode '${mode}' for database '${dbName}' on server '${name}', ` +
-                    `must be 'full' or 'readonly'. Ignoring.`
-                );
-                delete dbModes[dbName];
-              }
+          const validModes = ["full", "readonly"];
+          for (const [dbName, mode] of Object.entries(dbModes)) {
+            if (!validModes.includes(mode as string)) {
+              console.error(
+                `Warning: Invalid accessMode '${mode}' for database '${dbName}' on server '${name}', ` +
+                  `must be 'full' or 'readonly'. Ignoring.`
+              );
+              delete dbModes[dbName];
             }
           }
         }
@@ -674,7 +672,8 @@ export class DatabaseManager {
       throw new Error(
         `Failed to connect to server '${serverName}': ${
           error instanceof Error ? error.message : String(error)
-        }`
+        }`,
+        { cause: error }
       );
     }
   }
@@ -766,7 +765,7 @@ export class DatabaseManager {
     } catch (error) {
       // Provide more context in error messages
       if (error instanceof Error) {
-        throw new Error(`Query failed: ${error.message}`);
+        throw new Error(`Query failed: ${error.message}`, { cause: error });
       }
       throw error;
     }
@@ -980,7 +979,8 @@ export class DatabaseManager {
         throw new Error(
           `Failed to set schema '${schema}': ${
             error instanceof Error ? error.message : String(error)
-          }`
+          }`,
+          { cause: error }
         );
       }
 
@@ -1081,7 +1081,8 @@ export class DatabaseManager {
         throw new Error(
           `Failed to set schema '${schema}': ${
             error instanceof Error ? error.message : String(error)
-          }`
+          }`,
+          { cause: error }
         );
       }
 
@@ -1114,7 +1115,8 @@ export class DatabaseManager {
       throw new Error(
         `Failed to set schema '${schema}': ${
           error instanceof Error ? error.message : String(error)
-        }`
+        }`,
+        { cause: error }
       );
     }
 
@@ -1540,7 +1542,7 @@ export class DatabaseManager {
       );
     }
 
-    const transactionId = uuidv4();
+    const transactionId = uuidv7();
     const client = await this.currentPool.connect();
 
     try {

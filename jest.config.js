@@ -16,6 +16,7 @@ export default {
           moduleResolution: 'NodeNext',
           esModuleInterop: true,
           verbatimModuleSyntax: false,
+          types: ['jest', 'node'],
         },
       },
     ],

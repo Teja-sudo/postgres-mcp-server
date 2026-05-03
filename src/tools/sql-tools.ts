@@ -23,7 +23,7 @@ import {
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { v4 as uuidv4 } from 'uuid';
+import { v7 as uuidv7 } from 'uuid';
 import { validateIdentifier, validateIndexType, isReadOnlySql, validatePositiveInteger } from '../utils/validation.js';
 
 // Import utilities from modular structure
@@ -190,7 +190,7 @@ export async function executeSql(args: {
   // If output is still too large even after pagination, write to file
   if (outputSize > MAX_OUTPUT_CHARS) {
     const tempDir = os.tmpdir();
-    const fileName = `postgres-mcp-output-${uuidv4()}.json`;
+    const fileName = `postgres-mcp-output-${uuidv7()}.json`;
     const filePath = path.join(tempDir, fileName);
 
     const outputData = {
@@ -1448,7 +1448,7 @@ export async function mutationPreview(args: {
   }
 
   // Build SELECT query to get sample of affected rows
-  let sampleRows: any[] = [];
+  let sampleRows: any[];
   try {
     const selectSql = whereClause
       ? `SELECT * FROM ${targetTable} WHERE ${whereClause} LIMIT ${sampleSize}`
@@ -1466,7 +1466,10 @@ export async function mutationPreview(args: {
       estimatedRowsAffected = parseInt(countResult.rows[0]?.cnt || '0', 10);
     }
   } catch (error) {
-    throw new Error(`Could not preview affected rows: ${error instanceof Error ? error.message : String(error)}`);
+    throw new Error(
+      `Could not preview affected rows: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error }
+    );
   }
 
   const result: MutationPreviewResult = {
