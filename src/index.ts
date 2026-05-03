@@ -36,6 +36,9 @@ import {
   describeTable,
   findDependents,
   schemaDiff,
+  lockCheck,
+  detectMigrationState,
+  safeAlterTable,
 } from "./tools/index.js";
 import { withConnectionRetry } from "./utils/index.js";
 
@@ -64,6 +67,9 @@ const transferObjectsWithRetry = withConnectionRetry(transferObjects);
 const describeTableWithRetry = withConnectionRetry(describeTable);
 const findDependentsWithRetry = withConnectionRetry(findDependents);
 const schemaDiffWithRetry = withConnectionRetry(schemaDiff);
+const lockCheckWithRetry = withConnectionRetry(lockCheck);
+const detectMigrationStateWithRetry = withConnectionRetry(detectMigrationState);
+// safe_alter_table doesn't need a connection (pure logic)
 
 /**
  * Helper to add connection context to any result
@@ -1003,6 +1009,99 @@ server.registerTool(
   },
   async (args) => {
     const result = await schemaDiffWithRetry(args as any);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "lock_check",
+  {
+    description:
+      "Static analysis of a SQL statement to determine the PostgreSQL lock level it will require, whether it forces a full table rewrite, and an estimated duration based on target table size. Returns warnings for ACCESS EXCLUSIVE locks on busy production tables and concrete recommendations (e.g., use CREATE INDEX CONCURRENTLY, NOT VALID + VALIDATE CONSTRAINT, etc). Use BEFORE running DDL on production. Knows lock semantics for ALTER TABLE variants, CREATE/DROP INDEX (concurrent vs not), VACUUM, CLUSTER, REFRESH MATERIALIZED VIEW, and more.",
+    inputSchema: z.object({
+      sql: z.string().describe("SQL DDL statement to analyze."),
+      estimate_duration: z.boolean().optional().default(true).describe("Look up target table size to estimate duration."),
+      server: z.string().optional(),
+      database: z.string().optional(),
+      schema: z.string().optional(),
+    }),
+  },
+  async (args) => {
+    const result = await lockCheckWithRetry(args as any);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "detect_migration_state",
+  {
+    description:
+      "Probe the database for migration tool tracker tables (Liquibase, Flyway, Alembic, Prisma, Knex, Sequelize, Django, Rails, Goose, TypeORM). Returns which tools are detected, the schema and table holding their state, the count of applied migrations, and the latest version. AI agents use this to immediately understand whether the DB is managed by a migration tool before suggesting changes.",
+    inputSchema: z.object({
+      schemas: z.array(z.string()).optional().describe("Schemas to probe. Default: all non-system schemas."),
+      server: z.string().optional(),
+      database: z.string().optional(),
+      schema: z.string().optional(),
+    }),
+  },
+  async (args) => {
+    const result = await detectMigrationStateWithRetry(args as any);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "safe_alter_table",
+  {
+    description:
+      "Convert a high-level intent ('add NOT NULL column with default', 'add NOT NULL', 'add foreign key', 'add CHECK', 'create index', 'drop index') into a multi-step zero-downtime DDL recipe. Each step has its own SQL, expected lock level, and notes. Pipe the resulting `scriptSql` through `dry_run_sql_file` for verification, then through `executeSqlFile(useTransaction=false)` for the production rollout (CONCURRENTLY operations cannot run inside a transaction).",
+    inputSchema: z.object({
+      intent: z
+        .union([
+          z.object({
+            kind: z.literal("add_not_null_column_with_default"),
+            table: z.string(),
+            column: z.string(),
+            type: z.string(),
+            default_expr: z.string(),
+          }),
+          z.object({
+            kind: z.literal("add_not_null"),
+            table: z.string(),
+            column: z.string(),
+          }),
+          z.object({
+            kind: z.literal("add_foreign_key"),
+            table: z.string(),
+            constraint_name: z.string(),
+            columns: z.array(z.string()),
+            references_table: z.string(),
+            references_columns: z.array(z.string()),
+          }),
+          z.object({
+            kind: z.literal("add_check"),
+            table: z.string(),
+            constraint_name: z.string(),
+            check_expr: z.string(),
+          }),
+          z.object({
+            kind: z.literal("create_index"),
+            table: z.string(),
+            index_name: z.string(),
+            columns: z.array(z.string()),
+            index_type: z.string().optional().default("btree"),
+            unique: z.boolean().optional().default(false),
+          }),
+          z.object({
+            kind: z.literal("drop_index"),
+            index_name: z.string(),
+            schema: z.string().optional(),
+          }),
+        ]),
+    }),
+  },
+  async (args) => {
+    const result = await safeAlterTable(args as any);
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );

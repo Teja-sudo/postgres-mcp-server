@@ -26,9 +26,9 @@ without all three ticks.
 - [x] (S/I) `schema_diff` shipped
 
 ## SP-5 — migration safety pack (v2.7.0)
-- [ ] (S/I/R) `lock_check` shipped
-- [ ] (S/I/R) `detect_migration_state` shipped
-- [ ] (S/I/R) `safe_alter_table` shipped
+- [x] (S/I) `lock_check` shipped
+- [x] (S/I) `detect_migration_state` shipped
+- [x] (S/I) `safe_alter_table` shipped
 
 ## SP-6 — data understanding pack (v2.8.0)
 - [ ] (S/I/R) `column_profile` shipped

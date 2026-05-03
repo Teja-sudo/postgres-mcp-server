@@ -4,6 +4,41 @@ All notable changes to `@tejasanik/postgres-mcp-server` are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/), versioning
 follows [Semantic Versioning](https://semver.org/).
 
+## [2.7.0] — 2026-05-03
+
+### Added (SP-5 — migration safety pack)
+
+- **`lock_check` MCP tool** — static analysis of a SQL DDL statement to
+  determine the PG lock level it requires, whether it forces a full
+  table rewrite, and (with table-size lookup) an estimated duration.
+  Returns warnings for ACCESS EXCLUSIVE on busy tables and concrete
+  recommendations: use CREATE INDEX CONCURRENTLY, NOT VALID + VALIDATE
+  CONSTRAINT, etc. Knows lock semantics for ALTER TABLE variants
+  (ADD/DROP COLUMN, ADD/DROP NOT NULL, ALTER TYPE, ADD CONSTRAINT,
+  RENAME, SET STORAGE/STATISTICS/TABLESPACE), CREATE/DROP INDEX
+  (CONCURRENTLY vs not), VACUUM (FULL vs not), CLUSTER, REFRESH
+  MATERIALIZED VIEW (CONCURRENTLY vs not).
+- **`detect_migration_state` MCP tool** — probes for 10 common
+  migration tracker tables (Liquibase databasechangelog, Flyway
+  flyway_schema_history, Alembic alembic_version, Prisma
+  _prisma_migrations, Knex knex_migrations, Sequelize SequelizeMeta,
+  Django django_migrations, Rails schema_migrations, Goose
+  goose_db_version, TypeORM migrations). Reports schema, table,
+  applied count, and latest version per detected tool.
+- **`safe_alter_table` MCP tool** — high-level intent → multi-step
+  zero-downtime DDL recipe. Six intents covered:
+  - `add_not_null_column_with_default`: 4-step recipe (add nullable,
+    backfill, set default, add NOT NULL via NOT VALID + VALIDATE).
+  - `add_not_null`: 4-step (CHECK NOT VALID → VALIDATE → SET NOT NULL
+    → DROP redundant CHECK).
+  - `add_foreign_key` / `add_check`: NOT VALID + VALIDATE recipe to
+    avoid the initial scan under heavy lock.
+  - `create_index` / `drop_index`: CONCURRENTLY recipe with note
+    that CONCURRENTLY cannot run inside a transaction.
+  Each step has its own SQL, expected lock level, notes. The combined
+  `scriptSql` is suitable for `dry_run_sql_file` review followed by
+  `executeSqlFile(useTransaction=false)` for production rollout.
+
 ## [2.6.0] — 2026-05-03
 
 ### Added (SP-4 — schema awareness pack)
