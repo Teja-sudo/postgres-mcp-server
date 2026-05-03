@@ -767,6 +767,24 @@ export async function executeSqlFile(args: {
       const stmt = executableStatements[statementIndex];
       const trimmed = stmt.sql.trim();
 
+      // SP-1 layer 1 (static skip) - applies in transaction mode only.
+      // Without this, an embedded COMMIT inside the file actually runs,
+      // closes our outer transaction, and causes downstream chaos.
+      if (useTransaction) {
+        const skipWarnings = detectNonRollbackableOperations(trimmed)
+          .filter((w) => w.mustSkip && w.operation === 'TRANSACTION_CONTROL');
+        if (skipWarnings.length > 0) {
+          // Surface as a recorded statement so callers see what happened
+          collectedErrors.push({
+            statementIndex: statementIndex + 1,
+            lineNumber: stmt.lineNumber,
+            sql: trimmed.length > SQL_TRUNCATION_SHORT ? trimmed.substring(0, SQL_TRUNCATION_SHORT) + '...' : trimmed,
+            error: `[skipped — TRANSACTION_CONTROL] ${skipWarnings.map((w) => w.message).join('; ')}`,
+          });
+          continue;
+        }
+      }
+
       try {
         const result = await client.query(trimmed);
         statementsExecuted++;

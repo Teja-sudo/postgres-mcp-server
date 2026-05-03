@@ -12,6 +12,11 @@
 import { PoolClient } from 'pg';
 import { Writable } from 'stream';
 
+/** Synchronous write callback - used by the export pipeline so we don't
+ *  need a Writable wrapper (which buffers asynchronously and can write
+ *  after the underlying stream closes). */
+export type WriteFn = (chunk: string) => void;
+
 /** Format SQL literal value from JS value, handling NULL, numbers,
  *  strings, booleans, dates, JSON, byte arrays. Best-effort — not a
  *  full PG type-aware encoder, but covers the common cases for
@@ -31,7 +36,14 @@ export function formatSqlLiteral(value: unknown): string {
     return `'\\x${value.toString('hex')}'::bytea`;
   }
   if (Array.isArray(value)) {
-    // PG array literal
+    // Audit-iteration-1 SP-2 P0 fix: empty arrays must include a
+    // type cast — bare `ARRAY[]` makes PG complain "cannot
+    // determine type of empty array". `'{}'::text[]` is the safest
+    // universal literal because PG will implicit-cast it to the
+    // target column's element type during INSERT regardless of
+    // whether the column is text[]/int[]/uuid[]/etc.
+    if (value.length === 0) return `'{}'::text[]`;
+    // PG array literal with elements
     const inner = value.map((v) => formatSqlLiteral(v)).join(', ');
     return `ARRAY[${inner}]`;
   }
@@ -72,13 +84,29 @@ export async function emitTableRowsAsInsert(
   client: PoolClient,
   schema: string,
   table: string,
-  sink: Writable,
+  sink: WriteFn | Writable,
   opts: EmitRowsOptions = {}
 ): Promise<{ rowsEmitted: number }> {
   const batchSize = opts.batchSize ?? 100;
   const qualified = qualify(schema, table);
 
-  // Discover column names + count for header
+  // Normalize sink: accept both a synchronous WriteFn and a Node Writable.
+  // The synchronous form is preferred because it avoids the "write after
+  // end" race when the export pipeline closes the underlying stream
+  // before the Writable's buffered chunks are drained.
+  const writeChunk: WriteFn = typeof sink === 'function'
+    ? sink
+    : (chunk: string) => { sink.write(chunk); };
+
+  // Audit-iteration-1 SP-2/SP-3 P0 fix: exclude IDENTITY (`a`/`d`)
+  // and GENERATED-STORED (`s`) columns from the INSERT column list.
+  // PG rejects explicit values for these:
+  //   `cannot insert a non-DEFAULT value into column "id"` (IDENTITY)
+  //   `cannot insert into generated column "x"` (STORED)
+  // For IDENTITY columns the auto-generated value will be assigned;
+  // for STORED columns the expression will be re-evaluated on the
+  // target. Sequence state for SERIAL-style IDENTITY is synced
+  // separately by the export/transfer caller.
   const colsRes = await client.query(
     `SELECT a.attname
      FROM pg_attribute a
@@ -86,6 +114,8 @@ export async function emitTableRowsAsInsert(
      JOIN pg_namespace n ON n.oid = c.relnamespace
      WHERE n.nspname = $1 AND c.relname = $2
        AND a.attnum > 0 AND NOT a.attisdropped
+       AND a.attidentity = ''
+       AND a.attgenerated = ''
      ORDER BY a.attnum`,
     [schema, table]
   );
@@ -108,11 +138,40 @@ export async function emitTableRowsAsInsert(
       const vals = columnNames.map((c) => formatSqlLiteral(row[c]));
       return `  (${vals.join(', ')})`;
     });
-    sink.write(
+    writeChunk(
       `INSERT INTO ${qualified} (${columnList}) VALUES\n` +
       valueRows.join(',\n') + ';\n'
     );
     emitted += batch.length;
+  }
+
+  // Audit-iteration-1 SP-2 P0 fix: emit setval for any serial-backed
+  // sequence on this table so a replay file leaves the sequence
+  // pointing past the inserted rows. Without this, the replayed DB
+  // gets the inserted rows AND a sequence still at 1; next nextval()
+  // collides with the loaded data.
+  if (emitted > 0) {
+    const seqRes = await client.query(
+      `SELECT
+         a.attname::text AS col,
+         pg_get_serial_sequence($1, a.attname) AS seq
+       FROM pg_attribute a
+       JOIN pg_class c ON c.oid = a.attrelid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = $2 AND c.relname = $3
+         AND a.attnum > 0 AND NOT a.attisdropped
+         AND pg_get_serial_sequence($1, a.attname) IS NOT NULL`,
+      [qualified, schema, table]
+    );
+    for (const seqRow of seqRes.rows) {
+      const seq = String(seqRow.seq);
+      const col = String(seqRow.col);
+      // Use literal in the dump because we don't know the value
+      // server-side until replay; SELECT setval is portable.
+      writeChunk(
+        `SELECT setval('${seq.replace(/'/g, "''")}', COALESCE((SELECT MAX(${qident(col)})::bigint FROM ${qualified}), 1), true);\n`
+      );
+    }
   }
 
   return { rowsEmitted: emitted };

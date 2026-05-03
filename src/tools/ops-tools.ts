@@ -225,11 +225,14 @@ export async function killQuery(args: KillQueryArgs): Promise<KillQueryResult> {
     const r = await client.query(`SELECT ${fn}($1) AS signaled`, [args.pid]);
     const signaled = r.rows[0]?.signaled === true;
 
-    const message = signaled
-      ? args.mode === 'cancel'
-        ? `Sent cancellation signal to PID ${args.pid}. Query may take a moment to actually stop.`
-        : `Sent termination signal to PID ${args.pid}. Backend will be killed.`
-      : `Failed to ${args.mode} PID ${args.pid}. Process may have already exited or you lack permission.`;
+    let message: string;
+    if (!signaled) {
+      message = `Failed to ${args.mode} PID ${args.pid}. Process may have already exited or you lack permission.`;
+    } else if (args.mode === 'cancel') {
+      message = `Sent cancellation signal to PID ${args.pid}. Query may take a moment to actually stop.`;
+    } else {
+      message = `Sent termination signal to PID ${args.pid}. Backend will be killed.`;
+    }
 
     return { pid: args.pid, mode: args.mode, signaled, target, message };
   } finally {

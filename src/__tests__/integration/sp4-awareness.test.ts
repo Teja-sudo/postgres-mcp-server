@@ -4,8 +4,7 @@
 
 import { afterAll, beforeAll, beforeEach, expect, it } from '@jest/globals';
 import { Pool } from 'pg';
-import { StartedPostgreSqlContainer, PostgreSqlContainer } from '@testcontainers/postgresql';
-import { describeIntegration, resetDatabase } from './postgres-container.js';
+import { describeIntegration, resetDatabase, startPostgres, PgHandle } from './postgres-container.js';
 import { resetDbManager } from '../../db-manager.js';
 import {
   describeTable,
@@ -15,20 +14,20 @@ import {
 } from '../../tools/index.js';
 
 describeIntegration('SP-4 schema awareness pack', () => {
-  let containerA: StartedPostgreSqlContainer;
-  let containerB: StartedPostgreSqlContainer;
+  let containerA: PgHandle;
+  let containerB: PgHandle;
   let poolA: Pool;
   let poolB: Pool;
 
   beforeAll(async () => {
-    [containerA, containerB] = await Promise.all([
-      new PostgreSqlContainer('postgres:16-alpine')
-        .withDatabase('a').withUsername('u').withPassword('p').start(),
-      new PostgreSqlContainer('postgres:16-alpine')
-        .withDatabase('b').withUsername('u').withPassword('p').start(),
+    const [a, b] = await Promise.all([
+      startPostgres('audit_sp4_a'),
+      startPostgres('audit_sp4_b'),
     ]);
-    poolA = new Pool({ connectionString: containerA.getConnectionUri(), max: 5 });
-    poolB = new Pool({ connectionString: containerB.getConnectionUri(), max: 5 });
+    containerA = a.container;
+    containerB = b.container;
+    poolA = a.pool;
+    poolB = b.pool;
 
     process.env.PG_NAME_A = 'envA';
     process.env.PG_HOST_A = containerA.getHost();

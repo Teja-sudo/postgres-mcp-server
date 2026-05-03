@@ -237,6 +237,12 @@ export class TransactionGuard {
       return { ok: true };
     } catch (err: unknown) {
       const pgErr = err as { code?: string; message?: string };
+      // 3B001 invalid_savepoint_specification: savepoint vanished
+      // 25P01 no_active_sql_transaction: outer tx was closed
+      // 25P02 in_failed_sql_transaction: a previous statement aborted the
+      //       tx (e.g. a DO block with COMMIT that PG refuses mid-tx).
+      //       We treat this as tx_closed for our purposes - the dry-run
+      //       can't trust subsequent queries on this connection.
       if (pgErr?.code === '3B001') {
         return {
           ok: false,
@@ -245,7 +251,7 @@ export class TransactionGuard {
           pgMessage: pgErr.message,
         };
       }
-      if (pgErr?.code === '25P01') {
+      if (pgErr?.code === '25P01' || pgErr?.code === '25P02') {
         return {
           ok: false,
           reason: 'tx_closed',

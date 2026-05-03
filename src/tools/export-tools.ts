@@ -21,7 +21,6 @@ import { getDbManager, OverrideClientResult } from '../db-manager.js';
 import { ConnectionOverride } from '../types.js';
 import {
   ObjectKind,
-  ObjectKindFilter,
   ObjectDescriptor,
   ExtractedDDL,
   listObjectsInScope,
@@ -114,9 +113,17 @@ function splitQualified(
   raw: string,
   defaultSchema: string
 ): { schema: string; name: string } {
-  const m = /^"?([^".]+)"?\.\s*"?([^".]+)"?$/.exec(raw.trim());
-  if (m) return { schema: m[1], name: m[2] };
-  return { schema: defaultSchema, name: raw.trim().replace(/^"|"$/g, '') };
+  // Use indexOf instead of regex to avoid the slow-regex lint
+  // (and keep parsing predictable). Strip wrapping double quotes
+  // from each part, but only at the outermost positions.
+  const trimmed = raw.trim();
+  const dot = trimmed.indexOf('.');
+  if (dot > 0 && dot < trimmed.length - 1) {
+    const left = trimmed.slice(0, dot).replace(/^"|"$/g, '').trim();
+    const right = trimmed.slice(dot + 1).replace(/^"|"$/g, '').trim();
+    if (left && right) return { schema: left, name: right };
+  }
+  return { schema: defaultSchema, name: trimmed.replace(/^"|"$/g, '') };
 }
 
 function buildBanner(
@@ -272,17 +279,16 @@ export async function exportToSqlFile(
   let rowsExported = 0;
   let bytesWritten = 0;
 
-  // Wrap the stream so we can count bytes
+  // Single synchronous write function: count bytes + push to underlying
+  // stream. We deliberately avoid wrapping in a Node Writable because
+  // the Writable's internal buffering can flush callbacks AFTER the
+  // outer stream has been ended in the finally block, producing
+  // "write after end" errors. Synchronous push-through has none of
+  // that complexity and is correct for our small batched writes.
   const countingWrite = (s: string): void => {
     bytesWritten += Buffer.byteLength(s, 'utf-8');
     stream.write(s);
   };
-  const countingSink: Writable = new Writable({
-    write(chunk, _enc, cb) {
-      bytesWritten += chunk.length;
-      stream.write(chunk, cb);
-    },
-  });
 
   try {
     countingWrite(buildBanner(source, args.what));
@@ -301,7 +307,7 @@ export async function exportToSqlFile(
         client,
         scopeSchema,
         args.what.tables,
-        countingSink,
+        countingWrite,
         { where: args.what.where, orderBy: args.what.orderBy, limit: args.what.limit }
       );
       rowsExported = rows;
@@ -311,7 +317,6 @@ export async function exportToSqlFile(
         client,
         args.what.schema ?? scopeSchema,
         countingWrite,
-        countingSink,
         args.what.include_data === true
       );
       objectsExported = result.objects;
@@ -400,18 +405,18 @@ async function emitDataForTables(
   client: any,
   defaultSchema: string,
   tables: string[],
-  sink: Writable,
+  write: (s: string) => void,
   opts: { where?: string; orderBy?: string; limit?: number }
 ): Promise<{ rows: number; warns: string[] }> {
   let rows = 0;
   const warns: string[] = [];
   for (const ref of tables) {
     const { schema, name } = splitQualified(ref, defaultSchema);
-    sink.write(`-- data: ${qualify(schema, name)}\n`);
+    write(`-- data: ${qualify(schema, name)}\n`);
     try {
-      const result = await emitTableRowsAsInsert(client, schema, name, sink, opts);
+      const result = await emitTableRowsAsInsert(client, schema, name, write, opts);
       rows += result.rowsEmitted;
-      sink.write('\n');
+      write('\n');
     } catch (e) {
       warns.push(
         `Failed to emit data for ${qualify(schema, name)}: ` +
@@ -426,7 +431,6 @@ async function emitSchemaDump(
   client: any,
   schema: string,
   write: (s: string) => void,
-  sink: Writable,
   includeData: boolean
 ): Promise<{ objects: number; rows: number; warns: string[] }> {
   const all = await listObjectsInScope(client, { schema }, 'all');
@@ -462,18 +466,41 @@ async function emitSchemaDump(
   if (includeData) {
     write('-- Data ----------------------------------------\n');
     const tables = all.filter((d) => d.kind === 'table');
+    // Audit-iteration-1 SP-2 P0 fix: disable user triggers around
+    // the data load so re-INSERTing source rows does NOT fire the
+    // dst triggers (e.g., audit_user_change writing to audit_log
+    // again, doubling the audit_log row count post-replay). The
+    // SESSION_REPLICATION_ROLE switch only affects this connection;
+    // user-defined triggers still fire when applications connect
+    // normally after replay.
+    write(`-- disable user triggers during data load to prevent\n`);
+    write(`-- duplicate side-effects from triggers re-firing on\n`);
+    write(`-- already-source-side-recorded events\n`);
+    write(`SET session_replication_role = 'replica';\n\n`);
     for (const t of tables) {
-      sink.write(`-- data: ${qualify(t.schema, t.name)}\n`);
+      write(`-- data: ${qualify(t.schema, t.name)}\n`);
       try {
-        const result = await emitTableRowsAsInsert(client, t.schema, t.name, sink);
+        const result = await emitTableRowsAsInsert(client, t.schema, t.name, write);
         rows += result.rowsEmitted;
-        sink.write('\n');
+        write('\n');
       } catch (e) {
         warns.push(
           `Failed to emit data for ${qualify(t.schema, t.name)}: ` +
           (e instanceof Error ? e.message : String(e))
         );
       }
+    }
+    write(`SET session_replication_role = 'origin';\n\n`);
+
+    // Audit-iteration-1 SP-2 P1 fix: refresh materialized views
+    // after data replay so they're populated.
+    const matviews = all.filter((d) => d.kind === 'matview');
+    if (matviews.length > 0) {
+      write('-- Matview refresh ------------------------------\n');
+      for (const mv of matviews) {
+        write(`REFRESH MATERIALIZED VIEW ${qualify(mv.schema, mv.name)};\n`);
+      }
+      write('\n');
     }
   }
 

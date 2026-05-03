@@ -61,6 +61,13 @@ export async function listObjectsInScope(
   }
 
   if (want('sequence')) {
+    // Audit-iteration-1 SP-2 P0 fix: exclude sequences that are
+    // owned by a SERIAL/identity column (pg_depend.deptype='a').
+    // The owning table's CREATE TABLE already emits `SERIAL`/
+    // `BIGSERIAL` which auto-creates the sequence, so listing those
+    // here would result in duplicate `CREATE SEQUENCE` statements
+    // on replay (we'd end up with both users_id_seq and
+    // users_id_seq1, half orphaned).
     const r = await client.query(
       `SELECT c.oid::int AS oid,
               c.relname AS name,
@@ -70,6 +77,13 @@ export async function listObjectsInScope(
        FROM pg_class c
        JOIN pg_namespace n ON n.oid = c.relnamespace
        WHERE c.relkind = 'S' AND n.nspname = $1
+         AND NOT EXISTS (
+           SELECT 1 FROM pg_depend d
+           WHERE d.classid = 'pg_class'::regclass
+             AND d.objid = c.oid
+             AND d.refclassid = 'pg_class'::regclass
+             AND d.deptype = 'a'
+         )
        ORDER BY c.relname`,
       [schema]
     );
@@ -79,6 +93,7 @@ export async function listObjectsInScope(
   if (want('type')) {
     // Composite (c) and enum (e) types only, excluding auto-generated row
     // types for tables (typtype='c' AND relkind='c' must check via join).
+    // Audit-iteration-1 fix: exclude extension-owned types.
     const r = await client.query(
       `SELECT t.oid::int AS oid,
               t.typname AS name,
@@ -92,6 +107,12 @@ export async function listObjectsInScope(
          AND (
            (t.typtype = 'e')
            OR (t.typtype = 'c' AND (c.oid IS NULL OR c.relkind = 'c'))
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM pg_depend d
+           WHERE d.classid = 'pg_type'::regclass
+             AND d.objid = t.oid
+             AND d.deptype = 'e'
          )
        ORDER BY t.typname`,
       [schema]
@@ -148,6 +169,12 @@ export async function listObjectsInScope(
   }
 
   if (want('function') || want('procedure')) {
+    // Audit-iteration-1 SP-2/SP-3 P0 fix: exclude extension-owned
+    // functions. With pgcrypto installed in `public`, the unfiltered
+    // listing previously returned all 38 of its functions (armor,
+    // digest, gen_random_uuid, etc.) as user-owned, then the
+    // export/transfer would emit `CREATE OR REPLACE FUNCTION ...`
+    // statements that collide on replay (or fail on overloads).
     const r = await client.query(
       `SELECT p.oid::int AS oid,
               p.proname AS name,
@@ -159,13 +186,21 @@ export async function listObjectsInScope(
        JOIN pg_namespace n ON n.oid = p.pronamespace
        WHERE n.nspname = $1
          AND p.prokind IN ('f', 'p')
+         AND NOT EXISTS (
+           SELECT 1 FROM pg_depend d
+           WHERE d.classid = 'pg_proc'::regclass
+             AND d.objid = p.oid
+             AND d.deptype = 'e'
+         )
        ORDER BY p.proname`,
       [schema]
     );
     for (const row of r.rows) {
       const kind: ObjectKind = row.prokind === 'p' ? 'procedure' : 'function';
       if (!want(kind)) continue;
-      const { prokind: _prokind, ...rest } = row;
+      // Strip the prokind discriminator (only used for kind selection)
+      const rest = { ...row };
+      delete rest.prokind;
       out.push({ ...rest, kind });
     }
   }

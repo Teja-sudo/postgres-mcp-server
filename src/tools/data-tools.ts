@@ -393,30 +393,40 @@ async function loadColumnMeta(
   schema: string,
   table: string
 ): Promise<ColumnMeta[]> {
+  // Audit-iteration-1 SP-6 P0 fix: ARRAY[1700])::oid[] precedence bug.
+  // The cast must be inside the ANY() (so it builds an oid[] array),
+  // not after — otherwise the equality runs first, returns boolean,
+  // and PG tries to cast bool to oid[] and crashes the entire query.
+  // Audit-iteration-1 SP-6 P2 fix: dropped the dead `LEFT JOIN
+  // information_schema.element_types ON FALSE` (always-NULL join);
+  // char_max now read from atttypmod directly for varchar/char.
   const colsR = await client.query(
     `SELECT a.attname,
             pg_catalog.format_type(a.atttypid, a.atttypmod) AS type,
             a.attnotnull, a.attidentity, a.attgenerated,
             pg_get_expr(d.adbin, d.adrelid) AS def,
-            information_schema.element_types.character_maximum_length AS char_max,
-            CASE WHEN a.atttypid = ANY(ARRAY[1700])::oid[]
+            CASE WHEN a.atttypid IN (1042, 1043) AND a.atttypmod > 4
+                 THEN a.atttypmod - 4 ELSE NULL END AS char_max,
+            CASE WHEN a.atttypid = ANY(ARRAY[1700]::oid[])
                  THEN ((a.atttypmod - 4) >> 16) & 65535 ELSE NULL END AS num_precision,
-            CASE WHEN a.atttypid = ANY(ARRAY[1700])::oid[]
+            CASE WHEN a.atttypid = ANY(ARRAY[1700]::oid[])
                  THEN (a.atttypmod - 4) & 65535 ELSE NULL END AS num_scale
      FROM pg_attribute a
      JOIN pg_class c ON c.oid = a.attrelid
      JOIN pg_namespace n ON n.oid = c.relnamespace
      LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
-     LEFT JOIN information_schema.element_types ON FALSE
      WHERE n.nspname = $1 AND c.relname = $2
        AND a.attnum > 0 AND NOT a.attisdropped
      ORDER BY a.attnum`,
     [schema, table]
   );
 
-  // PK + UNIQUE columns
+  // PK + UNIQUE + FK + CHECK columns. Audit-iteration-1 fix:
+  // pg_constraint.consrc was removed in PG 12+. Use
+  // pg_get_constraintdef as the canonical source of the
+  // constraint definition.
   const conR = await client.query(
-    `SELECT con.contype, con.conkey, con.consrc, pg_get_constraintdef(con.oid) AS def,
+    `SELECT con.contype, con.conkey, pg_get_constraintdef(con.oid) AS def,
             con.confrelid::int AS confrelid, con.confkey
      FROM pg_constraint con
      JOIN pg_class c ON c.oid = con.conrelid
@@ -512,7 +522,7 @@ function generateValueForColumn(
   const tries = col.isUnique ? 50 : 1;
 
   for (let attempt = 0; attempt < tries; attempt++) {
-    let v: string | null = null;
+    let v: string | null;
     const i = col.isUnique ? rowIndex * 1000 + attempt : rowIndex;
 
     if (/^(integer|smallint|bigint|int\d?)\b/.test(t)) {
@@ -534,7 +544,8 @@ function generateValueForColumn(
       }
       v = `'${base.replace(/'/g, "''")}'`;
     } else if (/^bytea\b/.test(t)) {
-      v = `'\\x${Buffer.from(`seed_${i}`).toString('hex')}'::bytea`;
+      const hex = Buffer.from(`seed_${i}`).toString('hex');
+      v = `'\\x${hex}'::bytea`;
     } else if (/^(json|jsonb)\b/.test(t)) {
       v = `'${JSON.stringify({ seed: i })}'::jsonb`;
     } else if (/\binet\b/.test(t)) {

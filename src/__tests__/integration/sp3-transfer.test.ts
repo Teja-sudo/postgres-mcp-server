@@ -6,32 +6,35 @@
  */
 
 import { afterAll, beforeAll, beforeEach, expect, it } from '@jest/globals';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { Pool } from 'pg';
-import { StartedPostgreSqlContainer, PostgreSqlContainer } from '@testcontainers/postgresql';
 import {
   describeIntegration,
   resetDatabase,
+  startPostgres,
+  PgHandle,
 } from './postgres-container.js';
 
 import { resetDbManager } from '../../db-manager.js';
 import { transferObjects, switchServerDb } from '../../tools/index.js';
 
 describeIntegration('SP-3 transfer_objects', () => {
-  let srcContainer: StartedPostgreSqlContainer;
-  let dstContainer: StartedPostgreSqlContainer;
+  let srcContainer: PgHandle;
+  let dstContainer: PgHandle;
   let srcPool: Pool;
   let dstPool: Pool;
 
   beforeAll(async () => {
-    [srcContainer, dstContainer] = await Promise.all([
-      new PostgreSqlContainer('postgres:16-alpine')
-        .withDatabase('source_db').withUsername('su').withPassword('sp').start(),
-      new PostgreSqlContainer('postgres:16-alpine')
-        .withDatabase('target_db').withUsername('tu').withPassword('tp').start(),
+    const [src, dst] = await Promise.all([
+      startPostgres('audit_sp3_src'),
+      startPostgres('audit_sp3_dst'),
     ]);
-
-    srcPool = new Pool({ connectionString: srcContainer.getConnectionUri(), max: 5 });
-    dstPool = new Pool({ connectionString: dstContainer.getConnectionUri(), max: 5 });
+    srcContainer = src.container;
+    dstContainer = dst.container;
+    srcPool = src.pool;
+    dstPool = dst.pool;
 
     process.env.PG_NAME_SRC = 'src';
     process.env.PG_HOST_SRC = srcContainer.getHost();
@@ -185,7 +188,7 @@ describeIntegration('SP-3 transfer_objects', () => {
 
   it('dry_run emits SQL to output_file without touching target', async () => {
     await srcPool.query(`CREATE TABLE dryrun_t (id int)`);
-    const tmpFile = require('path').join(require('os').tmpdir(), `sp3-dr-${Date.now()}.sql`);
+    const tmpFile = path.join(os.tmpdir(), `sp3-dr-${Date.now()}.sql`);
 
     const result = await transferObjects({
       from: { server: 'src' },
@@ -204,7 +207,6 @@ describeIntegration('SP-3 transfer_objects', () => {
     expect(r.rows[0].reg).toBeNull();
 
     // File was written
-    const fs = require('fs');
     expect(fs.existsSync(tmpFile)).toBe(true);
     const content = fs.readFileSync(tmpFile, 'utf-8');
     expect(content).toContain('CREATE TABLE');

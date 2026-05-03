@@ -11,12 +11,12 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { Pool } from 'pg';
-import { StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import {
   describeIntegration,
   startPostgres,
   stopPostgres,
   resetDatabase,
+  PgHandle,
 } from './postgres-container.js';
 
 import { resetDbManager } from '../../db-manager.js';
@@ -26,12 +26,12 @@ import {
 } from '../../tools/index.js';
 
 describeIntegration('SP-2 export_to_sql_file', () => {
-  let container: StartedPostgreSqlContainer;
+  let container: PgHandle;
   let pool: Pool;
   let testDir: string;
 
   beforeAll(async () => {
-    const started = await startPostgres();
+    const started = await startPostgres('audit_sp2');
     container = started.container;
     pool = started.pool;
 

@@ -97,7 +97,11 @@ const ALTER_PATTERNS: Array<{
   forcesRewrite: boolean;
   notes: string;
 }> = [
-  // PG 11+ recipes that reduce locking
+  // PG 11+ recipes that reduce locking.
+  // The `(?!.*...)` lookahead is flagged by sonarjs/slow-regex; in
+  // practice the input is bounded (SQL DDL ≤ 100KB by upstream
+  // limit elsewhere) and we accept the worst-case backtracking.
+  // eslint-disable-next-line sonarjs/slow-regex
   { match: /ADD\s+COLUMN\s+\w+\s+\w+(?:\([^)]+\))?\s+(?!.*(?:NOT\s+NULL|DEFAULT))/i,
     lock: 'AccessExclusiveLock', forcesRewrite: false,
     notes: 'ADD COLUMN without DEFAULT or NOT NULL: ACCESS EXCLUSIVE briefly (metadata only on PG 11+).' },
@@ -167,10 +171,26 @@ export interface LockCheckResult {
 export async function lockCheck(args: LockCheckArgs): Promise<LockCheckResult> {
   if (!args.sql) throw new Error('sql is required');
 
-  const stripped = args.sql
+  let stripped = args.sql
     .replace(/--[^\n]*/g, '')
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .trim();
+
+  // Audit-iteration-1 SP-5 P0 fix: peel off outer transaction-control
+  // wrappers (`BEGIN; <DDL>; COMMIT;`, `START TRANSACTION; <DDL>; END;`).
+  // Without this peel, the anchored ^DDL regex never matches because
+  // the SQL begins with BEGIN — lockCheck silently returned `unknown`
+  // for any DDL the caller wrapped in a transaction block.
+  // bounded DDL input (caller-supplied SQL); accept worst-case backtracking
+  /* eslint-disable sonarjs/slow-regex */
+  const STRIP_LEADING_TX = /^\s*(?:BEGIN|START\s+TRANSACTION|COMMIT|END|ROLLBACK|ABORT)\s*(?:[A-Z\s]+)?;\s*/i;
+  const STRIP_TRAILING_TX = /;\s*(?:COMMIT|END|ROLLBACK|ABORT)\s*;?\s*$/i;
+  /* eslint-enable sonarjs/slow-regex */
+  for (let i = 0; i < 3; i++) {
+    const before = stripped;
+    stripped = stripped.replace(STRIP_LEADING_TX, '').replace(STRIP_TRAILING_TX, '').trim();
+    if (stripped === before) break;
+  }
 
   let lock: LockLevel | 'unknown' = 'unknown';
   let forcesRewrite = false;
@@ -282,6 +302,24 @@ export async function lockCheck(args: LockCheckArgs): Promise<LockCheckResult> {
     );
   }
 
+  // Audit-iteration-1 SP-5 P0 fix: warn that `ADD COLUMN ... NOT NULL`
+  // without a DEFAULT will FAIL on any table that already has rows -
+  // PG cannot synthesize a value for existing rows. Caller likely
+  // wants safe_alter_table's add_not_null_column_with_default recipe.
+  if (
+    // eslint-disable-next-line sonarjs/slow-regex -- bounded DDL input
+    /ADD\s+COLUMN\s+\w+\s+\S+.*\bNOT\s+NULL\b/i.test(stripped) &&
+    !/\bDEFAULT\b/i.test(stripped) &&
+    !/\bGENERATED\b/i.test(stripped)
+  ) {
+    result.warnings.push(
+      'ADD COLUMN NOT NULL without DEFAULT fails immediately if the table has any rows ' +
+      '("column \\"x\\" of relation \\"...\\" contains null values"). For non-empty tables ' +
+      'use safe_alter_table({ kind: "add_not_null_column_with_default", ... }) which ' +
+      'emits a 4-step safe recipe (add nullable → backfill → set default → set NOT NULL).'
+    );
+  }
+
   // Recommendations
   if (/CREATE\s+INDEX\b(?!.*CONCURRENTLY)/i.test(stripped)) {
     result.recommendations.push('Use CREATE INDEX CONCURRENTLY to avoid blocking writes.');
@@ -309,23 +347,47 @@ export async function lockCheck(args: LockCheckArgs): Promise<LockCheckResult> {
 // detect_migration_state
 // ============================================================
 
+/**
+ * Each probe lists the table name AND a set of "signature" columns —
+ * names that must all be present in the table for it to count as that
+ * tool. Audit-iteration-1 SP-5 P0 fix: previously the probe was
+ * to_regclass-only, so any user table named `migrations` was reported
+ * as TypeORM (high false-positive rate). Column shape verification
+ * eliminates this collision.
+ *
+ * Use a generous-but-distinctive subset: enough columns that a casual
+ * user wouldn't have all of them by accident, few enough that minor
+ * version drift in the migration tool doesn't cause us to miss
+ * detection.
+ */
 const MIGRATION_TOOL_PROBES: Array<{
   tool: string;
   table: string;
   schema?: string;
   versionColumn: string;
-  countQuery?: string;
+  /** Lowercase column names that must all be present. */
+  signatureColumns: string[];
 }> = [
-  { tool: 'Liquibase', table: 'databasechangelog', versionColumn: 'id' },
-  { tool: 'Flyway', table: 'flyway_schema_history', versionColumn: 'version' },
-  { tool: 'Alembic', table: 'alembic_version', versionColumn: 'version_num' },
-  { tool: 'Prisma', table: '_prisma_migrations', versionColumn: 'migration_name' },
-  { tool: 'Knex', table: 'knex_migrations', versionColumn: 'name' },
-  { tool: 'Sequelize', table: 'SequelizeMeta', versionColumn: 'name' },
-  { tool: 'Django', table: 'django_migrations', versionColumn: 'name' },
-  { tool: 'Rails', table: 'schema_migrations', versionColumn: 'version' },
-  { tool: 'Goose', table: 'goose_db_version', versionColumn: 'version_id' },
-  { tool: 'TypeORM', table: 'migrations', versionColumn: 'name' },
+  { tool: 'Liquibase', table: 'databasechangelog', versionColumn: 'id',
+    signatureColumns: ['id', 'author', 'filename', 'dateexecuted', 'md5sum'] },
+  { tool: 'Flyway', table: 'flyway_schema_history', versionColumn: 'version',
+    signatureColumns: ['installed_rank', 'version', 'description', 'checksum', 'installed_on'] },
+  { tool: 'Alembic', table: 'alembic_version', versionColumn: 'version_num',
+    signatureColumns: ['version_num'] },
+  { tool: 'Prisma', table: '_prisma_migrations', versionColumn: 'migration_name',
+    signatureColumns: ['id', 'checksum', 'finished_at', 'migration_name'] },
+  { tool: 'Knex', table: 'knex_migrations', versionColumn: 'name',
+    signatureColumns: ['id', 'name', 'batch', 'migration_time'] },
+  { tool: 'Sequelize', table: 'SequelizeMeta', versionColumn: 'name',
+    signatureColumns: ['name'] },
+  { tool: 'Django', table: 'django_migrations', versionColumn: 'name',
+    signatureColumns: ['id', 'app', 'name', 'applied'] },
+  { tool: 'Rails', table: 'schema_migrations', versionColumn: 'version',
+    signatureColumns: ['version'] },
+  { tool: 'Goose', table: 'goose_db_version', versionColumn: 'version_id',
+    signatureColumns: ['id', 'version_id', 'is_applied', 'tstamp'] },
+  { tool: 'TypeORM', table: 'migrations', versionColumn: 'name',
+    signatureColumns: ['id', 'timestamp', 'name'] },
 ];
 
 export interface DetectMigrationStateArgs {
@@ -379,7 +441,19 @@ export async function detectMigrationState(
           `SELECT to_regclass($1) AS reg`,
           [`${s}.${probe.table}`]
         );
-        if (exists.rows[0].reg !== null) {
+        if (exists.rows[0].reg === null) continue;
+        // Audit-iteration-1 SP-5 P0 fix: verify column shape. Without
+        // this, any user table happening to share a probe name (e.g.
+        // a business `migrations` table) is misreported as TypeORM.
+        const colsR = await client.query(
+          `SELECT lower(column_name) AS col
+           FROM information_schema.columns
+           WHERE table_schema = $1 AND table_name = $2`,
+          [s, probe.table]
+        );
+        const cols = new Set(colsR.rows.map((row) => String(row.col)));
+        const missingSig = probe.signatureColumns.filter((c) => !cols.has(c.toLowerCase()));
+        if (missingSig.length === 0) {
           foundIn = s;
           break;
         }

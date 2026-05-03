@@ -118,8 +118,9 @@ export async function transferObjects(
     const targetDb = args.to.database;
     if (dbManager.isReadOnlyFor(targetServer, targetDb)) {
       sourceClient.release();
+      const dbPart = targetDb ? ` database '${targetDb}'` : '';
       throw new Error(
-        `Target server '${targetServer}'${targetDb ? ` database '${targetDb}'` : ''} is in readonly access mode. ` +
+        `Target server '${targetServer}'${dbPart} is in readonly access mode. ` +
         `Cannot apply transferred objects. Use dry_run: true to generate the SQL only, ` +
         `or change the target's effective access mode.`
       );
@@ -246,7 +247,14 @@ export async function transferObjects(
                 continue;
               }
               if (ifExists === 'replace') {
-                const dropSql = buildDropStatement(desc);
+                // Audit-iteration-1 SP-3 P0 fix #6: for functions /
+                // procedures we need full argument signatures (PG can
+                // have multiple overloads); for triggers we need the
+                // table name. Resolve those from the source side
+                // before emitting the drop.
+                const dropSql = await buildDropStatementWithSignature(
+                  sourceClient.client, desc
+                );
                 if (dropSql) {
                   await targetClient!.client.query(dropSql);
                 }
@@ -270,23 +278,41 @@ export async function transferObjects(
       if (tables.length === 0 && (include === 'data')) {
         warnings.push('No tables in source scope; nothing to transfer for data');
       }
+      const targetSchema = args.to.schema ?? sourceClient.schema;
       for (const t of tables) {
         if (dryRun) {
           if (outputStream) {
-            outputStream.write(`-- data: ${qualify(t.schema, t.name)}\n`);
+            const writeChunk = (s: string): void => { outputStream!.write(s); };
+            writeChunk(`-- data: ${qualify(t.schema, t.name)}\n`);
             const result = await emitTableRowsAsInsert(
-              sourceClient.client, t.schema, t.name, outputStream
+              sourceClient.client, t.schema, t.name, writeChunk
             );
             rowsTransferred += result.rowsEmitted;
-            outputStream.write('\n');
+            writeChunk('\n');
           }
         } else {
+          // Audit-iteration-1 SP-3 P0 fix #5: when if_exists='skip',
+          // also skip data transfer for tables that already have rows
+          // on the target. The previous code unconditionally re-INSERTed,
+          // which either errored on PK violations or silently duplicated.
+          if (ifExists === 'skip') {
+            const existingR = await targetClient!.client.query(
+              `SELECT COUNT(*)::bigint AS c FROM ${qualify(targetSchema, t.name)}`
+            );
+            const existing = Number(existingR.rows[0]?.c ?? 0);
+            if (existing > 0) {
+              warnings.push(
+                `Skipped data for ${qualify(targetSchema, t.name)}: target has ${existing} rows already.`
+              );
+              continue;
+            }
+          }
           const rows = await transferTableData(
             sourceClient.client,
             targetClient!.client,
             t.schema,
             t.name,
-            args.to.schema ?? sourceClient.schema
+            targetSchema
           );
           rowsTransferred += rows;
         }
@@ -329,7 +355,12 @@ async function resolveSourceObjects(
   refs: ObjectRefForTransfer[] | '*'
 ): Promise<ObjectDescriptor[]> {
   if (refs === '*') {
-    return listObjectsInScope(client, { schema }, 'all');
+    const all = await listObjectsInScope(client, { schema }, 'all');
+    // The 'public' schema exists by default on every PG database. Don't
+    // try to recreate it - the target already has it. Same for the
+    // language plpgsql which is always pre-installed (we already
+    // exclude it from listObjectsInScope, but defense-in-depth).
+    return all.filter((d) => !(d.kind === 'schema' && d.name === 'public'));
   }
   const out: ObjectDescriptor[] = [];
   for (const ref of refs) {
@@ -414,6 +445,45 @@ async function checkExists(
   }
 }
 
+/**
+ * Audit-iteration-1 SP-3 P0 fix #6: build a DROP that PG can actually
+ * execute on overloaded functions and on triggers (which need the
+ * table name).
+ *
+ * For functions/procedures, fetch the full identity arg list via
+ * `pg_get_function_identity_arguments` so the drop targets the
+ * specific overload. For triggers, fetch the owning table.
+ */
+async function buildDropStatementWithSignature(
+  client: PoolClient,
+  desc: ObjectDescriptor
+): Promise<string | null> {
+  if (desc.kind === 'function' || desc.kind === 'procedure') {
+    const r = await client.query(
+      `SELECT pg_get_function_identity_arguments($1::oid) AS args`,
+      [desc.oid]
+    );
+    const args = r.rows[0]?.args ?? '';
+    const kw = desc.kind === 'procedure' ? 'PROCEDURE' : 'FUNCTION';
+    return `DROP ${kw} IF EXISTS ${qualify(desc.schema, desc.name)}(${args}) CASCADE;`;
+  }
+  if (desc.kind === 'trigger') {
+    const r = await client.query(
+      `SELECT n.nspname AS sch, c.relname AS tbl
+       FROM pg_trigger t
+       JOIN pg_class c ON c.oid = t.tgrelid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE t.oid = $1::oid`,
+      [desc.oid]
+    );
+    if (r.rows.length === 0) return null;
+    const sch = String(r.rows[0].sch);
+    const tbl = String(r.rows[0].tbl);
+    return `DROP TRIGGER IF EXISTS ${safeIdent(desc.name)} ON ${qualify(sch, tbl)};`;
+  }
+  return buildDropStatement(desc);
+}
+
 function buildDropStatement(desc: ObjectDescriptor): string | null {
   switch (desc.kind) {
     case 'table': return `DROP TABLE IF EXISTS ${qualify(desc.schema, desc.name)} CASCADE;`;
@@ -453,7 +523,9 @@ async function transferTableData(
   tableName: string,
   targetSchema: string
 ): Promise<number> {
-  // Discover columns
+  // Audit-iteration-1 SP-3 P0 fix: exclude IDENTITY/GENERATED
+  // columns from data transfer column list - PG rejects explicit
+  // values for either. See data-emitter.ts for full reasoning.
   const colsRes = await source.query(
     `SELECT a.attname
      FROM pg_attribute a
@@ -461,6 +533,8 @@ async function transferTableData(
      JOIN pg_namespace n ON n.oid = c.relnamespace
      WHERE n.nspname = $1 AND c.relname = $2
        AND a.attnum > 0 AND NOT a.attisdropped
+       AND a.attidentity = ''
+       AND a.attgenerated = ''
      ORDER BY a.attnum`,
     [sourceSchema, tableName]
   );
@@ -497,5 +571,35 @@ async function transferTableData(
     );
     total += batch.length;
   }
+
+  // Audit-iteration-1 SP-2/SP-3 P0 fix: sync sequence state after
+  // data load. Source rows came in with explicit serial values; the
+  // target's auto-created sequence still points at 1, so the next
+  // nextval() will collide with our just-loaded data. Walk every
+  // serial-backed column on the target and call setval(seq, max(col))
+  // so the next insert advances past the loaded rows.
+  const seqRes = await target.query(
+    `SELECT
+       a.attname AS col,
+       pg_get_serial_sequence($1, a.attname) AS seq
+     FROM pg_attribute a
+     JOIN pg_class c ON c.oid = a.attrelid
+     JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = $2 AND c.relname = $3
+       AND a.attnum > 0 AND NOT a.attisdropped
+       AND pg_get_serial_sequence($1, a.attname) IS NOT NULL`,
+    [targetQualified, targetSchema, tableName]
+  );
+  for (const seqRow of seqRes.rows) {
+    const col = String(seqRow.col);
+    const seq = String(seqRow.seq);
+    // setval to MAX(col); coalesce to 1 to handle empty tables.
+    // is_called=true so next nextval() advances past max.
+    await target.query(
+      `SELECT setval($1, COALESCE((SELECT MAX(${safeIdent(col)})::bigint FROM ${targetQualified}), 1), true)`,
+      [seq]
+    );
+  }
+
   return total;
 }

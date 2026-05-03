@@ -185,14 +185,24 @@ async function extractTableDDL(
   const warnings: string[] = [];
   const dependencies: number[] = [];
 
-  // Columns
+  // Columns + per-column sequence dependencies (SERIAL columns
+  // reference a sequence via nextval('xxx_id_seq'); the sequence
+  // must be created before the table or the table DDL fails).
   const cols = await client.query(
     `SELECT a.attname,
             pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
             a.attnotnull,
             pg_get_expr(d.adbin, d.adrelid) AS default_expr,
             a.attidentity,
-            a.attgenerated
+            a.attgenerated,
+            (
+              SELECT array_agg(refobjid::int)
+              FROM pg_depend dep
+              WHERE dep.classid = 'pg_attrdef'::regclass
+                AND dep.objid = d.oid
+                AND dep.refclassid = 'pg_class'::regclass
+                AND dep.deptype = 'n'
+            ) AS seq_oids
      FROM pg_attribute a
      LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
      WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped
@@ -205,19 +215,41 @@ async function extractTableDDL(
   }
 
   const colDefs = cols.rows.map((row) => {
-    let def = `  ${qident(row.attname)} ${row.data_type}`;
-    if (row.attidentity) {
-      // GENERATED ... AS IDENTITY
-      const kind = row.attidentity === 'a' ? 'ALWAYS' : 'BY DEFAULT';
-      def += ` GENERATED ${kind} AS IDENTITY`;
-      warnings.push(`Column ${row.attname}: ${UNSUPPORTED_FEATURES.IDENTITY_COLUMN}`);
-    } else if (row.attgenerated === 's') {
-      def += ` GENERATED ALWAYS AS (${row.default_expr}) STORED`;
-      warnings.push(`Column ${row.attname}: ${UNSUPPORTED_FEATURES.GENERATED_COLUMN}`);
-    } else if (row.default_expr) {
-      def += ` DEFAULT ${row.default_expr}`;
+    // Detect SERIAL pattern: integer/bigint/smallint column with a
+    // `nextval('xxx_seq'::regclass)` default and an auto-owned
+    // sequence dependency. Emit SERIAL/BIGSERIAL/SMALLSERIAL instead
+    // so PG creates the sequence implicitly with the table - making
+    // the table DDL self-contained for transfer.
+    const seqOids = (row.seq_oids as number[] | null) ?? [];
+    const looksLikeSerial =
+      seqOids.length > 0 &&
+      typeof row.default_expr === 'string' &&
+      /^nextval\b/i.test(row.default_expr);
+    let def: string;
+    if (looksLikeSerial) {
+      const baseType = String(row.data_type).toLowerCase();
+      let serialType = 'serial';
+      if (baseType === 'bigint') serialType = 'bigserial';
+      else if (baseType === 'smallint') serialType = 'smallserial';
+      def = `  ${qident(row.attname)} ${serialType}`;
+      // SERIAL implies NOT NULL; the original NOT NULL is redundant
+      // but we leave the rest of constraints (PK, etc.) to inline
+      // constraints. No DEFAULT clause needed.
+    } else {
+      def = `  ${qident(row.attname)} ${row.data_type}`;
+      if (row.attidentity) {
+        // GENERATED ... AS IDENTITY
+        const kind = row.attidentity === 'a' ? 'ALWAYS' : 'BY DEFAULT';
+        def += ` GENERATED ${kind} AS IDENTITY`;
+        warnings.push(`Column ${row.attname}: ${UNSUPPORTED_FEATURES.IDENTITY_COLUMN}`);
+      } else if (row.attgenerated === 's') {
+        def += ` GENERATED ALWAYS AS (${row.default_expr}) STORED`;
+        warnings.push(`Column ${row.attname}: ${UNSUPPORTED_FEATURES.GENERATED_COLUMN}`);
+      } else if (row.default_expr) {
+        def += ` DEFAULT ${row.default_expr}`;
+      }
+      if (row.attnotnull) def += ' NOT NULL';
     }
-    if (row.attnotnull) def += ' NOT NULL';
     return def;
   });
 
@@ -301,9 +333,13 @@ async function extractIndexDDL(
   client: PoolClient,
   obj: ObjectDescriptor
 ): Promise<ExtractedDDL> {
+  // Cast $1::oid explicitly. node-pg sends numbers as text, and PG has
+  // both pg_get_indexdef(oid) and pg_get_indexdef(text)-flavored
+  // overload candidates - without the cast PG resolves to the text
+  // form and treats the OID number as a relation name.
   const r = await client.query(
-    `SELECT pg_get_indexdef($1) AS def, indrelid::int AS table_oid
-     FROM pg_index WHERE indexrelid = $1`,
+    `SELECT pg_get_indexdef($1::oid) AS def, indrelid::int AS table_oid
+     FROM pg_index WHERE indexrelid = $1::oid`,
     [obj.oid]
   );
   if (r.rows.length === 0) {
@@ -322,7 +358,8 @@ async function extractViewDDL(
   client: PoolClient,
   obj: ObjectDescriptor
 ): Promise<ExtractedDDL> {
-  const r = await client.query(`SELECT pg_get_viewdef($1, true) AS def`, [obj.oid]);
+  // $1::oid cast - see extractIndexDDL note about pg_get_*def overloading.
+  const r = await client.query(`SELECT pg_get_viewdef($1::oid, true) AS def`, [obj.oid]);
   if (r.rows.length === 0) {
     throw new Error(`View ${obj.name} not found`);
   }
@@ -341,7 +378,7 @@ async function extractMatViewDDL(
   client: PoolClient,
   obj: ObjectDescriptor
 ): Promise<ExtractedDDL> {
-  const r = await client.query(`SELECT pg_get_viewdef($1, true) AS def`, [obj.oid]);
+  const r = await client.query(`SELECT pg_get_viewdef($1::oid, true) AS def`, [obj.oid]);
   if (r.rows.length === 0) {
     throw new Error(`Materialized view ${obj.name} not found`);
   }
@@ -360,7 +397,7 @@ async function extractFunctionDDL(
   client: PoolClient,
   obj: ObjectDescriptor
 ): Promise<ExtractedDDL> {
-  const r = await client.query(`SELECT pg_get_functiondef($1) AS def`, [obj.oid]);
+  const r = await client.query(`SELECT pg_get_functiondef($1::oid) AS def`, [obj.oid]);
   if (r.rows.length === 0) {
     throw new Error(`Function/procedure ${obj.name} not found`);
   }
@@ -380,8 +417,8 @@ async function extractTriggerDDL(
   obj: ObjectDescriptor
 ): Promise<ExtractedDDL> {
   const r = await client.query(
-    `SELECT pg_get_triggerdef($1) AS def, tgrelid::int AS table_oid
-     FROM pg_trigger WHERE oid = $1`,
+    `SELECT pg_get_triggerdef($1::oid) AS def, tgrelid::int AS table_oid
+     FROM pg_trigger WHERE oid = $1::oid`,
     [obj.oid]
   );
   if (r.rows.length === 0) {

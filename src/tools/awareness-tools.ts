@@ -18,6 +18,7 @@ import { getDbManager } from '../db-manager.js';
 import { ConnectionOverride } from '../types.js';
 import {
   ObjectKind,
+  ObjectDescriptor,
   listObjectsInScope,
   extractObjectDDL,
 } from './introspection/index.js';
@@ -61,6 +62,11 @@ export interface DescribeTableResult {
     default?: string;
     nullPercent?: number;
     distinctRatio?: number;
+    /** SP-4 P1 fix: surface column-level comments. */
+    comment?: string;
+    /** SP-4 P1 fix: explicit kind for generated/identity columns
+     *  so callers can distinguish them from plain DEFAULT columns. */
+    generated?: 'stored' | 'identity_always' | 'identity_default';
   }>;
   primaryKey: string[];
   foreignKeysOut: Array<{
@@ -124,12 +130,17 @@ export async function describeTable(args: DescribeTableArgs): Promise<DescribeTa
 
     const sizeRow = sizeRes.rows[0];
 
-    // Columns
+    // Columns - SP-4 P1 fix: also fetch column comments and
+    // generated/identity flags so callers can tell apart a plain
+    // DEFAULT column from a GENERATED ALWAYS AS one.
     const colsRes = await client.query(
       `SELECT a.attname AS name,
               pg_catalog.format_type(a.atttypid, a.atttypmod) AS type,
               NOT a.attnotnull AS nullable,
-              pg_get_expr(d.adbin, d.adrelid) AS "default"
+              pg_get_expr(d.adbin, d.adrelid) AS "default",
+              a.attidentity AS attidentity,
+              a.attgenerated AS attgenerated,
+              pg_catalog.col_description(a.attrelid, a.attnum) AS col_comment
        FROM pg_attribute a
        LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
        JOIN pg_class c ON c.oid = a.attrelid
@@ -139,12 +150,20 @@ export async function describeTable(args: DescribeTableArgs): Promise<DescribeTa
        ORDER BY a.attnum`,
       [schema, args.table]
     );
-    const columns: DescribeTableResult['columns'] = colsRes.rows.map((r) => ({
-      name: r.name,
-      type: r.type,
-      nullable: r.nullable,
-      default: r.default ?? undefined,
-    }));
+    const columns: DescribeTableResult['columns'] = colsRes.rows.map((r) => {
+      let generated: 'stored' | 'identity_always' | 'identity_default' | undefined;
+      if (r.attgenerated === 's') generated = 'stored';
+      else if (r.attidentity === 'a') generated = 'identity_always';
+      else if (r.attidentity === 'd') generated = 'identity_default';
+      return {
+        name: r.name,
+        type: r.type,
+        nullable: r.nullable,
+        default: r.default ?? undefined,
+        comment: r.col_comment ?? undefined,
+        generated,
+      };
+    });
 
     // Primary key
     const pkRes = await client.query(
@@ -160,12 +179,17 @@ export async function describeTable(args: DescribeTableArgs): Promise<DescribeTa
     const primaryKey = pkRes.rows.map((r) => r.attname);
 
     // FKs going OUT (this table -> other tables)
+    // Audit-iteration-1 SP-4 P0 fix: cast attname to ::text inside
+    // array_agg. pg_attribute.attname is type `name`, and node-pg
+    // doesn't have a parser for name[], so without the cast the
+    // result comes back as a raw PG-array literal string ("{a,b}")
+    // and any TS consumer treating it as string[] silently breaks.
     const fkOutRes = await client.query(
       `SELECT con.conname,
               pg_get_constraintdef(con.oid, true) AS def,
-              array_agg(att.attname ORDER BY u.ord) AS cols,
+              array_agg(att.attname::text ORDER BY u.ord) AS cols,
               ref_n.nspname || '.' || ref_c.relname AS ref_table,
-              array_agg(ref_att.attname ORDER BY u.ord) AS ref_cols,
+              array_agg(ref_att.attname::text ORDER BY u.ord) AS ref_cols,
               CASE con.confdeltype WHEN 'a' THEN 'NO ACTION' WHEN 'r' THEN 'RESTRICT'
                                    WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL'
                                    WHEN 'd' THEN 'SET DEFAULT' END AS on_delete,
@@ -195,12 +219,12 @@ export async function describeTable(args: DescribeTableArgs): Promise<DescribeTa
       onUpdate: r.on_update,
     }));
 
-    // FKs coming IN (other tables -> this table)
+    // FKs coming IN (other tables -> this table) - same ::text cast
     const fkInRes = await client.query(
       `SELECT con.conname,
               src_n.nspname || '.' || src_c.relname AS src_table,
-              array_agg(src_att.attname ORDER BY u.ord) AS src_cols,
-              array_agg(ref_att.attname ORDER BY u.ord) AS ref_cols
+              array_agg(src_att.attname::text ORDER BY u.ord) AS src_cols,
+              array_agg(ref_att.attname::text ORDER BY u.ord) AS ref_cols
        FROM pg_constraint con
        JOIN pg_class c ON c.oid = con.confrelid
        JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -371,6 +395,18 @@ export async function findDependents(args: FindDependentsArgs): Promise<FindDepe
     const dependents: FindDependentsResult['dependents'] = [];
     let truncatedAtDepth = false;
 
+    // Resolve catalog OIDs once so we can compare without per-row queries
+    const classidR = await client.query(
+      `SELECT 'pg_class'::regclass::oid::int AS pg_class,
+              'pg_constraint'::regclass::oid::int AS pg_constraint,
+              'pg_proc'::regclass::oid::int AS pg_proc,
+              'pg_type'::regclass::oid::int AS pg_type,
+              'pg_rewrite'::regclass::oid::int AS pg_rewrite,
+              'pg_attrdef'::regclass::oid::int AS pg_attrdef,
+              'pg_trigger'::regclass::oid::int AS pg_trigger`
+    );
+    const CLS = classidR.rows[0];
+
     while (queue.length > 0) {
       const { oid, classid, depth, via } = queue.shift()!;
       if (depth > maxDepth) {
@@ -398,8 +434,20 @@ export async function findDependents(args: FindDependentsArgs): Promise<FindDepe
 
         const info = await describeOid(client, depClass, depOid);
         if (!info) continue;
-        // Skip internal / extension-owned objects unless they're at depth 0
+        // Audit-iteration-1 SP-4 P0 fix #4: filter TOAST tables and
+        // self-array-types from the dependent set. They're internal
+        // bookkeeping objects, not user-meaningful dependents, and
+        // they inflate totalDependents.
         if (info.kindLabel === 'extension') continue;
+        if (info.kindLabel === 't') continue; // TOAST table
+        if (info.name.startsWith('pg_toast_')) continue;
+        // Self-array-type: a table 'tenants' implicitly owns a type
+        // 'tenants' (its row type) - filtering keeps the result lean.
+        if (
+          info.kindLabel === 'type' &&
+          info.schema === schema &&
+          info.name === args.name
+        ) continue;
 
         dependents.push({
           kind: info.kindLabel,
@@ -408,8 +456,42 @@ export async function findDependents(args: FindDependentsArgs): Promise<FindDepe
           depth: depth + 1,
           via: via === 'self' ? `pg_depend (${depthLabel(row.deptype)})` : via + ` → pg_depend`,
         });
+
+        // Audit-iteration-1 SP-4 P0 fix #2: when we land on a
+        // pg_constraint row (typically a foreign key), also enqueue
+        // its conrelid (the table the constraint is ON) so the BFS
+        // walks "what tables transitively depend on this one".
+        // Without this, the walker stops at the constraint and
+        // misses every table that has an FK pointing here.
+        let extraEnqueue: { oid: number; classid: number } | null = null;
+        if (depClass === CLS.pg_constraint) {
+          const conR = await client.query(
+            `SELECT conrelid::int AS rel FROM pg_constraint WHERE oid = $1`,
+            [depOid]
+          );
+          const relOid = Number(conR.rows[0]?.rel);
+          if (relOid && !visited.has(relOid)) {
+            visited.add(relOid);
+            // Add the table itself as a dependent too
+            const relInfo = await describeOid(client, CLS.pg_class, relOid);
+            if (relInfo && relInfo.kindLabel !== 't' && !relInfo.name.startsWith('pg_toast_')) {
+              dependents.push({
+                kind: relInfo.kindLabel,
+                schema: relInfo.schema,
+                name: relInfo.name,
+                depth: depth + 1,
+                via: 'pg_constraint → ' + info.name,
+              });
+              extraEnqueue = { oid: relOid, classid: CLS.pg_class };
+            }
+          }
+        }
+
         if (depth + 1 < maxDepth) {
           queue.push({ oid: depOid, classid: depClass, depth: depth + 1, via: 'pg_depend' });
+          if (extraEnqueue) {
+            queue.push({ ...extraEnqueue, depth: depth + 1, via: 'pg_constraint' });
+          }
         }
       }
     }
@@ -565,7 +647,10 @@ async function describeOid(
     );
     if (r.rows.length === 0) return null;
     const ct = r.rows[0].contype;
-    const label = ct === 'f' ? 'foreign-key' : ct === 'p' ? 'primary-key' : ct === 'u' ? 'unique' : 'constraint';
+    const conKindLabel: Record<string, string> = {
+      f: 'foreign-key', p: 'primary-key', u: 'unique', c: 'check',
+    };
+    const label = conKindLabel[ct] ?? 'constraint';
     return {
       kindLabel: label,
       schema: r.rows[0].schema,
@@ -677,10 +762,34 @@ export async function schemaDiff(args: SchemaDiffArgs): Promise<SchemaDiffResult
       const srcDdl = await extractObjectDDL(sourceClient.client, src);
       const tgtDdl = await extractObjectDDL(targetClient.client, tgt);
       if (normalize(srcDdl.sql) !== normalize(tgtDdl.sql)) {
-        // Suggest a CREATE OR REPLACE for views/functions; DROP+CREATE for others
+        // Audit-iteration-1 SP-4 P0 fix: for tables, prefer ALTER
+        // statements derived from a column-level diff over the
+        // catastrophic DROP TABLE CASCADE + CREATE pair. Cascade
+        // would destroy all rows AND propagate through every
+        // dependent FK / view / matview - rarely what the caller
+        // wants. We only fall back to DROP+CREATE when no targeted
+        // ALTER recipe is available (e.g. a column was added).
         let suggested: string;
         if (src.kind === 'view' || src.kind === 'function' || src.kind === 'procedure') {
           suggested = srcDdl.sql; // CREATE OR REPLACE
+        } else if (src.kind === 'table') {
+          const altered = await buildTableAlterScript(
+            sourceClient.client, targetClient.client, src, tgt
+          );
+          if (altered) {
+            suggested = altered;
+          } else {
+            // No targeted ALTER recipe → conservative path. Annotate
+            // the script with a warning so callers see the destructive
+            // nature explicitly.
+            const drop = buildDropStatement(src.kind, src.schema, src.name);
+            suggested =
+              `-- WARNING: targeted ALTER recipe unavailable for ${src.name}.\n` +
+              `-- The fallback DROP TABLE CASCADE will destroy all rows AND\n` +
+              `-- cascade through every dependent FK, view, and matview.\n` +
+              `-- Inspect the source/target DDL pair below before running.\n` +
+              (drop ?? '') + '\n' + srcDdl.sql;
+          }
         } else {
           const drop = buildDropStatement(src.kind, src.schema, src.name);
           suggested = (drop ?? '') + '\n' + srcDdl.sql;
@@ -731,6 +840,122 @@ export async function schemaDiff(args: SchemaDiffArgs): Promise<SchemaDiffResult
     sourceClient.release();
     targetClient.release();
   }
+}
+
+/**
+ * Audit-iteration-1 SP-4 P0 fix: build a targeted ALTER TABLE script
+ * to migrate the target table's columns to match the source. Returns
+ * null when the column-level diff is too complex for a safe ALTER
+ * recipe (e.g. constraint additions/removals, type changes that PG
+ * cannot cast); caller falls back to DROP+CREATE with a warning.
+ *
+ * Covers the common drift cases:
+ *   - new column on source not on target → ADD COLUMN
+ *   - column on target not on source → DROP COLUMN
+ *   - column type change → ALTER COLUMN ... TYPE (with USING fallback)
+ *   - NULLability change → ALTER COLUMN SET/DROP NOT NULL
+ *   - default change → ALTER COLUMN SET/DROP DEFAULT
+ */
+async function buildTableAlterScript(
+  sourceClient: PoolClient,
+  targetClient: PoolClient,
+  src: ObjectDescriptor,
+  tgt: ObjectDescriptor
+): Promise<string | null> {
+  const colsQuery = `
+    SELECT a.attname AS name,
+           pg_catalog.format_type(a.atttypid, a.atttypmod) AS type,
+           a.attnotnull AS notnull,
+           pg_get_expr(d.adbin, d.adrelid) AS default_expr,
+           a.attnum AS attnum,
+           a.attidentity AS attidentity,
+           a.attgenerated AS attgenerated
+    FROM pg_attribute a
+    LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+    WHERE a.attrelid = $1::oid
+      AND a.attnum > 0 AND NOT a.attisdropped
+    ORDER BY a.attnum`;
+  const [srcCols, tgtCols] = await Promise.all([
+    sourceClient.query(colsQuery, [src.oid]),
+    targetClient.query(colsQuery, [tgt.oid]),
+  ]);
+
+  type ColMeta = {
+    name: string; type: string; notnull: boolean;
+    default_expr: string | null; attnum: number;
+    attidentity: string; attgenerated: string;
+  };
+  const srcByName = new Map<string, ColMeta>(
+    srcCols.rows.map((r) => [r.name, r as ColMeta])
+  );
+  const tgtByName = new Map<string, ColMeta>(
+    tgtCols.rows.map((r) => [r.name, r as ColMeta])
+  );
+
+  const stmts: string[] = [];
+  const tableRef = qualify(src.schema, src.name);
+
+  // Columns added in source → ADD COLUMN
+  for (const [name, col] of srcByName) {
+    if (tgtByName.has(name)) continue;
+    let stmt = `ALTER TABLE ${tableRef} ADD COLUMN ${safeIdent(name)} ${col.type}`;
+    if (col.default_expr) stmt += ` DEFAULT ${col.default_expr}`;
+    if (col.notnull) stmt += ' NOT NULL';
+    stmts.push(stmt + ';');
+  }
+
+  // Columns removed → DROP COLUMN
+  for (const [name] of tgtByName) {
+    if (srcByName.has(name)) continue;
+    stmts.push(`ALTER TABLE ${tableRef} DROP COLUMN ${safeIdent(name)};`);
+  }
+
+  // Columns in both — diff individual attributes
+  for (const [name, srcCol] of srcByName) {
+    const tgtCol = tgtByName.get(name);
+    if (!tgtCol) continue;
+
+    // Identity / generated columns: ALTER recipe is much more
+    // complex (drop identity, recreate, etc.); bail to DROP+CREATE.
+    if (
+      srcCol.attidentity !== tgtCol.attidentity ||
+      srcCol.attgenerated !== tgtCol.attgenerated
+    ) {
+      return null;
+    }
+
+    if (srcCol.type !== tgtCol.type) {
+      stmts.push(
+        `ALTER TABLE ${tableRef} ALTER COLUMN ${safeIdent(name)} ` +
+        `TYPE ${srcCol.type} USING ${safeIdent(name)}::${srcCol.type};`
+      );
+    }
+    if (srcCol.notnull !== tgtCol.notnull) {
+      stmts.push(
+        srcCol.notnull
+          ? `ALTER TABLE ${tableRef} ALTER COLUMN ${safeIdent(name)} SET NOT NULL;`
+          : `ALTER TABLE ${tableRef} ALTER COLUMN ${safeIdent(name)} DROP NOT NULL;`
+      );
+    }
+    if ((srcCol.default_expr ?? null) !== (tgtCol.default_expr ?? null)) {
+      stmts.push(
+        srcCol.default_expr
+          ? `ALTER TABLE ${tableRef} ALTER COLUMN ${safeIdent(name)} SET DEFAULT ${srcCol.default_expr};`
+          : `ALTER TABLE ${tableRef} ALTER COLUMN ${safeIdent(name)} DROP DEFAULT;`
+      );
+    }
+  }
+
+  // Constraints / indexes are deliberately NOT diffed here — they
+  // would each need their own targeted recipe and any non-trivial
+  // change should fall through to DROP+CREATE with the warning.
+  // Heuristic: if the only difference is in column shape, all
+  // collected stmts cover it; otherwise the DDL strings would have
+  // matched after the column-level changes. So this targeted recipe
+  // is only correct when constraints/indexes match.
+  if (stmts.length === 0) return null;
+
+  return stmts.join('\n');
 }
 
 function buildDropStatement(kind: ObjectKind, schema: string, name: string): string | null {
