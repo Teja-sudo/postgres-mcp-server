@@ -32,6 +32,7 @@ import {
   getTransactionInfo,
   listActiveTransactions,
   exportToSqlFile,
+  transferObjects,
 } from "./tools/index.js";
 import { withConnectionRetry } from "./utils/index.js";
 
@@ -56,6 +57,7 @@ const rollbackTransactionWithRetry = withConnectionRetry(rollbackTransaction);
 const getTransactionInfoWithRetry = withConnectionRetry(getTransactionInfo);
 const listActiveTransactionsWithRetry = withConnectionRetry(listActiveTransactions);
 const exportToSqlFileWithRetry = withConnectionRetry(exportToSqlFile);
+const transferObjectsWithRetry = withConnectionRetry(transferObjects);
 
 /**
  * Helper to add connection context to any result
@@ -864,6 +866,68 @@ server.registerTool(
   },
   async (args) => {
     const result = await exportToSqlFileWithRetry(args as any);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "transfer_objects",
+  {
+    description:
+      "Transfer schema (DDL) and/or data from one configured server/database to another (same server, different DB, or fully remote). Builds on the introspection module for DDL extraction with topological ordering. Modes: include='ddl'|'data'|'both'. Behavior on existing target objects: if_exists='skip'|'replace'|'error'. dry_run=true emits the would-be SQL to output_file or returns inline (no target writes). Both endpoints must be configured servers (PG_NAME_*); ad-hoc connection strings are not accepted (security). Refuses if target's effective access mode is readonly. FK constraints between tables are emitted as ALTER TABLE statements appended after tables to handle inter-table dependency cycles.",
+    inputSchema: z.object({
+      from: z.object({
+        server: z.string(),
+        database: z.string().optional(),
+        schema: z.string().optional(),
+      }).describe("Source endpoint."),
+      to: z.object({
+        server: z.string(),
+        database: z.string().optional(),
+        schema: z.string().optional(),
+      }).describe("Target endpoint."),
+      objects: z
+        .union([
+          z.literal("*"),
+          z.array(
+            z.object({
+              kind: z.enum([
+                "extension", "schema", "sequence", "type",
+                "table", "index", "view", "matview",
+                "function", "procedure", "trigger",
+              ]),
+              name: z.string(),
+              schema: z.string().optional(),
+            })
+          ),
+        ])
+        .describe("List of objects, or '*' for all objects in source schema."),
+      include: z
+        .enum(["ddl", "data", "both"])
+        .optional()
+        .default("both"),
+      if_exists: z
+        .enum(["skip", "replace", "error"])
+        .optional()
+        .default("error")
+        .describe("Behavior when a target object already exists."),
+      data_strategy: z
+        .literal("insert_batches")
+        .optional()
+        .default("insert_batches"),
+      dry_run: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Generate SQL without applying. Use with output_file."),
+      output_file: z
+        .string()
+        .optional()
+        .describe("When dry_run is true, write generated SQL to this .sql path."),
+    }),
+  },
+  async (args) => {
+    const result = await transferObjectsWithRetry(args as any);
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );

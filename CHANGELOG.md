@@ -4,6 +4,31 @@ All notable changes to `@tejasanik/postgres-mcp-server` are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/), versioning
 follows [Semantic Versioning](https://semver.org/).
 
+## [2.5.0] — 2026-05-03
+
+### Added (SP-3)
+
+- **`transfer_objects` MCP tool** — releases / moves schema and/or data
+  between two configured servers (same server, different DB, or fully
+  remote). Builds on the SP-2 introspection module:
+  - `from` and `to` endpoints, each `{ server, database, schema }`. Both
+    must be configured servers (`PG_NAME_*`); ad-hoc connection strings
+    are not accepted (security).
+  - `objects: '*' | ObjectRef[]` — transfer everything in source schema
+    or a specific list.
+  - `include: 'ddl' | 'data' | 'both'`.
+  - `if_exists: 'skip' | 'replace' | 'error'` — handles target-side
+    conflicts. `replace` issues a `DROP … CASCADE` before recreating.
+  - `dry_run: true` + `output_file` — emits the would-be SQL without
+    touching the target. Useful for review-before-apply.
+  - Refuses if target's effective access mode is `readonly`.
+  - Apply happens inside a target-side transaction (atomic-or-rollback
+    on the destination).
+  - FK constraints between tables emitted as `ALTER TABLE` statements
+    appended after tables, breaking inter-table dependency cycles.
+  - Data transferred via parameterized INSERT batches (100 rows per
+    statement). Streaming COPY format reserved for v2.
+
 ## [2.4.0] — 2026-05-03
 
 ### Added (SP-2)

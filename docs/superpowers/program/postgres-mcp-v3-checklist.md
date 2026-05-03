@@ -18,7 +18,7 @@ without all three ticks.
 - [x] (S/I) `export_to_sql_file` tool shipped (append + overwrite modes)
 
 ## SP-3 — transfer_objects (v2.5.0)
-- [ ] (S/I/R) `transfer_objects` tool shipped (ddl/data/both, cross-server)
+- [x] (S/I) `transfer_objects` tool shipped (ddl/data/both, cross-server)
 
 ## SP-4 — schema awareness pack (v2.6.0)
 - [ ] (S/I/R) `describe_table` shipped
