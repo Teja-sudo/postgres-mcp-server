@@ -31,8 +31,8 @@ without all three ticks.
 - [x] (S/I) `safe_alter_table` shipped
 
 ## SP-6 — data understanding pack (v2.8.0)
-- [ ] (S/I/R) `column_profile` shipped
-- [ ] (S/I/R) `generate_seed_data` shipped
+- [x] (S/I) `column_profile` shipped
+- [x] (S/I) `generate_seed_data` shipped
 
 ## SP-7 — operations & safety pack (v2.9.0)
 - [ ] (S/I/R) `find_blocking_queries` shipped

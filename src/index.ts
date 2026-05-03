@@ -39,6 +39,8 @@ import {
   lockCheck,
   detectMigrationState,
   safeAlterTable,
+  columnProfile,
+  generateSeedData,
 } from "./tools/index.js";
 import { withConnectionRetry } from "./utils/index.js";
 
@@ -70,6 +72,8 @@ const schemaDiffWithRetry = withConnectionRetry(schemaDiff);
 const lockCheckWithRetry = withConnectionRetry(lockCheck);
 const detectMigrationStateWithRetry = withConnectionRetry(detectMigrationState);
 // safe_alter_table doesn't need a connection (pure logic)
+const columnProfileWithRetry = withConnectionRetry(columnProfile);
+const generateSeedDataWithRetry = withConnectionRetry(generateSeedData);
 
 /**
  * Helper to add connection context to any result
@@ -1102,6 +1106,53 @@ server.registerTool(
   },
   async (args) => {
     const result = await safeAlterTable(args as any);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "column_profile",
+  {
+    description:
+      "Single-pass profile per column: null %, distinct count, top-K values with frequencies, min/max, and type-aware stats (avg/stddev for numeric, length distribution for text, range for temporal). Uses TABLESAMPLE BERNOULLI for tables larger than `sample_threshold` (default 1M rows) to keep latency bounded. Replaces a dozen separate exploratory queries an AI agent would otherwise run to understand a column's shape.",
+    inputSchema: z.object({
+      table: z.string(),
+      schema: z.string().optional().default("public"),
+      columns: z.array(z.string()).optional().describe("Specific columns to profile (default: all up to 30)."),
+      sample_percent: z.number().optional().default(10),
+      sample_threshold: z.number().optional().default(1_000_000),
+      top_k: z.number().optional().default(10).describe("Top-K values per column (max 25)."),
+      server: z.string().optional(),
+      database: z.string().optional(),
+      override_schema: z.string().optional(),
+    }),
+  },
+  async (args) => {
+    const result = await columnProfileWithRetry(args as any);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "generate_seed_data",
+  {
+    description:
+      "Generate schema-aware fake seed data for a table. Respects NOT NULL, UNIQUE/PK (with retry-with-collision-suffix), enum types (cycles through labels), defaults (uses DEFAULT for unknown types), text length limits, and FK columns (skipped or filled — caller's choice). Generates type-appropriate values for numeric, text, boolean, uuid, date/timestamp, bytea, JSON, inet, cidr, macaddr. Per-column overrides via `column_values`. Apply directly (default) or return SQL only via `apply: false`.",
+    inputSchema: z.object({
+      table: z.string(),
+      schema: z.string().optional().default("public"),
+      count: z.number().min(1).max(100_000),
+      column_values: z.record(z.string(), z.string()).optional()
+        .describe("Per-column SQL value override (e.g. { country: \"'US'\", priority: '1' }). Quoted as PG literals."),
+      skip_fks: z.boolean().optional().default(false),
+      apply: z.boolean().optional().default(true).describe("Apply to DB (default true) or return SQL only (false)."),
+      server: z.string().optional(),
+      database: z.string().optional(),
+      override_schema: z.string().optional(),
+    }),
+  },
+  async (args) => {
+    const result = await generateSeedDataWithRetry(args as any);
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );

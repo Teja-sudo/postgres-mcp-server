@@ -4,6 +4,28 @@ All notable changes to `@tejasanik/postgres-mcp-server` are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/), versioning
 follows [Semantic Versioning](https://semver.org/).
 
+## [2.8.0] — 2026-05-03
+
+### Added (SP-6 — data understanding pack)
+
+- **`column_profile` MCP tool** — single-pass profile per column:
+  null count + percent, distinct count + ratio, top-K values with
+  frequencies (default 10, max 25), and type-aware stats (min/max/
+  avg/stddev for numeric, length min/max/avg for text, range for
+  temporal). Uses `TABLESAMPLE BERNOULLI` for tables larger than
+  `sample_threshold` (default 1M rows) to bound latency. Replaces
+  ~10 separate exploratory queries.
+- **`generate_seed_data` MCP tool** — schema-aware fake seed data
+  generation. Respects NOT NULL (uses DEFAULT for unknown types),
+  UNIQUE/PK (retry-with-suffix to avoid collisions), enum types
+  (cycles through labels), text length limits, generated/identity
+  columns (skipped). Generates type-appropriate values for numeric
+  (integer/bigint/numeric/decimal), text (text/varchar/char/citext),
+  boolean, uuid (`gen_random_uuid()`), date/timestamp (epoch +
+  rowIndex), bytea, JSON, inet, cidr, macaddr. Per-column overrides
+  via `column_values` (caller supplies the SQL literal). Apply mode
+  default; `apply: false` returns SQL only for review.
+
 ## [2.7.0] — 2026-05-03
 
 ### Added (SP-5 — migration safety pack)
