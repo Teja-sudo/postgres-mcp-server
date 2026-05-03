@@ -31,6 +31,7 @@ import {
   getConnectionContext,
   getTransactionInfo,
   listActiveTransactions,
+  exportToSqlFile,
 } from "./tools/index.js";
 import { withConnectionRetry } from "./utils/index.js";
 
@@ -54,6 +55,7 @@ const commitTransactionWithRetry = withConnectionRetry(commitTransaction);
 const rollbackTransactionWithRetry = withConnectionRetry(rollbackTransaction);
 const getTransactionInfoWithRetry = withConnectionRetry(getTransactionInfo);
 const listActiveTransactionsWithRetry = withConnectionRetry(listActiveTransactions);
+const exportToSqlFileWithRetry = withConnectionRetry(exportToSqlFile);
 
 /**
  * Helper to add connection context to any result
@@ -798,6 +800,70 @@ server.registerTool(
   },
   async (args) => {
     const result = await analyzeQueryIndexesWithRetry(args);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "export_to_sql_file",
+  {
+    description:
+      "Export schema (DDL) and/or data from the connected database to a .sql file. Supports four content kinds via the 'what' parameter: 'objects' (DDL of a list of objects), 'data' (INSERT statements for tables), 'schema_dump' (full schema, optionally with data), 'query_result' (SELECT result emitted as INSERTs into a target table). Mode is 'append' (default, appends to existing file with separator banner) or 'overwrite'. The header banner records timestamp and source server alias (host/port hidden). Use this before transfer_objects or for migration script generation.",
+    inputSchema: z.object({
+      filePath: z.string().describe("Absolute or relative path to the .sql file. Must end with .sql."),
+      mode: z
+        .enum(["append", "overwrite"])
+        .optional()
+        .default("append")
+        .describe("File write mode. Append (default) preserves existing content with a separator banner; overwrite replaces the file."),
+      what: z
+        .union([
+          z.object({
+            kind: z.literal("objects"),
+            objects: z
+              .array(
+                z.object({
+                  kind: z.enum([
+                    "extension", "schema", "sequence", "type",
+                    "table", "index", "view", "matview",
+                    "function", "procedure", "trigger",
+                  ]),
+                  name: z.string(),
+                  schema: z.string().optional(),
+                })
+              )
+              .describe("List of objects to export DDL for. Topologically ordered by dependency."),
+          }),
+          z.object({
+            kind: z.literal("data"),
+            tables: z.array(z.string()).describe("Schema-qualified or scope-relative table names."),
+            format: z.literal("insert").optional().default("insert"),
+            where: z.string().optional().describe("WHERE clause (without the keyword)"),
+            orderBy: z.string().optional(),
+            limit: z.number().optional(),
+          }),
+          z.object({
+            kind: z.literal("schema_dump"),
+            schema: z.string().optional(),
+            include_data: z.boolean().optional().default(false),
+          }),
+          z.object({
+            kind: z.literal("query_result"),
+            sql: z.string(),
+            target_table: z.string().describe("Schema-qualified target table for the emitted INSERT statements."),
+          }),
+        ]),
+      include_create_if_not_exists: z.boolean().optional().default(true),
+      confirm_overwrite: z.boolean().optional().describe(
+        "When mode='overwrite' and file was modified <60s ago, set true to confirm. Foot-gun guard."
+      ),
+      server: z.string().optional().describe("One-time server override."),
+      database: z.string().optional().describe("One-time database override."),
+      schema: z.string().optional().describe("One-time schema override (sets default schema for refs)."),
+    }),
+  },
+  async (args) => {
+    const result = await exportToSqlFileWithRetry(args as any);
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );

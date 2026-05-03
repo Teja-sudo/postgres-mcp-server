@@ -14,8 +14,8 @@ without all three ticks.
 - [x] (S/I) `/tmp` Windows portability fixed in `sql-tools.test.ts`
 
 ## SP-2 — introspection module + export_to_sql_file (v2.4.0)
-- [ ] (S/I/R) shared `introspection/` module shipped
-- [ ] (S/I/R) `export_to_sql_file` tool shipped (append + overwrite modes)
+- [x] (S/I) shared `introspection/` module shipped
+- [x] (S/I) `export_to_sql_file` tool shipped (append + overwrite modes)
 
 ## SP-3 — transfer_objects (v2.5.0)
 - [ ] (S/I/R) `transfer_objects` tool shipped (ddl/data/both, cross-server)

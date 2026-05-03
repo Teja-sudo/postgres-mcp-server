@@ -4,6 +4,49 @@ All notable changes to `@tejasanik/postgres-mcp-server` are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/), versioning
 follows [Semantic Versioning](https://semver.org/).
 
+## [2.4.0] — 2026-05-03
+
+### Added (SP-2)
+
+- **`export_to_sql_file` MCP tool** — exports schema and/or data from
+  the connected database to a `.sql` file. Four content variants:
+  - `{ kind: 'objects', objects }` — DDL of a list of objects, ordered
+    topologically by dependency.
+  - `{ kind: 'data', tables, where, orderBy, limit }` — INSERT statements
+    for the listed tables, with optional WHERE / ORDER BY / LIMIT.
+  - `{ kind: 'schema_dump', schema, include_data }` — full schema (and
+    optionally data) for a schema.
+  - `{ kind: 'query_result', sql, target_table }` — SELECT result emitted
+    as INSERTs into a named target table.
+  - Modes: `append` (default, preserves existing content with separator
+    banner) or `overwrite`. Foot-gun guard refuses overwrite of
+    files modified <60s ago unless `confirm_overwrite: true`.
+  - Header banner records timestamp + source server alias (host/port
+    intentionally hidden, consistent with `list_servers` policy).
+  - Refuses writes to sensitive paths (`.env*`, `node_modules/`,
+    `.git/`).
+- **`introspection/` shared module** — building block for SP-3
+  (transfer_objects), SP-4 (describe_table, find_dependents,
+  schema_diff). Public surface:
+  - `listObjectsInScope(client, scope, kind)` — discover objects
+  - `extractObjectDDL(client, descriptor)` — DDL string + dependencies +
+    warnings (per object)
+  - `buildDependencyGraph(input)` / `topologicallyOrder(graph)` —
+    creation-order resolution
+  - `emitTableRowsAsInsert(...)` / `formatSqlLiteral(value)` — data emit
+- **Supported object kinds** (DDL extraction): extension, schema,
+  sequence, type (enum + composite), table, index, view, materialized
+  view, function, procedure, trigger.
+- **Documented unsupported features** (SP-2 v1) — RLS policies,
+  exclusion constraints, partition hierarchies, generated/identity
+  columns (rendered approximately), domains, range types, custom
+  collations / text-search configs / operator classes / aggregates,
+  rules, large objects, foreign tables. Each surface a warning rather
+  than silently dropping.
+- **Foreign-key handling** — FKs are emitted as `ALTER TABLE ... ADD
+  CONSTRAINT` statements appended after all tables, so cyclic FKs
+  between tables don't break creation order.
+
 ## [2.3.1] — 2026-05-03
 
 ### Fixed (SP-1)
