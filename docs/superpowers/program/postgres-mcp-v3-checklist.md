@@ -21,9 +21,9 @@ without all three ticks.
 - [x] (S/I) `transfer_objects` tool shipped (ddl/data/both, cross-server)
 
 ## SP-4 — schema awareness pack (v2.6.0)
-- [ ] (S/I/R) `describe_table` shipped
-- [ ] (S/I/R) `find_dependents` shipped
-- [ ] (S/I/R) `schema_diff` shipped
+- [x] (S/I) `describe_table` shipped
+- [x] (S/I) `find_dependents` shipped
+- [x] (S/I) `schema_diff` shipped
 
 ## SP-5 — migration safety pack (v2.7.0)
 - [ ] (S/I/R) `lock_check` shipped

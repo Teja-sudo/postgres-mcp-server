@@ -4,6 +4,33 @@ All notable changes to `@tejasanik/postgres-mcp-server` are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/), versioning
 follows [Semantic Versioning](https://semver.org/).
 
+## [2.6.0] — 2026-05-03
+
+### Added (SP-4 — schema awareness pack)
+
+- **`describe_table` MCP tool** — single rich call replacing ~5 separate
+  ones (get_object_details + sample SELECT + COUNT + pg_stats lookup).
+  Returns columns (with null %/distinct ratio from pg_stats), primary
+  key, foreign keys going OUT (this table → others) AND coming IN
+  (others → this table), indexes (with definitions), table size,
+  row-count estimate, sample rows, comment.
+- **`find_dependents` MCP tool** — recursive walk of `pg_depend` to
+  find every object that depends on a target. Classifies dependents
+  (tables, views, matviews, foreign-keys, indexes, functions, types,
+  rules) with depth and dependency reason ('normal', 'auto',
+  'internal', 'extension', 'pin'). Use BEFORE running DROP CASCADE.
+  Configurable max_depth (default 5).
+- **`schema_diff` MCP tool** — DDL delta between two
+  `{ server, database, schema }` endpoints. Returns:
+  - `toCreate`: in source but not in target
+  - `toDrop`: in target but not in source
+  - `toModify`: in both, but DDL drifted (CREATE OR REPLACE for
+    views/functions/procedures; DROP+CREATE for everything else)
+  - `migrationSql`: single script that, when applied to the TARGET,
+    converges its schema with the SOURCE.
+  Source is the source-of-truth. All comparisons happen at the DDL-string
+  level after comment stripping + whitespace normalization.
+
 ## [2.5.0] — 2026-05-03
 
 ### Added (SP-3)

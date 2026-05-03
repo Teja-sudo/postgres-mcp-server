@@ -33,6 +33,9 @@ import {
   listActiveTransactions,
   exportToSqlFile,
   transferObjects,
+  describeTable,
+  findDependents,
+  schemaDiff,
 } from "./tools/index.js";
 import { withConnectionRetry } from "./utils/index.js";
 
@@ -58,6 +61,9 @@ const getTransactionInfoWithRetry = withConnectionRetry(getTransactionInfo);
 const listActiveTransactionsWithRetry = withConnectionRetry(listActiveTransactions);
 const exportToSqlFileWithRetry = withConnectionRetry(exportToSqlFile);
 const transferObjectsWithRetry = withConnectionRetry(transferObjects);
+const describeTableWithRetry = withConnectionRetry(describeTable);
+const findDependentsWithRetry = withConnectionRetry(findDependents);
+const schemaDiffWithRetry = withConnectionRetry(schemaDiff);
 
 /**
  * Helper to add connection context to any result
@@ -928,6 +934,75 @@ server.registerTool(
   },
   async (args) => {
     const result = await transferObjectsWithRetry(args as any);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "describe_table",
+  {
+    description:
+      "Single rich call describing a table: columns (type/nullable/default + null %/distinct ratio from pg_stats), primary key, foreign keys going OUT (this table → others) AND coming IN (others → this table), all indexes (with definitions), table size, row-count estimate, and sample rows. Replaces ~5 separate calls (get_object_details + LIMIT 5 + COUNT(*) + pg_stats).",
+    inputSchema: z.object({
+      table: z.string().describe("Table name (unqualified — use schema for the schema)."),
+      schema: z.string().optional().default("public"),
+      sample_size: z.number().optional().default(5).describe("Number of sample rows to fetch (0 to skip)."),
+      profile_columns: z.array(z.string()).optional().describe("Columns to profile (default: all up to 20)."),
+      server: z.string().optional(),
+      database: z.string().optional(),
+      override_schema: z.string().optional().describe("One-time schema override for the connection (separate from `schema` which is the table's schema)."),
+    }),
+  },
+  async (args) => {
+    const result = await describeTableWithRetry(args as any);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "find_dependents",
+  {
+    description:
+      "Find what depends on a database object before dropping it. Recursively walks pg_depend, classifies dependents (views, foreign keys, functions, materialized views, indexes, rules) and reports each with its depth from the target. Use this BEFORE running DROP CASCADE to understand the blast radius. Returns the dependent objects flattened with `depth` (1 = directly depends, 2 = depends on a depth-1 dependent, etc).",
+    inputSchema: z.object({
+      name: z.string().describe("Object name."),
+      kind: z.enum([
+        "table", "view", "matview", "sequence", "index",
+        "function", "procedure", "type", "extension", "schema",
+      ]).optional().default("table"),
+      schema: z.string().optional().default("public"),
+      max_depth: z.number().optional().default(5).describe("Recursion limit (1-10)."),
+      server: z.string().optional(),
+      database: z.string().optional(),
+      override_schema: z.string().optional(),
+    }),
+  },
+  async (args) => {
+    const result = await findDependentsWithRetry(args as any);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "schema_diff",
+  {
+    description:
+      "Compute the DDL delta between two { server, database, schema } endpoints. Returns objects to CREATE (in source but not target), DROP (in target but not source), and MODIFY (in both, but DDL differs), plus a single `migrationSql` script that, when applied to the TARGET, converges its schema with the SOURCE. CREATE OR REPLACE is used for views/functions/procedures; DROP+CREATE for everything else. Source is the source of truth.",
+    inputSchema: z.object({
+      source: z.object({
+        server: z.string(),
+        database: z.string().optional(),
+        schema: z.string().optional(),
+      }),
+      target: z.object({
+        server: z.string(),
+        database: z.string().optional(),
+        schema: z.string().optional(),
+      }),
+    }),
+  },
+  async (args) => {
+    const result = await schemaDiffWithRetry(args as any);
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );
