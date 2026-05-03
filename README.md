@@ -18,79 +18,46 @@ npx postgres-mcp-server
 
 ## Configuration
 
-### Environment Variables
-
-You can configure servers using either **individual environment variables** (recommended) or a **JSON string** (legacy).
-
-#### Option 1: Individual Environment Variables (Recommended)
-
-Configure each server using `PG_*` prefixed variables with a numeric or named suffix:
+Configure each server using `PG_*` environment variables. The suffix (`_1`, `_2`, `_DEV`, `_PROD`, …) can be any string — the server is detected by the presence of `PG_NAME_*`.
 
 ```bash
-# Server 1 - Development
-export PG_NAME_1="dev"
-export PG_HOST_1="dev.example.com"
-export PG_PORT_1="5432"
-export PG_USERNAME_1="dev_user"
-export PG_PASSWORD_1="dev_password"
-export PG_DATABASE_1="myapp_dev"
-export PG_SCHEMA_1="public"
-export PG_SSL_1="true"
-export PG_DEFAULT_1="true"
-export PG_CONTEXT_1="Development server. Feel free to run any queries. Test data only."
-
-# Server 2 - Staging
-export PG_NAME_2="staging"
-export PG_HOST_2="staging.example.com"
-export PG_PORT_2="5432"
-export PG_USERNAME_2="staging_user"
-export PG_PASSWORD_2="staging_password"
-export PG_DATABASE_2="myapp_staging"
-export PG_SSL_2="require"
-export PG_CONTEXT_2="Staging server with production-like data. Avoid bulk deletes. Use LIMIT on large tables."
-
-# Server 3 - Production
-export PG_NAME_3="production"
-export PG_HOST_3="prod.example.com"
-export PG_PORT_3="5432"
-export PG_USERNAME_3="prod_user"
-export PG_PASSWORD_3="prod_password"
-export PG_DATABASE_3="myapp_prod"
-export PG_SCHEMA_3="app"
-export PG_SSL_3="true"
-export PG_CONTEXT_3="PRODUCTION - Read-only queries only. Always use LIMIT. Avoid full table scans. Peak hours: 9am-5pm EST."
+PG_NAME_1="prod"
+PG_HOST_1="prod.example.com"
+PG_PORT_1="5432"
+PG_USERNAME_1="user"
+PG_PASSWORD_1="pass"
+PG_DATABASE_1="mydb"
+PG_SSL_1="true"
+PG_DEFAULT_1="true"
+PG_ACCESS_MODE_1="readonly"
+PG_DB_ACCESS_MODES_1="analytics:full,staging:rw"
 ```
 
 **Environment Variable Reference:**
 
-| Variable          | Required | Description                                                        |
-| ----------------- | -------- | ------------------------------------------------------------------ |
-| `PG_NAME_{n}`     | Yes      | Server name (used to identify the server)                          |
-| `PG_HOST_{n}`     | Yes      | PostgreSQL server hostname                                         |
-| `PG_PORT_{n}`     | No       | Port number (default: "5432")                                      |
-| `PG_USERNAME_{n}` | Yes      | Database username                                                  |
-| `PG_PASSWORD_{n}` | No       | Database password                                                  |
-| `PG_DATABASE_{n}` | No       | Default database (default: "postgres")                             |
-| `PG_SCHEMA_{n}`   | No       | Default schema (default: "public")                                 |
-| `PG_SSL_{n}`      | No       | SSL mode: `true`, `false`, `require`, `prefer`, `allow`, `disable` |
-| `PG_DEFAULT_{n}`  | No       | Set to `true` to make this the default server                      |
-| `PG_CONTEXT_{n}`  | No       | AI context/guidance for this server (see below)                    |
+| Variable                  | Required | Description                                                                       |
+| ------------------------- | -------- | --------------------------------------------------------------------------------- |
+| `PG_NAME_{n}`             | Yes      | Server name (used to identify the server)                                         |
+| `PG_HOST_{n}`             | Yes      | PostgreSQL server hostname                                                        |
+| `PG_PORT_{n}`             | No       | Port number (default: `"5432"`)                                                   |
+| `PG_USERNAME_{n}`         | Yes      | Database username                                                                 |
+| `PG_PASSWORD_{n}`         | No       | Database password                                                                 |
+| `PG_DATABASE_{n}`         | No       | Default database (default: `"postgres"`)                                          |
+| `PG_SCHEMA_{n}`           | No       | Default schema (default: `"public"`)                                              |
+| `PG_SSL_{n}`              | No       | SSL mode: `true`, `false`, `require`, `prefer`, `allow`, `disable`                |
+| `PG_DEFAULT_{n}`          | No       | Set to `true` to make this the default server on startup                          |
+| `PG_CONTEXT_{n}`          | No       | AI context/guidance for this server (see below)                                   |
+| `PG_ACCESS_MODE_{n}`      | No       | Server-wide access mode: `readonly` / `full` (overrides `POSTGRES_ACCESS_MODE`)   |
+| `PG_DB_ACCESS_MODES_{n}`  | No       | Per-DB access mode overrides: `dbname:mode,dbname:mode` (e.g. `analytics:full`)   |
 
-#### AI Context for Servers
+### AI Context for Servers
 
-The `PG_CONTEXT_{n}` variable allows you to provide guidance to AI agents about how to interact with each server. This context is returned in `list_servers` and `get_current_connection` responses, helping AI agents make better decisions.
-
-**Example context values:**
+`PG_CONTEXT_{n}` provides guidance to AI agents about how to interact with each server. The context is returned in `list_servers` and `get_current_connection` responses so AI agents can adjust their behavior accordingly.
 
 ```bash
-# Development - full access
-export PG_CONTEXT_DEV="Development environment. Safe to run any queries. Contains test data only."
-
-# Staging - be careful
-export PG_CONTEXT_STAGING="Staging with production-like data. Use LIMIT clauses. Avoid bulk operations."
-
-# Production - strict guidelines
-export PG_CONTEXT_PROD="PRODUCTION DATABASE - CRITICAL GUIDELINES:
+PG_CONTEXT_DEV="Development environment. Safe to run any queries. Contains test data only."
+PG_CONTEXT_STAGING="Staging with production-like data. Use LIMIT clauses. Avoid bulk operations."
+PG_CONTEXT_PROD="PRODUCTION DATABASE - CRITICAL GUIDELINES:
 - Read-only queries strongly preferred
 - Always use LIMIT (max 1000 rows)
 - Avoid full table scans on large tables (users, orders, events)
@@ -99,131 +66,51 @@ export PG_CONTEXT_PROD="PRODUCTION DATABASE - CRITICAL GUIDELINES:
 - Contact DBA before any DDL operations"
 ```
 
-The context appears in the `list_servers` response for each server and in `get_current_connection` for the active server, allowing AI agents to adjust their behavior accordingly.
+### Access Mode Configuration
 
-**Note:** The suffix `{n}` can be any string (e.g., `_1`, `_2`, `_DEV`, `_PROD`). The system detects servers by looking for `PG_NAME_*` variables.
+Access modes control whether write operations are allowed. Configure at three levels with the following priority:
 
-#### Option 2: JSON Configuration (Legacy)
-
-Set the `POSTGRES_SERVERS` environment variable with a JSON object:
+**Priority:** Database-level > Server-level > Global > default (`full`)
 
 ```bash
-export POSTGRES_SERVERS='{
-  "dev": {
-    "host": "dev.example.com",
-    "port": "5432",
-    "username": "your_username",
-    "password": "your_password",
-    "defaultDatabase": "myapp_dev",
-    "defaultSchema": "public",
-    "isDefault": true,
-    "ssl": true,
-    "context": "Development server. Safe for any queries."
-  },
-  "production": {
-    "host": "prod.example.com",
-    "port": "5432",
-    "username": "your_username",
-    "password": "your_password",
-    "defaultDatabase": "myapp_prod",
-    "ssl": "require",
-    "context": "PRODUCTION - Read-only queries only. Always use LIMIT."
+# Global default for all servers (optional)
+POSTGRES_ACCESS_MODE="readonly"   # full | readonly
+
+# Server-level override (recommended for production)
+PG_ACCESS_MODE_1="readonly"
+
+# Per-database override (most specific). Format: dbname:mode,dbname:mode
+PG_DB_ACCESS_MODES_1="production:readonly,analytics:full,staging:rw"
+```
+
+**Supported values:**
+- `full` / `rw` / `readwrite` — allows all SQL operations
+- `readonly` / `ro` / `read-only` — only SELECT and read operations allowed
+
+### Claude Code CLI
+
+```bash
+claude mcp add-json postgres_dbs --scope user '{
+  "command": "npx",
+  "args": ["-y", "@tejasanik/postgres-mcp-server"],
+  "env": {
+    "PG_NAME_1": "prod",
+    "PG_HOST_1": "prod.example.com",
+    "PG_PORT_1": "5432",
+    "PG_USERNAME_1": "user",
+    "PG_PASSWORD_1": "pass",
+    "PG_DATABASE_1": "mydb",
+    "PG_SSL_1": "true",
+    "PG_DEFAULT_1": "true",
+    "PG_ACCESS_MODE_1": "readonly",
+    "PG_DB_ACCESS_MODES_1": "analytics:full,staging:rw"
   }
 }'
 ```
 
-**JSON Configuration Options:**
+### Claude Desktop
 
-- `host` (required): PostgreSQL server hostname
-- `port` (optional): Port number (default: "5432")
-- `username` (required): Database username
-- `password` (required): Database password
-- `defaultDatabase` (optional): Default database to connect to (default: "postgres")
-- `defaultSchema` (optional): Default schema to use (default: "public")
-- `isDefault` (optional): Mark this server as the default server to connect to
-- `ssl` (optional): SSL/TLS connection configuration:
-  - `true` or `"require"`: Enable SSL (recommended for cloud databases)
-  - `"prefer"`: Use SSL if available
-  - `"allow"`: Try non-SSL first, then SSL
-  - `false` or `"disable"`: Disable SSL
-  - Object: `{ "rejectUnauthorized": false, "ca": "...", "cert": "...", "key": "..." }`
-
-**Note:** If both formats are used, individual `PG_*` variables take precedence over `POSTGRES_SERVERS`.
-
-#### Access Mode Configuration
-
-Access modes control whether write operations are allowed. You can configure access at three levels with the following priority:
-
-**Priority:** Database-level > Server-level > Global > default (full)
-
-##### Global Access Mode (POSTGRES_ACCESS_MODE)
-
-Sets the default access mode for all servers and databases:
-
-```bash
-# For read-only access (recommended for production)
-export POSTGRES_ACCESS_MODE="readonly"
-
-# For full access (use with caution)
-export POSTGRES_ACCESS_MODE="full"
-```
-
-**Supported values:**
-- `full` / `rw` / `readwrite`: Full access - allows all SQL operations
-- `readonly` / `ro` / `read-only`: Read-only mode - only SELECT and read operations allowed
-
-##### Server-Level Access Mode (PG_ACCESS_MODE_*)
-
-Override global access mode for specific servers:
-
-```bash
-# Server 1: read-only (production)
-export PG_ACCESS_MODE_1="readonly"
-
-# Server 2: full access (development)
-export PG_ACCESS_MODE_DEV="full"
-```
-
-##### Database-Level Access Mode (PG_DB_ACCESS_MODES_*)
-
-Override server access mode for specific databases. Format: `dbname:mode,dbname:mode`
-
-```bash
-# For server 1: production db is readonly, analytics has full access
-export PG_DB_ACCESS_MODES_1="production:readonly,analytics:full,staging:rw"
-
-# For server PROD: specific database overrides
-export PG_DB_ACCESS_MODES_PROD="users_db:ro,logs:readonly,dev_db:full"
-```
-
-##### JSON Configuration (POSTGRES_SERVERS)
-
-Access modes can also be configured in the JSON format:
-
-```json
-{
-  "production": {
-    "host": "prod.example.com",
-    "username": "user",
-    "password": "pass",
-    "accessMode": "readonly",
-    "databaseAccessModes": {
-      "analytics": "full",
-      "reporting": "readonly"
-    }
-  },
-  "development": {
-    "host": "dev.example.com",
-    "username": "user",
-    "password": "pass",
-    "accessMode": "full"
-  }
-}
-```
-
-### Claude Desktop Configuration
-
-Add the server to your Claude Desktop MCP configuration (`claude_desktop_config.json`):
+Add to `claude_desktop_config.json`:
 
 ```json
 {
@@ -248,33 +135,26 @@ Add the server to your Claude Desktop MCP configuration (`claude_desktop_config.
 }
 ```
 
-### Claude Code CLI Configuration
+### Codex CLI
 
-Add the server using the Claude Code CLI:
+Add to `~/.codex/config.toml`:
 
-```bash
-claude mcp add-json postgres_dbs --scope user '{
-  "command": "npx",
-  "args": ["-y","@tejasanik/postgres-mcp-server"],
-  "env": {
-    "PG_NAME_1": "prod",
-    "PG_HOST_1": "prod.example.com",
-    "PG_PORT_1": "5432",
-    "PG_USERNAME_1": "user",
-    "PG_PASSWORD_1": "pass",
-    "PG_DATABASE_1": "mydb",
-    "PG_SSL_1": "true",
-    "PG_DEFAULT_1": "true",
-    "PG_ACCESS_MODE_1": "readonly",
-    "PG_DB_ACCESS_MODES_1": "analytics:full",
-    "PG_NAME_2": "dev",
-    "PG_HOST_2": "dev.example.com",
-    "PG_USERNAME_2": "user",
-    "PG_PASSWORD_2": "pass",
-    "PG_SSL_2": "true",
-    "PG_ACCESS_MODE_2": "full"
-  }
-}'
+```toml
+[mcp_servers.postgres]
+command = "npx"
+args = ["-y", "@tejasanik/postgres-mcp-server"]
+
+[mcp_servers.postgres.env]
+PG_NAME_1 = "prod"
+PG_HOST_1 = "prod.example.com"
+PG_PORT_1 = "5432"
+PG_USERNAME_1 = "user"
+PG_PASSWORD_1 = "pass"
+PG_DATABASE_1 = "mydb"
+PG_SSL_1 = "true"
+PG_DEFAULT_1 = "true"
+PG_ACCESS_MODE_1 = "readonly"
+PG_DB_ACCESS_MODES_1 = "analytics:full,staging:rw"
 ```
 
 ## Available Tools
@@ -1303,7 +1183,7 @@ After live audit testing across multiple iterations against a real PG 17 cluster
 
 ### Real-World Experience
 
-**Task:** Deploy a PostgreSQL function to two databases (dev + GraphQL-Intro-DB)
+**Task:** Deploy a PostgreSQL function to two databases (dev + analytics)
 
 1. **Discovery**: `list_servers` showed all configured servers
 2. **Preview**: Used `preview_sql_file` to check the file structure
