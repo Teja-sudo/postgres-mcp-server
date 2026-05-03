@@ -4,6 +4,110 @@ All notable changes to `@tejasanik/postgres-mcp-server` are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/), versioning
 follows [Semantic Versioning](https://semver.org/).
 
+## [3.0.1] — 2026-05-04
+
+Audit-loop iteration 3: all 36 MCP tools reviewed against a real PG 17
+cluster with complex schemas (FKs, partial indexes, materialized views,
+cycles). Fixes are bug-only; no new tools and no breaking API changes.
+
+### Fixed
+
+- **`switch_server_db` validates inputs before tearing down the live
+  pool.** Previously, a malformed `dbName` or `schema` killed the
+  current connection on its way to throwing. Validation now runs first;
+  the pool is only closed once inputs are accepted.
+- **`detect_migration_state` recognizes quoted-identifier tracker
+  tables.** Replaced `to_regclass($1)` with
+  `to_regclass(format('%I.%I', $1, $2))`, so Sequelize's mixed-case
+  `"SequelizeMeta"` (and any other tool that uses quoted identifiers)
+  is detected.
+- **`list_databases` / `list_servers` `maxResults` clamped non-negative**
+  via `Math.max(requested, 0)` (was `Math.min(maxResults || 50, 200)`,
+  which let `-1` slip through as the default).
+- **`find_dependents.truncatedAtDepth` actually trips at the boundary.**
+  Off-by-one in the depth check meant the flag never reflected real
+  truncation. The walker now enqueues up to and including `max_depth`
+  and sets the flag exactly when the next layer is suppressed.
+- **EXPLAIN-plan column-reference parser handles qualified names.**
+  PG 17's EXPLAIN output emits `(orders.status = ...)` for joined
+  predicates; the analyzer now matches both `col` and `tbl.col` forms
+  when extracting referenced columns.
+- **`safe_alter_table.create_index` rejects unknown `index_type`.**
+  Allowlist is now `{btree, hash, gist, spgist, gin, brin}` — anything
+  else throws before SQL is constructed.
+- **`batch_execute` with `stopOnError: true` short-circuits.**
+  Previous implementation pre-fired all queries via `Promise.all` and
+  only filtered failures afterwards; remaining queries can now never
+  observe side-effects of an earlier failure.
+- **`mutation_dry_run` preserves the real PG error code.** The
+  no-RETURNING fallback now only fires for the two error codes that
+  actually indicate a RETURNING-clause issue (`42703`
+  undefined_column / `0A000` feature_not_supported). Other failures
+  (e.g. `23505` unique_violation, `23503` foreign_key_violation)
+  surface their original code, detail, and constraint name to the
+  caller — instead of being masked as `25P02 in_failed_sql_transaction`.
+- **`dry_run_sql_file` per-statement savepoints.** Each user statement
+  now runs inside its own `SAVEPOINT psm_stmt_<idx>` when
+  `stopOnError: false`, with `ROLLBACK TO SAVEPOINT` on failure. Two
+  benefits: (a) cascading `25P02` errors are gone — every failing
+  statement reports its own real error code with line number;
+  (b) `COMMIT`/`ROLLBACK` issued from inside a `DO` block is now
+  contained — PG refuses transaction termination inside a savepoint
+  subtransaction, so the dry-run is no longer compromised when a
+  migration script DO-blocks an embedded `COMMIT`.
+- **`get_top_queries` runtime probes `pg_stat_statements`.** Catalog
+  membership is no longer trusted; we issue a
+  `SELECT 1 FROM pg_stat_statements LIMIT 0` and distinguish
+  `42P01 undefined_table` (not installed) from `55000 object_not_in_prerequisite_state`
+  (installed but `shared_preload_libraries` missing) with clear
+  remediation messages. Legacy `total_time / mean_time` columns are
+  only attempted on PG < 13.
+- **`list_objects` + `get_object_details` materialized-view support.**
+  `relkind='m'` is now a first-class object kind (queried via
+  `pg_class` directly since `information_schema.views` doesn't expose
+  it). `get_object_details` auto-detects view / matview / sequence
+  from `pg_class.relkind` regardless of the caller-supplied
+  `objectType`, returns `exists: false` early when the object isn't
+  found, surfaces sequence-specific metadata, and includes CHECK
+  constraint expressions via `pg_get_constraintdef`.
+- **`explain_query` validates `hypotheticalIndexes` even without
+  hypopg.** Validation moved out of the `if (has_hypopg)` branch.
+  `hypopg_reset()` now only runs when at least one hypothetical index
+  was actually registered (was previously called unconditionally —
+  harmless but noisy).
+- **`analyze_db_health` Invalid Indexes failure surfaces as
+  `warning`.** Earlier code swallowed the error and reported
+  `status: 'healthy'`, which lied about cases where the catalog query
+  itself failed (permissions, etc.). The check now reports
+  `status: 'warning'` with the actual error text in `message`.
+
+### Changed
+
+- **`TableInfo.type` widened** to include `'matview'`. Additive — no
+  caller change required.
+- `MEMORY.md`, `audit-iteration-3.md` design / fix doc added under
+  `docs/superpowers/program/` for future audit-loop iterations.
+
+### Tests
+
+- New `src/__tests__/audit/iteration-3-fixes.test.ts` (14 tests),
+  one per P0/P1 fix above. Exercised against a real PG 17 cluster
+  via `AUDIT_PG_URL`.
+- `821 tests pass across 28 suites` against real PG 17 (no mocks for
+  any of the fixed behaviors).
+
+### Documentation
+
+- README: documented all 13 v3 tools (`describe_table`,
+  `find_dependents`, `lock_check`, `safe_alter_table`,
+  `detect_migration_state`, `export_to_sql_file`, `transfer_objects`,
+  `schema_diff`, `column_profile`, `generate_seed_data`,
+  `find_blocking_queries`, `kill_query`, plus
+  `maxEstimatedRows` / `maxEstimatedCost` query-budget flags on
+  `execute_sql`). Refreshed the connection-override list. Added a
+  Development & Testing section explaining the
+  `AUDIT_PG_URL` / `testcontainers` / skipped flow for contributors.
+
 ## [3.0.0] — 2026-05-03
 
 ### Added (SP-7 — operations & safety pack)
