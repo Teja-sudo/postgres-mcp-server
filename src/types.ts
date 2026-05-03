@@ -96,7 +96,7 @@ export interface SchemaInfo {
 
 export interface TableInfo {
   name: string;
-  type: 'table' | 'view' | 'sequence' | 'extension';
+  type: 'table' | 'view' | 'matview' | 'sequence' | 'extension';
   owner: string;
   schema: string;
 }

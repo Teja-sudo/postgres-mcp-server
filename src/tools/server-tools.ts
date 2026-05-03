@@ -175,7 +175,14 @@ export async function listDatabases(args: {
   }
 
   const systemDbs = ['template0', 'template1'];
-  const maxResults = Math.min(args.maxResults || 50, 200);
+  // Audit-iteration-3 fix (group 1 P1-3, P1-4): clamp maxResults
+  // to a sane positive range. Previously `|| 50` swallowed an
+  // explicit `0` and negative values caused `slice(0, -100)` which
+  // silently dropped trailing rows. We now use `??` so 0 is honored
+  // (= "return zero rows") and Math.max enforces a non-negative
+  // floor before the upper bound.
+  const requested = args.maxResults ?? 50;
+  const maxResults = Math.min(Math.max(requested, 0), 200);
 
   let databases: DatabaseInfo[];
 

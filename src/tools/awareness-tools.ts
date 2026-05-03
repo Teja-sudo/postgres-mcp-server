@@ -487,11 +487,19 @@ export async function findDependents(args: FindDependentsArgs): Promise<FindDepe
           }
         }
 
-        if (depth + 1 < maxDepth) {
+        // Audit-iteration-3 fix (group 6, iteration-1 SP-4 P2):
+        // off-by-one. Previously `depth + 1 < maxDepth` meant
+        // children at the boundary depth were never enqueued AND
+        // the truncatedAtDepth flag never tripped. Now we enqueue
+        // up to and including maxDepth, and set the flag once we
+        // see we'd exceed it.
+        if (depth + 1 <= maxDepth) {
           queue.push({ oid: depOid, classid: depClass, depth: depth + 1, via: 'pg_depend' });
           if (extraEnqueue) {
             queue.push({ ...extraEnqueue, depth: depth + 1, via: 'pg_constraint' });
           }
+        } else {
+          truncatedAtDepth = true;
         }
       }
     }

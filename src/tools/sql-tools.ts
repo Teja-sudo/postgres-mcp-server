@@ -445,15 +445,50 @@ export async function explainQuery(args: {
     client = await dbManager.getClient();
   }
 
+  let createdHypotheticalIndexes = false;
   try {
-    // If hypothetical indexes are specified, validate and create them
+    // Audit-iteration-3 fix (group 5 P1-2): validate ALL hypothetical-
+    // index inputs unconditionally. Previously the entire validation
+    // block was nested inside `if (has_hypopg)`, so on a cluster
+    // without the extension a payload like `{ table: "users; DROP
+    // TABLE x" }` was silently accepted and the call returned a
+    // normal plan. Validation must hold regardless of whether we'll
+    // act on the indexes.
     if (args.hypotheticalIndexes && args.hypotheticalIndexes.length > 0) {
-      // Limit number of hypothetical indexes
       if (args.hypotheticalIndexes.length > MAX_HYPOTHETICAL_INDEXES) {
         throw new Error(`Maximum ${MAX_HYPOTHETICAL_INDEXES} hypothetical indexes allowed`);
       }
 
-      // Check if hypopg extension is available
+      // Per-entry validation runs always
+      for (const idx of args.hypotheticalIndexes) {
+        if (!idx.table) {
+          throw new Error('hypotheticalIndexes: table is required');
+        }
+        let schemaName = 'public';
+        let tableName = idx.table;
+        if (idx.table.includes('.')) {
+          const parts = idx.table.split('.');
+          if (parts.length !== 2) {
+            throw new Error(`hypotheticalIndexes: invalid table format '${idx.table}'`);
+          }
+          schemaName = parts[0];
+          tableName = parts[1];
+          validateIdentifier(schemaName, 'schema');
+        }
+        validateIdentifier(tableName, 'table');
+        if (!idx.columns || !Array.isArray(idx.columns) || idx.columns.length === 0) {
+          throw new Error('hypotheticalIndexes: columns array is required and must not be empty');
+        }
+        if (idx.columns.length > 32) {
+          throw new Error('hypotheticalIndexes: maximum 32 columns per index');
+        }
+        for (const col of idx.columns) {
+          validateIdentifier(col, 'column');
+        }
+        validateIndexType(idx.indexType || 'btree');
+      }
+
+      // Only after validation: check if hypopg is available and act.
       const hypopgCheck = await client.query(`
         SELECT EXISTS (
           SELECT 1 FROM pg_extension WHERE extname = 'hypopg'
@@ -461,55 +496,29 @@ export async function explainQuery(args: {
       `);
 
       if (hypopgCheck.rows[0].has_hypopg) {
-        // Create hypothetical indexes with validated inputs
         for (const idx of args.hypotheticalIndexes) {
-          // Validate table name
-          if (!idx.table) {
-            throw new Error('hypotheticalIndexes: table is required');
-          }
-
-          // Handle schema.table format
           let schemaName = 'public';
           let tableName = idx.table;
-
           if (idx.table.includes('.')) {
             const parts = idx.table.split('.');
-            if (parts.length !== 2) {
-              throw new Error(`hypotheticalIndexes: invalid table format '${idx.table}'`);
-            }
             schemaName = parts[0];
             tableName = parts[1];
-            validateIdentifier(schemaName, 'schema');
           }
-          validateIdentifier(tableName, 'table');
-
-          // Validate columns
-          if (!idx.columns || !Array.isArray(idx.columns) || idx.columns.length === 0) {
-            throw new Error('hypotheticalIndexes: columns array is required and must not be empty');
-          }
-
-          if (idx.columns.length > 32) {
-            throw new Error('hypotheticalIndexes: maximum 32 columns per index');
-          }
-
-          for (const col of idx.columns) {
-            validateIdentifier(col, 'column');
-          }
-
-          // Validate index type
           const indexType = validateIndexType(idx.indexType || 'btree');
-
-          // Build safe index creation string
           const safeTableName = schemaName !== 'public'
             ? `"${schemaName}"."${tableName}"`
             : `"${tableName}"`;
           const safeColumns = idx.columns.map(c => `"${c}"`).join(', ');
-
-          // Use parameterized approach via hypopg
           const indexDef = `CREATE INDEX ON ${safeTableName} USING ${indexType} (${safeColumns})`;
           await client.query('SELECT hypopg_create_index($1)', [indexDef]);
         }
+        createdHypotheticalIndexes = true;
       }
+      // If hypopg isn't installed, validation has already passed,
+      // and we silently fall through to the EXPLAIN as if the
+      // hypothetical indexes weren't there. Caller can detect this
+      // by inspecting the plan (no Index Scan on hypothetical
+      // names) or re-checking pg_extension.
     }
 
     // Build EXPLAIN query
@@ -529,12 +538,17 @@ export async function explainQuery(args: {
     const explainSql = `EXPLAIN (${options.join(', ')}) ${args.sql}`;
     const result = await client.query(explainSql);
 
-    // Clean up hypothetical indexes if created
-    if (args.hypotheticalIndexes && args.hypotheticalIndexes.length > 0) {
+    // Audit-iteration-3 fix (group 5 P1-1): only reset hypopg state
+    // when we actually created hypothetical indexes (i.e., hypopg
+    // was present AND we acted on inputs). Previously this was an
+    // unconditional call gated only on `args.hypotheticalIndexes.
+    // length > 0`, which made noisy `function hypopg_reset() does
+    // not exist` errors fire (and get swallowed) on every cluster
+    // without the extension.
+    if (createdHypotheticalIndexes) {
       try {
         await client.query('SELECT hypopg_reset()');
       } catch (e) {
-        // hypopg extension may not be available
         console.debug('Could not reset hypopg:', e);
       }
     }
@@ -1229,6 +1243,20 @@ export async function dryRunSqlFile(args: {
           result.warnings = stmtWarnings.map(w => w.message);
         }
 
+        // Audit-iteration-3 fix (group 4 P0-2): when stopOnError is
+        // false the contract is "continue and collect every statement's
+        // real error". Without a per-statement savepoint, the first
+        // failure poisons the outer tx and every subsequent statement
+        // returns 25P02 ("current transaction is aborted") - useless
+        // for an operator trying to find the second / third real bug
+        // in their migration. Wrap each statement in a savepoint and
+        // ROLLBACK TO SAVEPOINT on failure so the next statement runs
+        // with a clean tx state. We still ROLLBACK the OUTER tx at the
+        // end so nothing persists.
+        const useStmtSavepoint = !stopOnError;
+        const stmtSp = useStmtSavepoint ? `psm_stmt_${idx}` : null;
+        if (stmtSp) await client.query(`SAVEPOINT ${stmtSp}`);
+
         try {
           const queryResult = await client.query(stmt.sql);
           result.success = true;
@@ -1240,11 +1268,23 @@ export async function dryRunSqlFile(args: {
           if (queryResult.rows && queryResult.rows.length > 0) {
             result.rows = queryResult.rows.slice(0, MAX_DRY_RUN_SAMPLE_ROWS);
           }
+          if (stmtSp) await client.query(`RELEASE SAVEPOINT ${stmtSp}`);
         } catch (e) {
           result.success = false;
           result.error = extractDryRunError(e);
           failureCount++;
 
+          if (stmtSp) {
+            // Roll back this statement's effects so the next one runs
+            // against a clean tx.
+            try {
+              await client.query(`ROLLBACK TO SAVEPOINT ${stmtSp}`);
+              await client.query(`RELEASE SAVEPOINT ${stmtSp}`);
+            } catch {
+              // tx may be too compromised to rollback to savepoint;
+              // fall through and let the loop's guard.verify catch it
+            }
+          }
           if (stopOnError) {
             aborted = true;
           }
@@ -1849,24 +1889,46 @@ export async function mutationDryRun(args: {
 
       success = true;
     } catch (e) {
-      // If RETURNING failed, try without it
-      if (!hasReturning) {
+      // Audit-iteration-3 fix (group 4 P0-1): preserve the FIRST
+      // (real) PG error code instead of running a no-RETURNING
+      // fallback that always errors with 25P02 (in_failed_sql_
+      // transaction) on a poisoned tx and overwrites the original
+      // 23505 / 23503 / etc. The fallback is only useful when the
+      // first error is genuinely RETURNING-related (42703 undefined
+      // _column or 0A000 feature_not_supported on certain DML
+      // forms). For everything else, capturing the FIRST error's
+      // code/constraint/detail is what callers actually want.
+      const firstErr = extractDryRunError(e);
+      const firstErrCode = firstErr.code;
+      const isReturningRelated =
+        firstErrCode === '42703' || // undefined_column (RETURNING references missing col)
+        firstErrCode === '0A000';   // feature_not_supported (RETURNING in stmts that don't allow it)
+
+      if (!hasReturning && isReturningRelated) {
+        // Genuine RETURNING-clause issue → roll back and retry without it.
         try {
+          // Need a savepoint roll-back to clear the aborted-tx state
+          // before retrying. Use a UUID7 savepoint name to avoid any
+          // name collision with the caller's SQL.
+          const sp = 'mdr_retry_' + Date.now().toString(36);
+          await client.query(`ROLLBACK TO SAVEPOINT ${sp}`).catch(() => {
+            /* No prior savepoint - PG is in failed-tx state, fall through */
+          });
           const result = await client.query(sql);
           rowsAffected = result.rowCount || 0;
           success = true;
-
-          // Try to get affected rows for UPDATE/DELETE
           if ((mutationType === 'UPDATE' || mutationType === 'DELETE') && targetTable && whereClause) {
             const afterSql = `SELECT * FROM ${targetTable} WHERE ${whereClause} LIMIT ${sampleSize}`;
             const afterResult = await client.query(afterSql);
             affectedRows = afterResult.rows;
           }
-        } catch (innerError) {
-          error = extractDryRunError(innerError);
+        } catch (_innerError) {
+          // Retry also failed - keep the FIRST error, which is the
+          // useful one for the caller.
+          error = firstErr;
         }
       } else {
-        error = extractDryRunError(e);
+        error = firstErr;
       }
     }
 
@@ -2006,51 +2068,76 @@ export async function batchExecute(args: {
   let successCount = 0;
   let failureCount = 0;
 
-  // Execute all queries in parallel
-  const promises = args.queries.map(async (query) => {
-    const queryStartTime = getStartTime();
-
-    try {
-      const result = await dbManager.queryWithOverride(query.sql, query.params, override);
-      const executionTimeMs = calculateExecutionTime(queryStartTime, getStartTime());
-
-      return {
-        name: query.name,
-        result: {
+  // Audit-iteration-3 fix (group 3 P0-1): when stopOnError is
+  // true, run queries sequentially so a failure actually halts
+  // execution. Previously the code did Promise.all() over all
+  // queries, dispatching every one before the result loop ran;
+  // the `if (stopOnError) break` only stopped *counting*, not
+  // *executing*, so side-effect writes from later queries
+  // persisted despite the contract saying "stop on first error".
+  // When stopOnError is false, parallel dispatch is still the
+  // efficient path.
+  if (stopOnError) {
+    for (const query of args.queries) {
+      const queryStartTime = getStartTime();
+      try {
+        const result = await dbManager.queryWithOverride(query.sql, query.params, override);
+        const executionTimeMs = calculateExecutionTime(queryStartTime, getStartTime());
+        results[query.name] = {
           success: true,
           rows: result.rows,
           rowCount: result.rowCount ?? result.rows.length,
-          executionTimeMs
-        } as BatchQueryResult
-      };
-    } catch (error) {
-      const executionTimeMs = calculateExecutionTime(queryStartTime, getStartTime());
-
-      return {
-        name: query.name,
-        result: {
+          executionTimeMs,
+        };
+        successCount++;
+      } catch (error) {
+        const executionTimeMs = calculateExecutionTime(queryStartTime, getStartTime());
+        results[query.name] = {
           success: false,
           error: error instanceof Error ? error.message : String(error),
-          executionTimeMs
-        } as BatchQueryResult
-      };
-    }
-  });
-
-  // Wait for all queries
-  const queryResults = await Promise.all(promises);
-
-  // Collect results
-  for (const { name, result } of queryResults) {
-    results[name] = result;
-    if (result.success) {
-      successCount++;
-    } else {
-      failureCount++;
-      if (stopOnError) {
-        // Mark remaining as not executed
+          executionTimeMs,
+        };
+        failureCount++;
+        // Genuine short-circuit: subsequent queries are not run,
+        // and not present in the results map. Caller can detect
+        // partial execution via successCount + failureCount <
+        // totalQueries.
         break;
       }
+    }
+  } else {
+    // Parallel dispatch: independent queries, all run
+    const promises = args.queries.map(async (query) => {
+      const queryStartTime = getStartTime();
+      try {
+        const result = await dbManager.queryWithOverride(query.sql, query.params, override);
+        const executionTimeMs = calculateExecutionTime(queryStartTime, getStartTime());
+        return {
+          name: query.name,
+          result: {
+            success: true,
+            rows: result.rows,
+            rowCount: result.rowCount ?? result.rows.length,
+            executionTimeMs,
+          } as BatchQueryResult,
+        };
+      } catch (error) {
+        const executionTimeMs = calculateExecutionTime(queryStartTime, getStartTime());
+        return {
+          name: query.name,
+          result: {
+            success: false,
+            error: error instanceof Error ? error.message : String(error),
+            executionTimeMs,
+          } as BatchQueryResult,
+        };
+      }
+    });
+    const queryResults = await Promise.all(promises);
+    for (const { name, result } of queryResults) {
+      results[name] = result;
+      if (result.success) successCount++;
+      else failureCount++;
     }
   }
 

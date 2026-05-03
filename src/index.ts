@@ -225,11 +225,11 @@ server.registerTool(
   "list_objects",
   {
     description:
-      "List tables, views, sequences, or extensions in a schema. Requires active connection. Optionally use server/database/targetSchema params for one-time execution on a different server.",
+      "List tables, views, materialized views, sequences, or extensions in a schema. Requires active connection. Optionally use server/database/targetSchema params for one-time execution on a different server.",
     inputSchema: z.object({
       schema: z.string().describe("Schema name to list objects from (e.g., 'public')"),
       objectType: z
-        .enum(["table", "view", "sequence", "extension", "all"])
+        .enum(["table", "view", "matview", "sequence", "extension", "all"])
         .optional()
         .default("all")
         .describe("Type of objects to list"),

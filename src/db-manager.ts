@@ -626,17 +626,21 @@ export class DatabaseManager {
       throw new Error(`Server '${serverName}' not found in configuration`);
     }
 
-    // Close existing pool if any
+    // Use provided database, server's default, or system default
+    const dbName = database || serverConfig.defaultDatabase || DEFAULT_DATABASE;
+
+    // Validate inputs BEFORE tearing down the existing pool — otherwise
+    // a malformed dbName/schema kills the live connection on its way to
+    // throwing. (Audit-iteration-3 group 1 P0-1: schema validation
+    // added; both validations now run before any state changes.)
+    validateDatabaseName(dbName);
+    if (schema) validateSchemaName(schema);
+
+    // Close existing pool if any (only after validation passed)
     if (this.currentPool) {
       await this.currentPool.end();
       this.currentPool = null;
     }
-
-    // Use provided database, server's default, or system default
-    const dbName = database || serverConfig.defaultDatabase || DEFAULT_DATABASE;
-
-    // Validate database name for SQL injection prevention
-    validateDatabaseName(dbName);
 
     const sslConfig = getSslConfig(serverConfig.ssl);
 

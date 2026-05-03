@@ -245,6 +245,8 @@ describe('Schema Tools', () => {
 
     it('should return columns, constraints, and indexes', async () => {
       mockQuery
+        // Audit-iteration-3: leading relkind-probe (existence check)
+        .mockResolvedValueOnce({ rows: [{ relkind: 'r' }] })
         .mockResolvedValueOnce({
           rows: [
             { column_name: 'id', data_type: 'integer', is_nullable: 'NO', column_default: null, character_maximum_length: null },
@@ -267,6 +269,8 @@ describe('Schema Tools', () => {
 
       const result = await getObjectDetails({ schema: 'public', objectName: 'users' });
 
+      expect(result.exists).toBe(true);
+      expect(result.detectedKind).toBe('table');
       expect(result.columns).toHaveLength(2);
       expect(result.constraints).toHaveLength(1);
       expect(result.indexes).toHaveLength(1);
@@ -289,6 +293,10 @@ describe('Schema Tools', () => {
 
     it('should get view definition when objectType is view', async () => {
       mockQuery
+        // Audit-iteration-3: leading relkind-probe returns 'v' so
+        // the view definition is fetched regardless of caller-
+        // supplied objectType (auto-detect).
+        .mockResolvedValueOnce({ rows: [{ relkind: 'v' }] })
         .mockResolvedValueOnce({ rows: [] }) // columns
         .mockResolvedValueOnce({ rows: [] }) // constraints
         .mockResolvedValueOnce({ rows: [] }) // indexes
@@ -297,6 +305,8 @@ describe('Schema Tools', () => {
 
       const result = await getObjectDetails({ schema: 'public', objectName: 'active_users', objectType: 'view' });
 
+      expect(result.exists).toBe(true);
+      expect(result.detectedKind).toBe('view');
       expect(result.definition).toBe('SELECT * FROM users');
     });
 

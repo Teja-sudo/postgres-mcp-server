@@ -1354,12 +1354,14 @@ SELECT * FROM ins;
       const { dryRunSqlFile } = await import('../tools/sql-tools.js');
       fs.writeFileSync(testFile, 'SELECT 1; SELECT 2; SELECT 3;');
 
-      mockClient.query
-        .mockResolvedValueOnce({}) // BEGIN
-        .mockResolvedValueOnce({ rows: [{ '?column?': 1 }], rowCount: 1 }) // SELECT 1
-        .mockResolvedValueOnce({ rows: [{ '?column?': 2 }], rowCount: 1 }) // SELECT 2
-        .mockResolvedValueOnce({ rows: [{ '?column?': 3 }], rowCount: 1 }) // SELECT 3
-        .mockResolvedValueOnce({}); // ROLLBACK
+      // Audit-iteration-3: dryRunSqlFile now emits per-statement
+      // SAVEPOINT/RELEASE pairs when stopOnError is false (the
+      // default), so use the smart mock instead of a brittle chain.
+      setupSmartClientMock(mockClient.query, [
+        { rows: [{ '?column?': 1 }], rowCount: 1 },
+        { rows: [{ '?column?': 2 }], rowCount: 1 },
+        { rows: [{ '?column?': 3 }], rowCount: 1 },
+      ]);
 
       const result = await dryRunSqlFile({ filePath: testFile });
 
@@ -1464,18 +1466,19 @@ SELECT nextval('users_id_seq');`);
       fs.writeFileSync(testFile, `SELECT 1;
 VACUUM users;`);
 
-      // VACUUM is now SKIPPED, not executed
-      mockClient.query
-        .mockResolvedValueOnce({}) // BEGIN
-        .mockResolvedValueOnce({ rows: [], rowCount: 1 }) // SELECT 1 (VACUUM is SKIPPED)
-        .mockResolvedValueOnce({}); // ROLLBACK
+      // VACUUM is statically skipped, only SELECT 1 user-query runs.
+      // Audit-iteration-3: switched to smart mock (per-statement
+      // savepoints emitted now).
+      setupSmartClientMock(mockClient.query, [
+        { rows: [], rowCount: 1 },  // SELECT 1
+      ]);
 
       const result = await dryRunSqlFile({ filePath: testFile });
 
       expect(result.nonRollbackableWarnings.some(w => w.operation === 'VACUUM')).toBe(true);
       expect(result.skippedCount).toBe(1);
       expect(result.statementResults[1].skipped).toBe(true);
-      expect(result.failureCount).toBe(0); // Not a failure, just skipped
+      expect(result.failureCount).toBe(0);
     });
 
     it('should strip patterns before execution', async () => {
@@ -1485,11 +1488,10 @@ VACUUM users;`);
 SELECT 2;
 /`);
 
-      mockClient.query
-        .mockResolvedValueOnce({}) // BEGIN
-        .mockResolvedValueOnce({ rows: [], rowCount: 1 }) // SELECT 1
-        .mockResolvedValueOnce({ rows: [], rowCount: 1 }) // SELECT 2
-        .mockResolvedValueOnce({}); // ROLLBACK
+      setupSmartClientMock(mockClient.query, [
+        { rows: [], rowCount: 1 },
+        { rows: [], rowCount: 1 },
+      ]);
 
       const result = await dryRunSqlFile({
         filePath: testFile,

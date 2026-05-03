@@ -17,15 +17,32 @@ export async function getTopQueries(args: {
   const validOrderBy = ['total_time', 'mean_time', 'calls'];
   const orderBy = validOrderBy.includes(args.orderBy || '') ? args.orderBy! : 'total_time';
 
-  // Check if pg_stat_statements extension is available
-  const extCheck = await dbManager.query(`
-    SELECT EXISTS (
-      SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements'
-    ) as has_extension
-  `);
-
-  if (!extCheck.rows[0].has_extension) {
-    throw new Error('pg_stat_statements extension is not installed. Please install it to use this feature.');
+  // Audit-iteration-3 fix (group 5 P0-1): catalog presence is not
+  // enough. The extension can be in `pg_extension` but NOT loaded
+  // via `shared_preload_libraries`, in which case any read of the
+  // view fails with 55000. Probe runtime usability with a tiny
+  // SELECT and surface the real error if the extension isn't
+  // actually loaded.
+  try {
+    await dbManager.query('SELECT 1 FROM pg_stat_statements LIMIT 0');
+  } catch (e) {
+    const err = e as { code?: string; message?: string };
+    if (err.code === '55000' || /must be loaded via shared_preload_libraries/i.test(err.message || '')) {
+      throw new Error(
+        'pg_stat_statements is in pg_extension but NOT loaded. Add ' +
+        "'pg_stat_statements' to shared_preload_libraries in postgresql.conf " +
+        'and restart PostgreSQL.'
+      );
+    }
+    if (err.code === '42P01' || /relation .* does not exist/i.test(err.message || '')) {
+      throw new Error(
+        'pg_stat_statements extension is not installed. ' +
+        "Run: CREATE EXTENSION pg_stat_statements;"
+      );
+    }
+    throw new Error(
+      `pg_stat_statements is unusable: ${err.message ?? String(e)}`
+    );
   }
 
   // Map order by to actual column names (safe since we validated above)
@@ -53,7 +70,20 @@ export async function getTopQueries(args: {
     const result = await dbManager.query<SlowQuery>(query, [minCalls, limit]);
     return result.rows;
   } catch (error) {
-    // PostgreSQL < 13 uses different column names, try legacy format
+    // Audit-iteration-3 fix (group 5 P0-1): only fall back to the
+    // legacy column names on PG <13. Previously the catch ran the
+    // legacy SELECT blindly, which on PG 13+ throws `column
+    // "total_time" does not exist`, masking whatever the original
+    // error was.
+    const verR = await dbManager.query<{ v: string }>(
+      `SELECT current_setting('server_version_num') AS v`
+    );
+    const versionNum = parseInt(verR.rows[0]?.v ?? '0', 10);
+    if (versionNum >= 130000) {
+      // PG 13+ → legacy fallback would also fail. Surface the
+      // original error so the operator knows what's actually wrong.
+      throw error;
+    }
     console.debug('Falling back to legacy pg_stat_statements columns:', error);
     const legacyOrderColumnMap: Record<string, string> = {
       'total_time': 'total_time',
@@ -274,19 +304,19 @@ function findSequentialScans(node: any, scans: any[] = []): any[] {
 function extractColumnsFromFilter(filter: string): string[] {
   if (!filter || typeof filter !== 'string') return [];
 
-  // Simple extraction of column names from filter expressions
   const columns: string[] = [];
 
-  // Match patterns like (column_name = ...) or (column_name > ...)
-  const filterRegex = /\((\w+)\s*[=<>!]+/g;
+  // Audit-iteration-3 fix (group 5 P1-4): match both bare column
+  // refs `(col = ...)` AND qualified refs `(alias.col = ...)`
+  // which is the form PG 17 EXPLAIN renders for joined tables.
+  // Captures the trailing identifier (the column), not the alias.
+  // eslint-disable-next-line sonarjs/slow-regex -- bounded EXPLAIN-output input
+  const filterRegex = /\(?(?:[a-zA-Z_]\w*\.)?([a-zA-Z_]\w*)\s*[=<>!]+/g;
   let match;
   while ((match = filterRegex.exec(filter)) !== null) {
-    const colMatch = /\((\w+)/.exec(match[0]);
-    if (colMatch && colMatch[1]) {
-      // Basic validation - only alphanumeric and underscore
-      if (/^[a-zA-Z_]\w*$/.test(colMatch[1])) {
-        columns.push(colMatch[1]);
-      }
+    const col = match[1];
+    if (col && /^[a-zA-Z_]\w*$/.test(col)) {
+      columns.push(col);
     }
   }
 
@@ -415,11 +445,14 @@ export async function analyzeDbHealth(): Promise<HealthCheckResult[]> {
       details: indexResult.rows.length > 0 ? { indexes: indexResult.rows } : undefined
     });
   } catch (error) {
-    console.debug('Could not check invalid indexes:', error);
+    // Audit-iteration-3 fix (group 5 P1-5): previously this swallowed
+    // the error and reported "No invalid indexes found" — masking
+    // genuine failures like permission_denied on pg_index.
+    // Mark as warning with the actual error message in details.
     results.push({
       category: 'Invalid Indexes',
-      status: 'healthy',
-      message: 'No invalid indexes found'
+      status: 'warning',
+      message: `Could not check invalid indexes: ${error instanceof Error ? error.message : String(error)}`,
     });
   }
 

@@ -437,9 +437,14 @@ export async function detectMigrationState(
     for (const probe of MIGRATION_TOOL_PROBES) {
       let foundIn: string | null = null;
       for (const s of schemas!) {
+        // Audit-iteration-3 fix (group 6 P0-1): use format('%I.%I')
+        // so PG quotes mixed-case identifiers correctly. Previously
+        // an unquoted Sequelize tracker `SequelizeMeta` was folded
+        // by to_regclass to lowercase `sequelizemeta` which doesn't
+        // match the case-preserving "SequelizeMeta" relation name.
         const exists = await client.query(
-          `SELECT to_regclass($1) AS reg`,
-          [`${s}.${probe.table}`]
+          `SELECT to_regclass(format('%I.%I', $1::text, $2::text)) AS reg`,
+          [s, probe.table]
         );
         if (exists.rows[0].reg === null) continue;
         // Audit-iteration-1 SP-5 P0 fix: verify column shape. Without
@@ -649,7 +654,22 @@ export async function safeAlterTable(args: SafeAlterTableArgs): Promise<SafeAlte
 
     case 'create_index': {
       const cols = intent.columns.map(escapeIdent).join(', ');
-      const indexType = intent.index_type ?? 'btree';
+      // Audit-iteration-3 fix (group 6, iteration-1 SP-5 P1-5):
+      // allowlist for index_type. Without this, the caller-supplied
+      // string was interpolated raw, e.g. `index_type:
+      // 'malicious-injection'` produced `USING malicious-injection`
+      // which is a SQL-injection / footgun surface (small, since the
+      // overall script is intended for human review, but cheap to
+      // close).
+      const VALID_INDEX_TYPES = new Set(['btree', 'hash', 'gist', 'spgist', 'gin', 'brin']);
+      const requestedType = (intent.index_type ?? 'btree').toLowerCase();
+      if (!VALID_INDEX_TYPES.has(requestedType)) {
+        throw new Error(
+          `index_type '${intent.index_type}' is not a valid PostgreSQL index method. ` +
+          `Allowed: ${[...VALID_INDEX_TYPES].join(', ')}.`
+        );
+      }
+      const indexType = requestedType;
       const unique = intent.unique ? 'UNIQUE ' : '';
       recipe.push({
         step: 1,

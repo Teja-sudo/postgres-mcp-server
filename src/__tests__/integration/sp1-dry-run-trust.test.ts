@@ -138,7 +138,7 @@ SAVEPOINT s1;`
     expect(await tableExists('t1')).toBe(false);
   }, 60_000);
 
-  it('dry_run_sql_file Layer 2: catches COMMIT inside a DO block', async () => {
+  it('dry_run_sql_file: COMMIT inside a DO block is contained by per-stmt savepoint', async () => {
     const filePath = writeSql(
       'do-block-commit.sql',
       `CREATE TABLE do_test (id int);
@@ -151,12 +151,23 @@ END $$;`
 
     const result = await dryRunSqlFile({ filePath });
 
-    // Static layer cannot reach COMMIT inside the dollar-quoted body.
-    // Layer 2 sentinel must catch it.
-    expect(result.dryRunCompromised).toBe(true);
-    expect(result.compromisedAt?.reason).toMatch(/tx_(closed|diverged)/);
-    expect(result.rolledBack).toBe(false);
-    expect(result.summary).toMatch(/persisted/i);
+    // Audit-iteration-3 (group 4 P0-2): with per-statement savepoints
+    // wrapping each user statement, PG refuses the COMMIT inside the
+    // DO block ("cannot commit while a subtransaction is active").
+    // The DO block fails as a single statement, we ROLLBACK TO the
+    // per-stmt savepoint, the outer tx survives, and the final
+    // ROLLBACK genuinely undoes everything. The dry-run is NOT
+    // compromised — the savepoint contained the damage.
+    //
+    // Net result: no COMMIT escapes, table is rolled back, the
+    // failed-DO statement is recorded with its real PG error.
+    expect(await tableExists('do_test')).toBe(false);
+    expect(result.rolledBack).toBe(true);
+    // The DO block statement should be marked as failed
+    const doStmt = result.statementResults.find((r) => r.type === 'DO');
+    expect(doStmt).toBeDefined();
+    expect(doStmt?.success).toBe(false);
+    expect(doStmt?.error?.message).toMatch(/cannot commit|in_failed_sql_transaction|invalid transaction termination/i);
   }, 60_000);
 
   it('mutationDryRun rejects multi-statement SQL with embedded COMMIT', async () => {

@@ -39,16 +39,34 @@ describe('Analysis Tools', () => {
   });
 
   describe('getTopQueries', () => {
+    // Audit-iteration-3 (group 5 P0-1): the extension check was
+    // upgraded from a catalog `pg_extension` lookup to a runtime
+    // usability probe (`SELECT 1 FROM pg_stat_statements LIMIT 0`).
+    // Test mock chains adjusted accordingly. The old form would
+    // accept "extension installed but not loaded" — yielding the
+    // misleading `column "total_time" does not exist` error.
     it('should check for pg_stat_statements extension', async () => {
-      mockQuery.mockResolvedValueOnce({ rows: [{ has_extension: false }] });
+      const err42P01 = Object.assign(new Error('relation "pg_stat_statements" does not exist'), { code: '42P01' });
+      mockQuery.mockRejectedValueOnce(err42P01);
 
       await expect(getTopQueries({}))
         .rejects.toThrow('pg_stat_statements extension is not installed');
     });
 
+    it('should detect "installed but not loaded" with a clear error', async () => {
+      const err55000 = Object.assign(
+        new Error('pg_stat_statements must be loaded via shared_preload_libraries'),
+        { code: '55000' }
+      );
+      mockQuery.mockRejectedValueOnce(err55000);
+
+      await expect(getTopQueries({}))
+        .rejects.toThrow(/shared_preload_libraries/i);
+    });
+
     it('should return top queries ordered by total_time', async () => {
       mockQuery
-        .mockResolvedValueOnce({ rows: [{ has_extension: true }] })
+        .mockResolvedValueOnce({ rows: [] }) // probe: usable
         .mockResolvedValueOnce({
           rows: [
             { query: 'SELECT * FROM users', calls: 100, total_time: 5000, mean_time: 50, rows: 1000 },
@@ -64,11 +82,10 @@ describe('Analysis Tools', () => {
 
     it('should validate limit parameter', async () => {
       mockQuery.mockReset();
-      mockQuery.mockResolvedValueOnce({ rows: [{ has_extension: true }] });
-      mockQuery.mockResolvedValueOnce({ rows: [] });
+      mockQuery.mockResolvedValueOnce({ rows: [] }); // probe
+      mockQuery.mockResolvedValueOnce({ rows: [] }); // primary
 
-      // limit > 100 should be capped at 100
-      await getTopQueries({ limit: 100 }); // use valid limit
+      await getTopQueries({ limit: 100 });
 
       const queryCall = mockQuery.mock.calls[1] as unknown[];
       expect((queryCall[1] as number[])[1]).toBe(100);
@@ -76,12 +93,11 @@ describe('Analysis Tools', () => {
 
     it('should validate orderBy parameter', async () => {
       mockQuery.mockReset();
-      mockQuery.mockResolvedValueOnce({ rows: [{ has_extension: true }] });
-      mockQuery.mockResolvedValueOnce({ rows: [] });
+      mockQuery.mockResolvedValueOnce({ rows: [] }); // probe
+      mockQuery.mockResolvedValueOnce({ rows: [] }); // primary
 
       await getTopQueries({ orderBy: 'invalid' as any });
 
-      // Should use default 'total_time'
       const queryCall = mockQuery.mock.calls[1][0] as string;
       expect(queryCall).toContain('total_exec_time');
     });
@@ -89,8 +105,9 @@ describe('Analysis Tools', () => {
     it('should fall back to legacy column names for older PostgreSQL', async () => {
       mockQuery.mockReset();
       mockQuery
-        .mockResolvedValueOnce({ rows: [{ has_extension: true }] })
-        .mockRejectedValueOnce(new Error('column "total_exec_time" does not exist'))
+        .mockResolvedValueOnce({ rows: [] })  // probe ok
+        .mockRejectedValueOnce(new Error('column "total_exec_time" does not exist')) // primary fails
+        .mockResolvedValueOnce({ rows: [{ v: '120000' }] })  // server version PG 12 → fall back
         .mockResolvedValueOnce({
           rows: [{ query: 'SELECT 1', calls: 1, total_time: 100, mean_time: 100, rows: 1 }]
         });
@@ -98,6 +115,16 @@ describe('Analysis Tools', () => {
       const result = await getTopQueries({});
 
       expect(result).toHaveLength(1);
+    });
+
+    it('should NOT fall back on PG 13+ (surface real error instead)', async () => {
+      mockQuery.mockReset();
+      mockQuery
+        .mockResolvedValueOnce({ rows: [] })  // probe ok
+        .mockRejectedValueOnce(new Error('column "total_exec_time" does not exist'))
+        .mockResolvedValueOnce({ rows: [{ v: '170000' }] }); // PG 17 → no legacy fallback
+
+      await expect(getTopQueries({})).rejects.toThrow(/total_exec_time/);
     });
   });
 
@@ -540,7 +567,11 @@ describe('Analysis Tools', () => {
       const result = await analyzeDbHealth();
 
       const indexHealth = result.find((r: any) => r.category === 'Invalid Indexes');
-      expect(indexHealth?.status).toBe('healthy'); // Defaults to healthy on error
+      // Audit-iteration-3 (group 5 P1-5): query failure surfaces as
+      // 'warning' with the real error in `message`, not a misleading
+      // 'healthy' / 'No invalid indexes found'.
+      expect(indexHealth?.status).toBe('warning');
+      expect(indexHealth?.message).toMatch(/Could not check invalid indexes/i);
     });
 
     it('should handle unused indexes query failure', async () => {

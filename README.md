@@ -374,14 +374,46 @@ Lists database objects within a specified schema.
 
 #### `get_object_details`
 
-Provides detailed information about a database object including columns, constraints, indexes, size, and row count.
+Provides detailed information about a database object including columns, constraints, indexes, size, and row count. Auto-detects whether the target is a table, view, materialized view, or sequence and adapts the response accordingly. Returns `exists: false` early when the object isn't found.
 
 **Parameters:**
 
 - `schema` (required): Schema name containing the object
 - `objectName` (required): Name of the object
-- `objectType` (optional): Type of the object
+- `objectType` (optional): Type of the object (`table`, `view`, `matview`, `sequence`, `extension`). Auto-detected from `pg_class.relkind` when omitted.
 - `server`, `database`, `targetSchema` (optional): One-time connection override
+
+**Returns (varies by detected kind):**
+
+- `exists`: Whether the object was found.
+- `detectedKind`: The actual kind detected (`table` / `view` / `matview` / `sequence`).
+- `columns`, `constraints` (incl. `check_clause` for CHECK constraints), `indexes`, `size`, `rowCount`: For relations.
+- `definition`: For views and materialized views.
+- `sequenceDetails`: For sequences (start, min/max, cache, last value).
+
+#### `describe_table`
+
+**v3 single-call table summary.** Replaces the ~5-call dance of `get_object_details + COUNT(*) + LIMIT 5 + pg_stats`. Returns columns (with null %, distinct ratio from pg_stats), primary key, foreign keys going OUT (this table → others), foreign keys coming IN (others → this table), all indexes with definitions, table size, row-count estimate, and a sample of rows.
+
+**Parameters:**
+
+- `table` (required): Unqualified table name.
+- `schema` (optional): Default `'public'`.
+- `sample_size` (optional): Number of sample rows to fetch (default 5; 0 to skip).
+- `profile_columns` (optional): Columns to profile (default: all up to 20).
+- `server`, `database`, `override_schema` (optional): One-time connection override.
+
+#### `find_dependents`
+
+Walks `pg_depend` recursively to find every database object that depends on a target — views, foreign keys, functions, materialized views, indexes, rules. **Use BEFORE `DROP CASCADE`** to understand the blast radius. Each dependent is returned flat with its `depth` from the target (1 = direct, 2 = depends on a depth-1 dependent, …). Sets `truncatedAtDepth: true` if the recursion limit was hit.
+
+**Parameters:**
+
+- `name` (required): Object name.
+- `kind` (optional): `table`/`view`/`matview`/`sequence`/`index`/`function`/`procedure`/`type`/`extension`/`schema` (default `table`).
+- `schema` (optional): Default `'public'`.
+- `max_depth` (optional): Recursion limit (1-10, default 5).
+- `server`, `database`, `override_schema` (optional): One-time connection override.
 
 ### Query Execution
 
@@ -399,6 +431,8 @@ Executes SQL statements on the database. Supports pagination and parameterized q
 - `includeSchemaHint` (optional): Include schema information (columns, primary keys, foreign keys) for tables referenced in the query.
 - `allowMultipleStatements` (optional): Allow multiple SQL statements separated by semicolons. Returns results for each statement with line numbers.
 - `transactionId` (optional): Execute within an active transaction. Get this from `begin_transaction`.
+- `maxEstimatedRows` (optional): Query-budget pre-flight check. If the planner estimates more rows than this, the query is refused without executing. Only applies to SELECT.
+- `maxEstimatedCost` (optional): Query-budget pre-flight check. If the planner estimates a higher cost than this, the query is refused without executing. Only applies to SELECT.
 - `server`, `database`, `schema` (optional): One-time connection override. Execute on a different server/database/schema without changing the main connection. Cannot be used with `transactionId`.
 
 **Returns:**
@@ -789,7 +823,7 @@ Most query execution tools support **one-time connection override** parameters t
 - Running read queries against a replica while keeping the main connection to primary
 - Comparing schemas across different servers
 
-**Supported tools:** `execute_sql`, `explain_query`, `list_schemas`, `list_objects`, `get_object_details`, `execute_sql_file`, `mutation_preview`, `mutation_dry_run`, `dry_run_sql_file`, `batch_execute`
+**Supported tools:** `execute_sql`, `explain_query`, `list_schemas`, `list_objects`, `get_object_details`, `describe_table`, `find_dependents`, `execute_sql_file`, `mutation_preview`, `mutation_dry_run`, `dry_run_sql_file`, `batch_execute`, `lock_check`, `detect_migration_state`, `column_profile`, `generate_seed_data`, `find_blocking_queries`, `kill_query`, `export_to_sql_file`
 
 **Override Parameters:**
 
@@ -874,6 +908,136 @@ Analyzes specific SQL queries and recommends indexes.
 **Parameters:**
 
 - `queries` (required): Array of SQL queries to analyze (max 10)
+
+### DDL Safety & Migration
+
+#### `lock_check`
+
+Static analysis of a SQL statement to determine the PostgreSQL lock level it will require, whether it forces a full-table rewrite, and an estimated duration based on the target table's current size. Knows lock semantics for `ALTER TABLE` variants, `CREATE/DROP INDEX` (concurrent vs not), `VACUUM`, `CLUSTER`, `REFRESH MATERIALIZED VIEW`, and more. Returns warnings for `ACCESS EXCLUSIVE` locks on busy production tables and concrete recommendations (e.g., use `CREATE INDEX CONCURRENTLY`, `NOT VALID + VALIDATE CONSTRAINT`, etc.).
+
+**Parameters:**
+
+- `sql` (required): DDL statement to analyze.
+- `estimate_duration` (optional): Look up target table size to estimate duration. Default `true`.
+- `server`, `database`, `schema` (optional): One-time connection override.
+
+#### `safe_alter_table`
+
+Convert a high-level **intent** into a multi-step zero-downtime DDL recipe. Each step has its own SQL, expected lock level, and notes. Pipe the resulting `scriptSql` through `dry_run_sql_file` for verification, then through `execute_sql_file({ useTransaction: false })` for the production rollout (`CONCURRENTLY` operations cannot run inside a transaction).
+
+**Supported intents:**
+
+- `add_not_null_column_with_default` — backfill before flipping NOT NULL.
+- `add_not_null` — `NOT VALID` then `VALIDATE CONSTRAINT`.
+- `add_foreign_key` — `NOT VALID` then `VALIDATE`.
+- `add_check` — `NOT VALID` then `VALIDATE`.
+- `create_index` — `CREATE INDEX CONCURRENTLY` (with allowlisted index method: `btree` / `hash` / `gist` / `spgist` / `gin` / `brin`).
+- `drop_index` — `DROP INDEX CONCURRENTLY`.
+
+**Parameters:**
+
+- `intent` (required): `{ kind, ... }` — see intent list above.
+
+#### `detect_migration_state`
+
+Probe the database for migration tool tracker tables (Liquibase, Flyway, Alembic, Prisma, Knex, Sequelize, Django, Rails, Goose, TypeORM). Returns which tools are detected, the schema and table holding their state, the count of applied migrations, and the latest version. Use this **first** to learn whether a DB is managed by a migration tool before suggesting changes.
+
+**Parameters:**
+
+- `schemas` (optional): Schemas to probe (default: all non-system schemas).
+- `server`, `database`, `schema` (optional): One-time connection override.
+
+### Cross-Database Operations
+
+#### `export_to_sql_file`
+
+Export schema (DDL) and/or data from the connected database to a `.sql` file. The header banner records timestamp and source server alias (host/port hidden). Use this before `transfer_objects` or for migration-script generation.
+
+**Parameters:**
+
+- `filePath` (required): Path to the `.sql` file. Must end with `.sql`.
+- `mode` (optional): `'append'` (default — preserves existing content with a separator banner) or `'overwrite'`.
+- `what` (required): One of:
+  - `{ kind: 'objects', objects: [{ kind, name, schema? }, ...] }` — DDL of an explicit list, topologically ordered by dependency.
+  - `{ kind: 'data', tables, where?, orderBy?, limit? }` — INSERT statements for tables.
+  - `{ kind: 'schema_dump', schema?, include_data? }` — full schema, optionally with data.
+  - `{ kind: 'query_result', sql, target_table }` — SELECT result emitted as INSERTs into a target table.
+- `confirm_overwrite` (optional): When `mode='overwrite'` and the file was modified <60s ago, set `true` to confirm. Foot-gun guard.
+- `server`, `database`, `schema` (optional): One-time connection override.
+
+#### `transfer_objects`
+
+Transfer DDL and/or data from one configured server/database to another (same server, different DB, or fully remote). Both endpoints must be configured servers (`PG_NAME_*`); ad-hoc connection strings are not accepted (security). Refuses if the target's effective access mode is `readonly`. FK constraints between tables are emitted as `ALTER TABLE` statements appended after tables to handle inter-table dependency cycles.
+
+**Parameters:**
+
+- `from`, `to` (required): `{ server, database?, schema? }` source and target endpoints.
+- `objects` (required): `'*'` (all objects in source schema) or array of `{ kind, name, schema? }`.
+- `include` (optional): `'ddl'` / `'data'` / `'both'` (default).
+- `if_exists` (optional): `'skip'` / `'replace'` / `'error'` (default — fails fast).
+- `dry_run` (optional): Generate SQL without applying. Use with `output_file`.
+- `output_file` (optional): Path to write generated SQL when `dry_run: true`.
+
+#### `schema_diff`
+
+Compute the DDL delta between two `{ server, database, schema }` endpoints. Returns objects to **CREATE** (in source but not target), **DROP** (in target but not source), and **MODIFY** (in both, but DDL differs), plus a single `migrationSql` script that converges the **target** with the **source**. Source is the source of truth.
+
+**Parameters:**
+
+- `source`, `target` (required): `{ server, database?, schema? }`.
+
+### Data Generation & Profiling
+
+#### `column_profile`
+
+Single-pass profile per column: null %, distinct count, top-K values with frequencies, min/max, and type-aware stats (avg/stddev for numeric, length distribution for text, range for temporal). Uses `TABLESAMPLE BERNOULLI` for tables larger than `sample_threshold` (default 1M rows) to keep latency bounded.
+
+**Parameters:**
+
+- `table` (required), `schema` (optional, default `'public'`).
+- `columns` (optional): Specific columns to profile (default: all up to 30).
+- `sample_percent` (optional): Default `10`.
+- `sample_threshold` (optional): Default `1_000_000` rows.
+- `top_k` (optional): Top-K values per column (default `10`, max `25`).
+- `server`, `database`, `override_schema` (optional): One-time connection override.
+
+#### `generate_seed_data`
+
+Generate schema-aware fake seed data for a table. Respects `NOT NULL`, `UNIQUE`/PK (with retry-with-collision-suffix), enum types (cycles through labels), defaults, text length limits, and FK columns (skipped or filled — caller's choice). Generates type-appropriate values for numeric, text, boolean, uuid, date/timestamp, bytea, JSON, inet, cidr, macaddr.
+
+**Parameters:**
+
+- `table` (required), `schema` (optional, default `'public'`).
+- `count` (required): 1 to 100,000.
+- `column_values` (optional): Per-column SQL value override, e.g. `{ country: "'US'", priority: '1' }`. Quoted as PG literals.
+- `skip_fks` (optional): Default `false`.
+- `apply` (optional): Apply directly to DB (default `true`) or return SQL only (`false`).
+- `server`, `database`, `override_schema` (optional): One-time connection override.
+
+### Operational Tools
+
+#### `find_blocking_queries`
+
+Show currently-blocking sessions in a friendly tree (blocker → blocked) using `pg_stat_activity ⨝ pg_blocking_pids()`. Returns each session's pid, user, database, application name, state, current query, time in state, and `wait_event`. Use to diagnose slowdowns and pick a candidate for `kill_query`.
+
+**Parameters:**
+
+- `include_idle` (optional): Default `true`.
+- `limit` (optional): Default `50`.
+- `server`, `database`, `schema` (optional): One-time connection override.
+
+#### `kill_query`
+
+Cancel or terminate a backend session by PID. Returns a snapshot of the target session before signaling.
+
+**Parameters:**
+
+- `pid` (required): Backend PID to signal.
+- `mode` (required): `'cancel'` (soft — `pg_cancel_backend`, interrupts current statement) or `'terminate'` (hard — `pg_terminate_backend`, kills the entire backend).
+- `confirm` (required): Must be `true`. Foot-gun guard.
+- `server`, `database`, `schema` (optional): One-time connection override.
+
+**Note:** Refused if the target server's effective access mode is `readonly`.
 
 ### Health Monitoring
 
@@ -1028,6 +1192,31 @@ When `execute_sql_file` or multi-statement execution encounters errors, line num
 - Optional: `pg_stat_statements` extension for query performance analysis
 - Optional: `hypopg` extension for hypothetical index simulation
 
+## Development & Testing
+
+The full test suite includes integration tests that exercise the tools against a **real PostgreSQL cluster** (no mocks). There are two backends:
+
+1. **Local audit cluster** (preferred): set `AUDIT_PG_URL` to a real PG 14+ instance you control. Tests provision per-test databases on it (e.g. `audit_iter1_a`, `audit_sp1`, …) so suites are isolated. The cluster is shared across runs and torn down externally.
+2. **testcontainers fallback** (CI): set `POSTGRES_INTEGRATION_TESTS=1` and the suite spins up `postgres:16-alpine` per test file.
+3. **Skipped** (default): if neither variable is set, integration tests are silently skipped — unit tests still run.
+
+```bash
+# Run unit tests only
+npm test
+
+# Run against your audit cluster
+export AUDIT_PG_URL="postgres://audit_owner:<urlencoded-pw>@127.0.0.1:5433/audit_db"
+npm test
+
+# Run only the audit-iteration regression tests
+npm test -- --testPathPatterns=audit/iteration
+
+# Run the perf-health deep audit
+npm run perfhealth
+```
+
+The `audit_owner` role on the cluster needs `CREATEDB` (so each suite can provision its own DB) and `CREATEROLE` (for test users). It should NOT be a superuser.
+
 ## 🤖 Agent Experience (AX) - Claude Code Review
 
 **Tested by:** Claude Code (Sonnet 4.5)
@@ -1095,6 +1284,22 @@ The developer implemented several features after I tested the MCP:
 ✅ **Enhanced Connection Info** - `get_current_connection` now returns `user` and AI `context`
 ✅ **Comprehensive Dry-Run** - `dry_run_sql_file` provides real execution + rollback
 ✅ **Better Error Details** - PostgreSQL error codes, constraint names, hints included
+
+### v3 Additions — Deeper Database Workflow Support
+
+After live audit testing across multiple iterations against a real PG 17 cluster with complex schemas (FKs, partial indexes, materialized views, cycles), v3 adds a layer of high-leverage tools that reduce typical multi-step AI workflows to a single call:
+
+✅ **`describe_table`** - Replaces ~5 calls (object details + sample rows + count + pg_stats) with one rich response including FKs both directions.
+✅ **`find_dependents`** - Walk `pg_depend` recursively before any `DROP CASCADE` to see the blast radius.
+✅ **`lock_check`** - Static analysis of DDL to predict lock level, table-rewrite, and duration. Knows the semantics of `ALTER TABLE`, `CREATE INDEX [CONCURRENTLY]`, `VACUUM`, `CLUSTER`, `REFRESH MATERIALIZED VIEW`, etc.
+✅ **`safe_alter_table`** - Convert intent ("add NOT NULL with default", "add FK", "create index", …) into a multi-step zero-downtime DDL recipe with NOT VALID + VALIDATE patterns.
+✅ **`detect_migration_state`** - Probe for Liquibase, Flyway, Alembic, Prisma, Knex, Sequelize, Django, Rails, Goose, TypeORM tracker tables. Quoted-identifier safe (e.g. catches Sequelize's `"SequelizeMeta"`).
+✅ **`export_to_sql_file`** / **`transfer_objects`** / **`schema_diff`** - First-class cross-database operations: dump, copy, or compare schema/data between configured endpoints. FK constraints emitted as separate `ALTER TABLE` to handle inter-table cycles.
+✅ **`column_profile`** - Type-aware column stats with `TABLESAMPLE BERNOULLI` for tables >1M rows. Replaces a dozen exploratory queries.
+✅ **`generate_seed_data`** - Schema-aware fake data with `NOT NULL`, `UNIQUE`/PK, enum, default, length, and FK awareness.
+✅ **`find_blocking_queries`** + **`kill_query`** - Diagnose lock waits and `pg_cancel_backend` / `pg_terminate_backend` with confirmation guard.
+✅ **Query budget on `execute_sql`** - `maxEstimatedRows` / `maxEstimatedCost` refuse the query before execution if the planner says it's too big.
+✅ **Hardening from audit iterations** - per-statement savepoints in `dry_run_sql_file` (DO-block + embedded COMMIT no longer compromises the dry-run), preserved PG error codes from `mutation_dry_run`, allowlisted `index_type` in `safe_alter_table`, schema validation runs **before** pool teardown in `switch_server_db`, `detect_migration_state` quoted-identifier lookup, `findDependents` `truncatedAtDepth` flag actually trips, `analyze_db_health` reports invalid-index check failures as `warning` (not silently `healthy`).
 
 ### Real-World Experience
 
