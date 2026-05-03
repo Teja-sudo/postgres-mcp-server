@@ -4,6 +4,22 @@ All notable changes to `@tejasanik/postgres-mcp-server` are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/), versioning
 follows [Semantic Versioning](https://semver.org/).
 
+## [3.0.2] — 2026-05-04
+
+Documentation-only release. No source or behavior changes.
+
+### Documentation
+
+- README configuration section trimmed: removed the `POSTGRES_SERVERS`
+  JSON / "legacy" block and the multi-server bash export walkthrough.
+  Single canonical `PG_*` example now matches the Claude Code / Desktop
+  snippets, alongside the variable-reference table, AI-context, and
+  access-mode subsections.
+- Client integration guides reordered to **Claude Code CLI → Claude
+  Desktop → Codex CLI**. Codex section added (`~/.codex/config.toml`).
+- Replaced the `GraphQL-Intro-DB` example DB name in the AX review
+  with the generic `analytics`.
+
 ## [3.0.1] — 2026-05-04
 
 Audit-loop iteration 3: all 36 MCP tools reviewed against a real PG 17
