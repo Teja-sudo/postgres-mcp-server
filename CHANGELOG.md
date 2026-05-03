@@ -4,6 +4,47 @@ All notable changes to `@tejasanik/postgres-mcp-server` are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/), versioning
 follows [Semantic Versioning](https://semver.org/).
 
+## [3.0.0] — 2026-05-03
+
+### Added (SP-7 — operations & safety pack)
+
+- **`find_blocking_queries` MCP tool** — friendly tree of blocker →
+  blocked sessions. Returns each session's pid, user, database,
+  application name, state, current query (truncated), time spent in
+  the current state, and PG wait_event / wait_event_type. Uses
+  `pg_blocking_pids()` (PG 9.6+) — replaces the gnarly
+  `pg_stat_activity ⨝ pg_locks` join an AI agent struggles to write.
+- **`kill_query` MCP tool** — `pg_cancel_backend` (soft, mode='cancel')
+  or `pg_terminate_backend` (hard, mode='terminate'). Requires
+  `confirm: true` (foot-gun guard). Refused if the target server's
+  effective access mode is readonly. Returns a pre-kill snapshot of
+  the target session.
+- **`maxEstimatedRows` / `maxEstimatedCost` flags on `execute_sql`** —
+  SP-7 query budget. Pre-EXPLAIN check on read-only queries only;
+  refuses to execute if the planner's estimate exceeds the budget.
+  Backstop for AI-generated queries against production. Silently
+  ignored on write queries (we don't EXPLAIN ANALYZE writes — that
+  would defeat read-only mode).
+
+### v3.0.0 rollup
+
+This is the bundled v3 release of the toolkit assembled across
+SP-1 through SP-7. The full surface added since v2.3.0:
+
+| SP | Tools / Changes |
+|----|-----------------|
+| SP-1 | dry-run trust restoration: 4 tools fixed, transaction-guard sentinel + TRANSACTION_CONTROL static skip |
+| SP-2 | introspection module + `export_to_sql_file` (4 variants) |
+| SP-3 | `transfer_objects` (cross-DB / cross-server release) |
+| SP-4 | `describe_table`, `find_dependents`, `schema_diff` |
+| SP-5 | `lock_check`, `detect_migration_state`, `safe_alter_table` |
+| SP-6 | `column_profile`, `generate_seed_data` |
+| SP-7 | `find_blocking_queries`, `kill_query`, `query_budget` flag |
+
+**13 new MCP tools added; 0 existing tools removed; all changes
+additive at the API level. The only behavior change is SP-1's
+silent-persistence bug fix in dry-run tools.**
+
 ## [2.8.0] — 2026-05-03
 
 ### Added (SP-6 — data understanding pack)

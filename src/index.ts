@@ -41,6 +41,8 @@ import {
   safeAlterTable,
   columnProfile,
   generateSeedData,
+  findBlockingQueries,
+  killQuery,
 } from "./tools/index.js";
 import { withConnectionRetry } from "./utils/index.js";
 
@@ -74,6 +76,8 @@ const detectMigrationStateWithRetry = withConnectionRetry(detectMigrationState);
 // safe_alter_table doesn't need a connection (pure logic)
 const columnProfileWithRetry = withConnectionRetry(columnProfile);
 const generateSeedDataWithRetry = withConnectionRetry(generateSeedData);
+const findBlockingQueriesWithRetry = withConnectionRetry(findBlockingQueries);
+const killQueryWithRetry = withConnectionRetry(killQuery);
 
 /**
  * Helper to add connection context to any result
@@ -329,6 +333,20 @@ server.registerTool(
         .string()
         .optional()
         .describe("Execute within an active transaction. Get this from begin_transaction."),
+      maxEstimatedRows: z
+        .number()
+        .optional()
+        .describe(
+          "SP-7 query budget: refuse to run if the planner estimates more than this many rows. " +
+          "Pre-EXPLAIN check on read-only queries only. Useful as a backstop for AI-generated queries."
+        ),
+      maxEstimatedCost: z
+        .number()
+        .optional()
+        .describe(
+          "SP-7 query budget: refuse to run if the planner estimates total cost above this. " +
+          "Read-only queries only."
+        ),
       // Connection override parameters for one-time execution
       server: z
         .string()
@@ -1153,6 +1171,45 @@ server.registerTool(
   },
   async (args) => {
     const result = await generateSeedDataWithRetry(args as any);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "find_blocking_queries",
+  {
+    description:
+      "Show currently-blocking sessions in a friendly tree (blocker → blocked) using pg_stat_activity ⨝ pg_blocking_pids(). Replaces the gnarly join an AI agent struggles to write. Returns each session's pid, user, database, application name, state, current query, time in state, and wait_event. Use to diagnose slowdowns and pick a candidate for kill_query.",
+    inputSchema: z.object({
+      include_idle: z.boolean().optional().default(true),
+      limit: z.number().optional().default(50),
+      server: z.string().optional(),
+      database: z.string().optional(),
+      schema: z.string().optional(),
+    }),
+  },
+  async (args) => {
+    const result = await findBlockingQueriesWithRetry(args as any);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "kill_query",
+  {
+    description:
+      "Cancel or terminate a backend session by PID. mode='cancel' (soft, pg_cancel_backend) interrupts the current statement; mode='terminate' (hard, pg_terminate_backend) kills the entire backend. Both require confirm:true. Refused if the target server's effective access mode is readonly. Returns a snapshot of the target session before signaling.",
+    inputSchema: z.object({
+      pid: z.number().describe("Backend PID to signal."),
+      mode: z.enum(["cancel", "terminate"]).describe("Soft cancel (statement only) or hard terminate (backend)."),
+      confirm: z.boolean().describe("Required confirmation. Foot-gun guard."),
+      server: z.string().optional(),
+      database: z.string().optional(),
+      schema: z.string().optional(),
+    }),
+  },
+  async (args) => {
+    const result = await killQueryWithRetry(args as any);
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );

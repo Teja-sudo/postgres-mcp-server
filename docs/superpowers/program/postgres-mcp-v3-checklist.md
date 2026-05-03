@@ -35,12 +35,14 @@ without all three ticks.
 - [x] (S/I) `generate_seed_data` shipped
 
 ## SP-7 — operations & safety pack (v2.9.0)
-- [ ] (S/I/R) `find_blocking_queries` shipped
-- [ ] (S/I/R) `kill_query` shipped
-- [ ] (S/I/R) `query_budget` flag on `execute_sql` shipped
+- [x] (S/I) `find_blocking_queries` shipped
+- [x] (S/I) `kill_query` shipped
+- [x] (S/I) `query_budget` flag on `execute_sql` shipped
 
 ## v3.0.0 rollup
-- [ ] All SPs released
-- [ ] Consolidated docs under `docs/tools/`
-- [ ] CHANGELOG migration notes finalized
-- [ ] Tagged & published as `3.0.0`
+- [x] All SPs implemented (S/I across all 19 lines)
+- [ ] Consolidated docs under `docs/tools/` (deferred — README still
+      hosts per-tool docs; can split later if README grows further)
+- [x] CHANGELOG migration notes finalized
+- [ ] Tagged & published as `3.0.0` (release left to user — workflow
+      auto-publishes on GitHub release creation)

@@ -83,6 +83,9 @@ export async function executeSql(args: {
   includeSchemaHint?: boolean;
   allowMultipleStatements?: boolean;
   transactionId?: string;
+  // SP-7 query budget (pre-EXPLAIN safety check)
+  maxEstimatedRows?: number;
+  maxEstimatedCost?: number;
   // Connection override parameters for one-time execution on a different server/database/schema
   server?: string;
   database?: string;
@@ -142,6 +145,45 @@ export async function executeSql(args: {
   // Handle multi-statement execution
   if (args.allowMultipleStatements) {
     return executeMultipleStatements(sql, schemaHint, args.transactionId, override);
+  }
+
+  // SP-7: query_budget pre-flight check. Refuse to run if EXPLAIN
+  // estimates exceed the caller's budget. Only applies to read-only
+  // queries (SELECT) - we don't want to EXPLAIN a write query (that
+  // would be EXPLAIN ANALYZE which we explicitly block elsewhere).
+  if (args.maxEstimatedRows !== undefined || args.maxEstimatedCost !== undefined) {
+    const { isReadOnly } = isReadOnlySql(sql);
+    if (isReadOnly) {
+      try {
+        const explainResult = override
+          ? await dbManager.queryWithOverride(`EXPLAIN (FORMAT JSON) ${sql}`, args.params, override)
+          : await dbManager.query(`EXPLAIN (FORMAT JSON) ${sql}`, args.params);
+        const plan = (explainResult.rows[0] as any)?.['QUERY PLAN']?.[0]?.Plan;
+        if (plan) {
+          const estRows = Number(plan['Plan Rows'] ?? 0);
+          const estCost = Number(plan['Total Cost'] ?? 0);
+          if (args.maxEstimatedRows !== undefined && estRows > args.maxEstimatedRows) {
+            throw new Error(
+              `Query budget exceeded: planner estimates ${estRows.toLocaleString()} rows, ` +
+              `budget is ${args.maxEstimatedRows.toLocaleString()}. ` +
+              `Refine WHERE clauses or raise maxEstimatedRows to proceed.`
+            );
+          }
+          if (args.maxEstimatedCost !== undefined && estCost > args.maxEstimatedCost) {
+            throw new Error(
+              `Query budget exceeded: planner estimates cost ${estCost.toFixed(2)}, ` +
+              `budget is ${args.maxEstimatedCost}. ` +
+              `Refine the query or raise maxEstimatedCost to proceed.`
+            );
+          }
+        }
+      } catch (e) {
+        // Re-throw budget violation; swallow EXPLAIN failures (some queries
+        // can't be explained, e.g. queries against catalog views with
+        // permission issues).
+        if (e instanceof Error && /Query budget exceeded/.test(e.message)) throw e;
+      }
+    }
   }
 
   // Record start time for execution timing
