@@ -1,5 +1,6 @@
 import { Pool, PoolClient, QueryResult, QueryResultRow } from "pg";
 import { v7 as uuidv7 } from "uuid";
+import { TransactionGuard, TxGuardResult } from "./tools/sql/utils/transaction-guard.js";
 import {
   AccessMode,
   ServerConfig,
@@ -347,7 +348,7 @@ export class DatabaseManager {
   private queryTimeoutMs: number;
   private activeTransactions: Map<
     string,
-    { client: PoolClient; info: TransactionInfo }
+    { client: PoolClient; info: TransactionInfo; guard: TransactionGuard }
   > = new Map();
 
   // Pool cache for connection overrides (keyed by "serverName:database")
@@ -1544,9 +1545,11 @@ export class DatabaseManager {
 
     const transactionId = uuidv7();
     const client = await this.currentPool.connect();
+    const guard = new TransactionGuard();
 
     try {
       await client.query("BEGIN");
+      await guard.arm(client);
 
       const info: TransactionInfo = {
         transactionId,
@@ -1557,7 +1560,7 @@ export class DatabaseManager {
         startedAt: new Date(),
       };
 
-      this.activeTransactions.set(transactionId, { client, info });
+      this.activeTransactions.set(transactionId, { client, info, guard });
       return info;
     } catch (error) {
       client.release();
@@ -1566,16 +1569,77 @@ export class DatabaseManager {
   }
 
   /**
-   * Commits an active transaction
+   * Verify the outer transaction's sentinel savepoint still exists.
+   * Used by tools that run user-supplied SQL inside an active transaction
+   * to detect if a transaction-control statement closed it.
+   *
+   * @returns ok:true if healthy, ok:false with reason if compromised, or
+   *          null if no such transaction exists.
    */
-  public async commitTransaction(transactionId: string): Promise<void> {
+  public async verifyTransactionIntact(
+    transactionId: string
+  ): Promise<TxGuardResult | null> {
+    const transaction = this.activeTransactions.get(transactionId);
+    if (!transaction) return null;
+    if (transaction.info.compromised) {
+      return {
+        ok: false,
+        reason: transaction.info.compromisedReason ?? 'tx_closed',
+      };
+    }
+    const result = await transaction.guard.verify(transaction.client);
+    if (!result.ok) {
+      transaction.info.compromised = true;
+      transaction.info.compromisedReason = result.reason;
+    }
+    return result;
+  }
+
+  /**
+   * Mark a transaction as compromised. Subsequent commit/rollback calls
+   * will return status 'compromised' instead of issuing SQL.
+   */
+  public markTransactionCompromised(
+    transactionId: string,
+    reason: 'tx_closed' | 'tx_diverged'
+  ): void {
+    const transaction = this.activeTransactions.get(transactionId);
+    if (!transaction) return;
+    transaction.info.compromised = true;
+    transaction.info.compromisedReason = reason;
+  }
+
+  /**
+   * Returns true if the transaction is marked compromised.
+   */
+  public isTransactionCompromised(transactionId: string): boolean {
+    const transaction = this.activeTransactions.get(transactionId);
+    return transaction?.info.compromised === true;
+  }
+
+  /**
+   * Commits an active transaction.
+   * @returns true if committed, false if transaction was compromised
+   *          (commit was not issued; client released).
+   */
+  public async commitTransaction(transactionId: string): Promise<boolean> {
     const transaction = this.activeTransactions.get(transactionId);
     if (!transaction) {
       throw new Error(`Transaction not found: ${transactionId}`);
     }
 
+    if (transaction.info.compromised) {
+      // Outer tx was already closed by an embedded transaction-control
+      // statement. Don't issue COMMIT against an unknown state - just
+      // release the client and clean up.
+      transaction.client.release();
+      this.activeTransactions.delete(transactionId);
+      return false;
+    }
+
     try {
       await transaction.client.query("COMMIT");
+      return true;
     } finally {
       transaction.client.release();
       this.activeTransactions.delete(transactionId);
@@ -1583,16 +1647,32 @@ export class DatabaseManager {
   }
 
   /**
-   * Rolls back an active transaction
+   * Rolls back an active transaction.
+   * @returns true if rolled back, false if transaction was compromised
+   *          (rollback was best-effort; client released).
    */
-  public async rollbackTransaction(transactionId: string): Promise<void> {
+  public async rollbackTransaction(transactionId: string): Promise<boolean> {
     const transaction = this.activeTransactions.get(transactionId);
     if (!transaction) {
       throw new Error(`Transaction not found: ${transactionId}`);
     }
 
+    if (transaction.info.compromised) {
+      // Best-effort rollback if connection still has a tx, but the
+      // outer one is gone. We don't propagate errors here.
+      try {
+        await transaction.client.query("ROLLBACK");
+      } catch {
+        // Outer tx was already closed
+      }
+      transaction.client.release();
+      this.activeTransactions.delete(transactionId);
+      return false;
+    }
+
     try {
       await transaction.client.query("ROLLBACK");
+      return true;
     } finally {
       transaction.client.release();
       this.activeTransactions.delete(transactionId);

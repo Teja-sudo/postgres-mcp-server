@@ -10,3 +10,4 @@ export * from './dry-run-utils.js';
 export * from './file-handler.js';
 export * from './result-formatter.js';
 export * from './sql-parser.js';
+export * from './transaction-guard.js';

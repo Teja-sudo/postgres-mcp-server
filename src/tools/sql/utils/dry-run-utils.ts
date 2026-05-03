@@ -6,6 +6,7 @@
  */
 
 import { DryRunError, NonRollbackableWarning } from '../../../types.js';
+import { stripLeadingComments } from './sql-parser.js';
 
 /** Valid operation types for non-rollbackable warnings */
 type OperationType = NonRollbackableWarning['operation'];
@@ -83,6 +84,59 @@ const NON_ROLLBACKABLE_PATTERNS: Array<{
     message: 'NOTIFY sends notifications on commit. Since dry-run rolls back, notifications will NOT be sent.',
     mustSkip: false,
   },
+  // Transaction-control statements - MUST be skipped in dry-run wrappers,
+  // otherwise they hijack the outer transaction and silently persist
+  // changes despite our final ROLLBACK. Note: 'END' is intentionally not
+  // included here (false-positive risk against CASE...END, plpgsql block
+  // terminators); the runtime savepoint sentinel catches it instead.
+  {
+    pattern: /^\s*BEGIN\b/,
+    operation: 'TRANSACTION_CONTROL',
+    message: 'BEGIN inside a dry-run wrapper opens a nested transaction PostgreSQL does not support. Skipped to preserve outer transaction integrity.',
+    mustSkip: true,
+  },
+  {
+    pattern: /^\s*START\s+TRANSACTION\b/,
+    operation: 'TRANSACTION_CONTROL',
+    message: 'START TRANSACTION inside a dry-run wrapper opens a nested transaction PostgreSQL does not support. Skipped to preserve outer transaction integrity.',
+    mustSkip: true,
+  },
+  {
+    pattern: /^\s*COMMIT\b/,
+    operation: 'TRANSACTION_CONTROL',
+    message: 'COMMIT inside a dry-run wrapper closes the outer transaction and would persist all preceding changes. Skipped.',
+    mustSkip: true,
+  },
+  {
+    pattern: /^\s*ROLLBACK\s+TO\b/,
+    operation: 'TRANSACTION_CONTROL',
+    message: 'ROLLBACK TO SAVEPOINT inside a dry-run wrapper interferes with the sentinel savepoint. Skipped.',
+    mustSkip: true,
+  },
+  {
+    pattern: /^\s*ROLLBACK\b(?!\s+TO)/,
+    operation: 'TRANSACTION_CONTROL',
+    message: 'ROLLBACK inside a dry-run wrapper closes the outer transaction. Skipped.',
+    mustSkip: true,
+  },
+  {
+    pattern: /^\s*ABORT\b/,
+    operation: 'TRANSACTION_CONTROL',
+    message: 'ABORT (synonym for ROLLBACK) inside a dry-run wrapper closes the outer transaction. Skipped.',
+    mustSkip: true,
+  },
+  {
+    pattern: /^\s*SAVEPOINT\b/,
+    operation: 'TRANSACTION_CONTROL',
+    message: 'SAVEPOINT inside a dry-run wrapper conflicts with the sentinel savepoint. Skipped.',
+    mustSkip: true,
+  },
+  {
+    pattern: /^\s*RELEASE\s+SAVEPOINT\b/,
+    operation: 'TRANSACTION_CONTROL',
+    message: 'RELEASE SAVEPOINT inside a dry-run wrapper conflicts with the sentinel savepoint. Skipped.',
+    mustSkip: true,
+  },
 ];
 
 /**
@@ -144,7 +198,9 @@ export function detectNonRollbackableOperations(
   lineNumber?: number
 ): NonRollbackableWarning[] {
   const warnings: NonRollbackableWarning[] = [];
-  const upperSql = sql.toUpperCase().trim();
+  // Strip leading comments first so patterns anchored at start-of-statement
+  // match correctly even when the user prefixes a statement with comments.
+  const upperSql = stripLeadingComments(sql).toUpperCase().trim();
 
   const clusterPattern = /\bCLUSTER\b/;
 

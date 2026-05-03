@@ -72,6 +72,8 @@ import {
   getStartTime,
 } from './sql/utils/result-formatter.js';
 
+import { TransactionGuard } from './sql/utils/transaction-guard.js';
+
 export async function executeSql(args: {
   sql: string;
   params?: any[];
@@ -287,8 +289,13 @@ async function executeMultipleStatements(
       release();
     }
   } else {
-    // Default execution path
+    // Default execution path. We use a small heuristic guard for the
+    // transactionId case so that an embedded COMMIT/ROLLBACK in the
+    // user's SQL is detected and the transaction is marked compromised.
+    const heuristicGuard = transactionId ? new TransactionGuard() : null;
+    let txAborted = false;
     for (let i = 0; i < executableStatements.length; i++) {
+      if (txAborted) break;
       const stmt = executableStatements[i];
       const stmtResult: MultiStatementResult = {
         statementIndex: i + 1,
@@ -313,6 +320,22 @@ async function executeMultipleStatements(
         stmtResult.success = false;
         stmtResult.error = error instanceof Error ? error.message : String(error);
         failureCount++;
+      }
+
+      // Layer 2 sentinel for transactionId path: if the user's SQL
+      // contained a transaction-control statement, the transaction
+      // we were holding is now closed. Mark it compromised so the
+      // upcoming commit_transaction / rollback_transaction call
+      // returns 'compromised' instead of pretending success.
+      if (transactionId && heuristicGuard && heuristicGuard.shouldVerifyAfter(stmt.sql)) {
+        const check = await dbManager.verifyTransactionIntact(transactionId);
+        if (check && !check.ok) {
+          stmtResult.error = (stmtResult.error ? stmtResult.error + ' | ' : '') +
+            `Transaction-control statement closed the outer transaction (reason: ${check.reason}). ` +
+            `Subsequent statements in this batch will not be executed. ` +
+            `commit_transaction/rollback_transaction on this transactionId will return status 'compromised'.`;
+          txAborted = true;
+        }
       }
 
       results.push(stmtResult);
@@ -613,6 +636,21 @@ export async function executeSqlFile(args: {
   const stopOnError = args.stopOnError !== false; // Default to true
   const validateOnly = args.validateOnly === true; // Default to false
 
+  // Refuse the combination useTransaction=true + stopOnError=false:
+  // PostgreSQL aborts the entire transaction on first error and ignores
+  // subsequent statements, so "continue with remaining statements" never
+  // produced useful results - just one real error followed by N spurious
+  // "current transaction is aborted" errors. Surface this explicitly.
+  if (useTransaction && args.stopOnError === false) {
+    throw new Error(
+      'useTransaction=true and stopOnError=false cannot be combined. ' +
+      'PostgreSQL aborts the entire transaction on the first error, ' +
+      'ignoring subsequent statements. Use useTransaction=false for ' +
+      'per-statement isolation, or stopOnError=true to roll back on ' +
+      'first failure.'
+    );
+  }
+
   // Build connection override if specified
   const hasOverride = args.server || args.database || args.schema;
   const override: ConnectionOverride | undefined = hasOverride
@@ -673,10 +711,14 @@ export async function executeSqlFile(args: {
   let totalRowsAffected = 0;
   let rolledBack = false;
   const collectedErrors: StatementError[] = [];
+  // Sentinel guard - only used when useTransaction is true.
+  const guard = useTransaction ? new TransactionGuard() : null;
+  let txCompromised = false;
 
   try {
     if (useTransaction) {
       await client.query('BEGIN');
+      if (guard) await guard.arm(client);
     }
 
     for (let statementIndex = 0; statementIndex < executableStatements.length; statementIndex++) {
@@ -695,7 +737,7 @@ export async function executeSqlFile(args: {
 
         if (stopOnError) {
           if (useTransaction) {
-            await client.query('ROLLBACK');
+            try { await client.query('ROLLBACK'); } catch { /* ignored */ }
             rolledBack = true;
           }
           // Add the error to collection before throwing
@@ -708,7 +750,8 @@ export async function executeSqlFile(args: {
           throw error;
         }
 
-        // If stopOnError is false, collect error and continue
+        // If stopOnError is false (only valid when useTransaction is also false),
+        // collect error and continue
         collectedErrors.push({
           statementIndex: statementIndex + 1,
           lineNumber: stmt.lineNumber,
@@ -717,9 +760,41 @@ export async function executeSqlFile(args: {
         });
         console.error(`Warning: Statement ${statementIndex + 1} at line ${stmt.lineNumber} failed: ${errorMessage}`);
       }
+
+      // Layer 2: runtime sentinel for transaction mode. Verify the
+      // outer transaction still exists if this statement was suspect.
+      if (guard && guard.shouldVerifyAfter(trimmed)) {
+        const check = await guard.verify(client);
+        if (!check.ok) {
+          txCompromised = true;
+          collectedErrors.push({
+            statementIndex: statementIndex + 1,
+            lineNumber: stmt.lineNumber,
+            sql: trimmed.length > SQL_TRUNCATION_SHORT ? trimmed.substring(0, SQL_TRUNCATION_SHORT) + '...' : trimmed,
+            error: `Transaction-control statement closed the outer transaction (reason: ${check.reason}). ` +
+                   `Subsequent changes may have persisted to the live database. Aborting.`
+          });
+          throw new Error(
+            `Transaction-control statement at line ${stmt.lineNumber} closed the outer transaction. ` +
+            `useTransaction=true cannot be honored when SQL contains COMMIT/ROLLBACK/etc. ` +
+            `Use useTransaction=false for per-statement execution.`
+          );
+        }
+      }
     }
 
     if (useTransaction && !rolledBack) {
+      // Final pre-commit verification
+      if (guard) {
+        const finalCheck = await guard.verify(client);
+        if (!finalCheck.ok) {
+          txCompromised = true;
+          throw new Error(
+            `Outer transaction was closed during execution (reason: ${finalCheck.reason}). ` +
+            `Cannot safely commit. Some changes may have persisted to the live database.`
+          );
+        }
+      }
       await client.query('COMMIT');
     }
 
@@ -745,6 +820,18 @@ export async function executeSqlFile(args: {
 
   } catch (error) {
     const executionTimeMs = calculateExecutionTime(startTime, getStartTime());
+
+    // If we hit the transaction-compromised path, rollback is best-effort
+    // - the outer tx is already gone. We still try in case it's been
+    // re-established by an autocommit statement.
+    if (txCompromised && useTransaction && !rolledBack) {
+      try {
+        await client.query('ROLLBACK');
+        rolledBack = true;
+      } catch {
+        // tx already closed; nothing to roll back
+      }
+    }
 
     const result: ExecuteSqlFileResult = {
       success: false,
@@ -1027,10 +1114,14 @@ export async function dryRunSqlFile(args: {
   let skippedCount = 0;
   let totalRowsAffected = 0;
   let aborted = false;
+  let dryRunCompromised = false;
+  let compromisedAt: { statementIndex: number; lineNumber: number; reason: 'tx_closed' | 'tx_diverged' } | undefined;
+  const guard = new TransactionGuard();
 
   try {
-    // Start transaction
+    // Start transaction and arm sentinel savepoint immediately
     await client.query('BEGIN');
+    await guard.arm(client);
 
     for (let idx = 0; idx < executableStatements.length && !aborted; idx++) {
       const stmt = executableStatements[idx];
@@ -1098,6 +1189,22 @@ export async function dryRunSqlFile(args: {
             aborted = true;
           }
         }
+
+        // Layer 2: runtime sentinel. Verify the outer transaction still
+        // exists if this statement was suspect (DO blocks, EXECUTE,
+        // CALL, or anything matching the transaction-control heuristic).
+        if (!aborted && guard.shouldVerifyAfter(stmt.sql)) {
+          const check = await guard.verify(client);
+          if (!check.ok) {
+            dryRunCompromised = true;
+            compromisedAt = {
+              statementIndex: idx + 1,
+              lineNumber: stmt.lineNumber,
+              reason: check.reason,
+            };
+            aborted = true;
+          }
+        }
       }
 
       result.executionTimeMs = calculateExecutionTime(stmtStartTime, getStartTime());
@@ -1108,8 +1215,26 @@ export async function dryRunSqlFile(args: {
       }
     }
 
-    // Always rollback - this is a dry run
-    await client.query('ROLLBACK');
+    // Final pre-rollback verification: catch anything the heuristic missed
+    if (!dryRunCompromised) {
+      const finalCheck = await guard.verify(client);
+      if (!finalCheck.ok) {
+        dryRunCompromised = true;
+        compromisedAt = {
+          statementIndex: -1,
+          lineNumber: -1,
+          reason: finalCheck.reason,
+        };
+      }
+    }
+
+    // Always attempt rollback - this is a dry run. Best-effort if
+    // outer tx was already closed (PG will WARNING; we ignore it).
+    try {
+      await client.query('ROLLBACK');
+    } catch {
+      // Ignore - tx may already be closed
+    }
 
   } catch (e) {
     // Ensure rollback on any error
@@ -1144,10 +1269,14 @@ export async function dryRunSqlFile(args: {
     summary += `Types: ${typeSummary}. `;
   }
   summary += `Total rows affected: ${totalRowsAffected}. `;
-  summary += 'All changes rolled back.';
+  if (dryRunCompromised) {
+    summary += 'WARNING: a transaction-control statement closed the outer transaction during execution; some changes may have persisted to the live database. ';
+  } else {
+    summary += 'All changes rolled back.';
+  }
 
   return {
-    success: failureCount === 0,
+    success: failureCount === 0 && !dryRunCompromised,
     filePath: resolvedPath,
     fileSize: stats.size,
     fileSizeFormatted,
@@ -1161,7 +1290,8 @@ export async function dryRunSqlFile(args: {
     statementResults,
     nonRollbackableWarnings,
     summary,
-    rolledBack: true
+    rolledBack: !dryRunCompromised,
+    ...(dryRunCompromised && { dryRunCompromised: true, compromisedAt }),
   };
 }
 
@@ -1616,11 +1746,15 @@ export async function mutationDryRun(args: {
   let rowsAffected = 0;
   let error: DryRunError | undefined;
   let success = false;
+  let dryRunCompromised = false;
+  let compromisedReason: 'tx_closed' | 'tx_diverged' | undefined;
   const warnings: string[] = [];
+  const guard = new TransactionGuard();
 
   try {
-    // Start transaction
+    // Start transaction and arm sentinel savepoint
     await client.query('BEGIN');
+    await guard.arm(client);
 
     // For UPDATE/DELETE, capture "before" state
     if ((mutationType === 'UPDATE' || mutationType === 'DELETE') && targetTable) {
@@ -1676,8 +1810,21 @@ export async function mutationDryRun(args: {
       }
     }
 
-    // Always rollback - this is a dry run
-    await client.query('ROLLBACK');
+    // Layer 2: verify the outer transaction still exists. The user's
+    // SQL is always treated as suspect (single statement we don't trust).
+    const finalCheck = await guard.verify(client);
+    if (!finalCheck.ok) {
+      dryRunCompromised = true;
+      compromisedReason = finalCheck.reason;
+      success = false;
+    }
+
+    // Always attempt rollback - best-effort if outer tx was closed
+    try {
+      await client.query('ROLLBACK');
+    } catch {
+      // Ignore - tx may already be closed
+    }
 
   } catch (e) {
     // Ensure rollback on any error
@@ -1729,6 +1876,14 @@ export async function mutationDryRun(args: {
 
   if (nonRollbackableWarnings.length > 0) {
     result.nonRollbackableWarnings = nonRollbackableWarnings;
+  }
+
+  if (dryRunCompromised && compromisedReason) {
+    result.dryRunCompromised = true;
+    result.compromisedAt = { reason: compromisedReason };
+    warnings.push(
+      'WARNING: a transaction-control statement closed the outer transaction; some changes may have persisted to the live database.'
+    );
   }
 
   if (warnings.length > 0) {
@@ -1913,7 +2068,20 @@ export async function commitTransaction(args: {
   }
 
   const dbManager = getDbManager();
-  await dbManager.commitTransaction(args.transactionId);
+  const wasCompromised = dbManager.isTransactionCompromised(args.transactionId);
+  const committed = await dbManager.commitTransaction(args.transactionId);
+
+  if (!committed || wasCompromised) {
+    return {
+      transactionId: args.transactionId,
+      status: 'compromised',
+      message:
+        'Transaction was compromised by an embedded transaction-control statement ' +
+        '(COMMIT/ROLLBACK/etc.) inside execute_sql. The outer transaction was already ' +
+        'closed; commit was not issued. Some changes may have persisted to the live database. ' +
+        'Inspect the database state and run any compensating queries needed.',
+    };
+  }
 
   return {
     transactionId: args.transactionId,
@@ -1933,7 +2101,20 @@ export async function rollbackTransaction(args: {
   }
 
   const dbManager = getDbManager();
-  await dbManager.rollbackTransaction(args.transactionId);
+  const wasCompromised = dbManager.isTransactionCompromised(args.transactionId);
+  const rolledBack = await dbManager.rollbackTransaction(args.transactionId);
+
+  if (!rolledBack || wasCompromised) {
+    return {
+      transactionId: args.transactionId,
+      status: 'compromised',
+      message:
+        'Transaction was compromised by an embedded transaction-control statement ' +
+        '(COMMIT/ROLLBACK/etc.) inside execute_sql. The outer transaction was already ' +
+        'closed; rollback was best-effort. Some changes may have persisted to the live database. ' +
+        'Inspect the database state and run any compensating queries needed.',
+    };
+  }
 
   return {
     transactionId: args.transactionId,

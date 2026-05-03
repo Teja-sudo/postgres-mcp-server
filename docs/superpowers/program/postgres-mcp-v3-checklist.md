@@ -6,12 +6,12 @@ implementation merged (I), released to npm (R). Nothing in this list ships
 without all three ticks.
 
 ## SP-1 — dry-run trust restoration (v2.3.1)
-- [ ] (S/I/R) `dry_run_sql_file` outer-tx leak fixed
-- [ ] (S/I/R) `mutationDryRun` outer-tx leak fixed
-- [ ] (S/I/R) `executeSqlFile(useTransaction=true)` outer-tx leak fixed
-- [ ] (S/I/R) `executeMultipleStatements(transactionId)` outer-tx leak fixed
-- [ ] (S/I/R) testcontainers harness added
-- [ ] (S/I/R) `/tmp` Windows portability fixed in `sql-tools.test.ts`
+- [x] (S/I) `dry_run_sql_file` outer-tx leak fixed
+- [x] (S/I) `mutationDryRun` outer-tx leak fixed
+- [x] (S/I) `executeSqlFile(useTransaction=true)` outer-tx leak fixed
+- [x] (S/I) `executeMultipleStatements(transactionId)` outer-tx leak fixed
+- [x] (S/I) testcontainers harness added
+- [x] (S/I) `/tmp` Windows portability fixed in `sql-tools.test.ts`
 
 ## SP-2 — introspection module + export_to_sql_file (v2.4.0)
 - [ ] (S/I/R) shared `introspection/` module shipped

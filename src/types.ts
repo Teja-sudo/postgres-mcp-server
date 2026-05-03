@@ -306,6 +306,12 @@ export interface TransactionInfo {
   database: string;
   schema: string;
   startedAt: Date;
+  /** True if a statement run inside this transaction closed it (e.g., embedded
+   *  COMMIT/ROLLBACK). Once compromised, commit/rollback calls return status
+   *  'compromised' instead of issuing SQL on a closed connection state. */
+  compromised?: boolean;
+  /** Reason the transaction was marked compromised */
+  compromisedReason?: 'tx_closed' | 'tx_diverged';
 }
 
 /**
@@ -313,7 +319,7 @@ export interface TransactionInfo {
  */
 export interface TransactionResult {
   transactionId: string;
-  status: 'started' | 'committed' | 'rolled_back';
+  status: 'started' | 'committed' | 'rolled_back' | 'compromised';
   message: string;
 }
 
@@ -397,7 +403,8 @@ export interface NonRollbackableWarning {
   /** Type of operation */
   operation: 'SEQUENCE' | 'VACUUM' | 'CLUSTER' | 'REINDEX_CONCURRENTLY' |
              'CREATE_INDEX_CONCURRENTLY' | 'CREATE_DATABASE' | 'DROP_DATABASE' |
-             'NOTIFY' | 'LISTEN' | 'UNLISTEN' | 'DISCARD' | 'LOAD';
+             'NOTIFY' | 'LISTEN' | 'UNLISTEN' | 'DISCARD' | 'LOAD' |
+             'TRANSACTION_CONTROL';
   /** Warning message explaining the limitation */
   message: string;
   /** Statement index (1-based) if applicable */
@@ -440,6 +447,12 @@ export interface MutationDryRunResult {
   warnings?: string[];
   /** Query plan from EXPLAIN (for skipped statements with NEXTVAL/SETVAL) */
   explainPlan?: object[];
+  /** True if a transaction-control statement closed our outer transaction
+   *  during execution. When true, some changes may have persisted despite
+   *  the tool's rollback semantics. */
+  dryRunCompromised?: boolean;
+  /** Where the outer transaction was closed (if dryRunCompromised is true) */
+  compromisedAt?: { reason: 'tx_closed' | 'tx_diverged' };
 }
 
 /**
@@ -476,4 +489,14 @@ export interface SqlFileDryRunResult {
   summary: string;
   /** Note that changes were rolled back */
   rolledBack: boolean;
+  /** True if a transaction-control statement closed our outer transaction
+   *  during execution. When true, rolledBack may be misleading - some
+   *  changes may have persisted to the live database. */
+  dryRunCompromised?: boolean;
+  /** Where the outer transaction was closed (if dryRunCompromised is true) */
+  compromisedAt?: {
+    statementIndex: number;
+    lineNumber: number;
+    reason: 'tx_closed' | 'tx_diverged';
+  };
 }

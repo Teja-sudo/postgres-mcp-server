@@ -171,6 +171,69 @@ describe('dry-run-utils', () => {
         expect(warnings[0].lineNumber).toBe(10);
       });
     });
+
+    describe('TRANSACTION_CONTROL operations (SP-1)', () => {
+      it.each([
+        ['BEGIN;', 'BEGIN'],
+        ['BEGIN', 'BEGIN'],
+        ['START TRANSACTION;', 'START TRANSACTION'],
+        ['COMMIT;', 'COMMIT'],
+        ['COMMIT', 'COMMIT'],
+        ['ROLLBACK;', 'ROLLBACK'],
+        ['ABORT;', 'ABORT'],
+        ['SAVEPOINT s1;', 'SAVEPOINT'],
+        ['RELEASE SAVEPOINT s1;', 'RELEASE SAVEPOINT'],
+        ['ROLLBACK TO SAVEPOINT s1;', 'ROLLBACK TO'],
+      ])('flags TRANSACTION_CONTROL with mustSkip:true for: %s', (sql) => {
+        const warnings = detectNonRollbackableOperations(sql);
+        const tc = warnings.filter((w) => w.operation === 'TRANSACTION_CONTROL');
+        expect(tc.length).toBeGreaterThanOrEqual(1);
+        expect(tc[0].mustSkip).toBe(true);
+      });
+
+      it('strips leading line comments before matching', () => {
+        // The COMMIT keyword preceded by a comment should still be caught
+        const warnings = detectNonRollbackableOperations('-- migration step\nCOMMIT;');
+        const tc = warnings.filter((w) => w.operation === 'TRANSACTION_CONTROL');
+        expect(tc.length).toBeGreaterThanOrEqual(1);
+      });
+
+      it('strips leading block comments before matching', () => {
+        const warnings = detectNonRollbackableOperations('/* note */ COMMIT;');
+        const tc = warnings.filter((w) => w.operation === 'TRANSACTION_CONTROL');
+        expect(tc.length).toBeGreaterThanOrEqual(1);
+      });
+
+      it('does NOT flag END (avoids false positives on CASE/plpgsql blocks)', () => {
+        // 'END' on its own would be a transaction-control synonym for COMMIT,
+        // but the false-positive risk against CASE...END / END IF / plpgsql
+        // block terminators is too high. Layer 2 catches it at runtime.
+        const warnings = detectNonRollbackableOperations('END;');
+        const tc = warnings.filter((w) => w.operation === 'TRANSACTION_CONTROL');
+        expect(tc).toHaveLength(0);
+      });
+
+      it('does NOT flag CREATE TABLE that just happens to mention BEGIN as a string', () => {
+        // The static layer is loose with strings (existing limitation), but
+        // the keyword must appear at the START of a statement to be flagged.
+        // CREATE TABLE doesn't start with BEGIN.
+        const warnings = detectNonRollbackableOperations(
+          "CREATE TABLE log (msg text); -- BEGIN tx tracker"
+        );
+        const tc = warnings.filter((w) => w.operation === 'TRANSACTION_CONTROL');
+        expect(tc).toHaveLength(0);
+      });
+
+      it('flags ROLLBACK without TO via the specific pattern, not ROLLBACK TO', () => {
+        const rollbackOnly = detectNonRollbackableOperations('ROLLBACK;');
+        const rollbackTo = detectNonRollbackableOperations('ROLLBACK TO sp1;');
+        // Both should be flagged, with different messages
+        const r1 = rollbackOnly.filter((w) => w.operation === 'TRANSACTION_CONTROL');
+        const r2 = rollbackTo.filter((w) => w.operation === 'TRANSACTION_CONTROL');
+        expect(r1.length).toBeGreaterThanOrEqual(1);
+        expect(r2.length).toBeGreaterThanOrEqual(1);
+      });
+    });
   });
 
   describe('hasMustSkipWarning', () => {

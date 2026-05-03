@@ -1,5 +1,7 @@
 import { jest, describe, it, expect, beforeEach, beforeAll } from '@jest/globals';
 import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 
 type MockFn = jest.Mock<any>;
 
@@ -14,6 +16,11 @@ const mockCommitTransaction = jest.fn<MockFn>();
 const mockRollbackTransaction = jest.fn<MockFn>();
 const mockQueryInTransaction = jest.fn<MockFn>();
 const mockGetConnectionContext = jest.fn<MockFn>();
+const mockIsTransactionCompromised = jest.fn<MockFn>();
+const mockVerifyTransactionIntact = jest.fn<MockFn>();
+const mockMarkTransactionCompromised = jest.fn<MockFn>();
+const mockGetTransactionInfo = jest.fn<MockFn>();
+const mockListActiveTransactions = jest.fn<MockFn>();
 
 jest.unstable_mockModule('../db-manager.js', () => ({
   getDbManager: jest.fn(() => ({
@@ -23,9 +30,14 @@ jest.unstable_mockModule('../db-manager.js', () => ({
     getClientWithOverride: mockGetClientWithOverride,
     isConnected: mockIsConnected.mockReturnValue(true),
     beginTransaction: mockBeginTransaction,
-    commitTransaction: mockCommitTransaction,
-    rollbackTransaction: mockRollbackTransaction,
+    commitTransaction: mockCommitTransaction.mockResolvedValue(true),
+    rollbackTransaction: mockRollbackTransaction.mockResolvedValue(true),
     queryInTransaction: mockQueryInTransaction,
+    isTransactionCompromised: mockIsTransactionCompromised.mockReturnValue(false),
+    verifyTransactionIntact: mockVerifyTransactionIntact.mockResolvedValue({ ok: true }),
+    markTransactionCompromised: mockMarkTransactionCompromised,
+    getTransactionInfo: mockGetTransactionInfo,
+    listActiveTransactions: mockListActiveTransactions.mockReturnValue([]),
     getConnectionContext: mockGetConnectionContext.mockReturnValue({
       server: 'test-server',
       database: 'test-db',
@@ -35,6 +47,50 @@ jest.unstable_mockModule('../db-manager.js', () => ({
   resetDbManager: jest.fn(),
   OverrideClientResult: {} // Export type placeholder
 }));
+
+/**
+ * Smart-mock helper for tests that exercise tools wrapping user SQL in a
+ * transaction with the SP-1 sentinel guard. Transparently handles system
+ * queries (BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE SAVEPOINT, the
+ * compound RELEASE+SAVEPOINT verify cycle, ABORT, START TRANSACTION) by
+ * returning empty success. User-query responses are pulled from the
+ * provided queue in order, with Error values throwing.
+ */
+function setupSmartClientMock(
+  mockFn: MockFn,
+  userResponses: Array<unknown>
+): void {
+  let userIdx = 0;
+  const isSystem = (sql: string): boolean => {
+    const trimmed = (sql || '').trim();
+    if (!trimmed) return false;
+    const upper = trimmed.toUpperCase();
+    if (
+      upper.startsWith('BEGIN') ||
+      upper.startsWith('COMMIT') ||
+      upper.startsWith('ABORT') ||
+      upper.startsWith('SAVEPOINT') ||
+      upper.startsWith('RELEASE SAVEPOINT') ||
+      upper.startsWith('RELEASE  SAVEPOINT') ||
+      upper.startsWith('START TRANSACTION') ||
+      upper.startsWith('ROLLBACK')
+    ) {
+      return true;
+    }
+    return false;
+  };
+  mockFn.mockImplementation(((sql: string) => {
+    if (isSystem(sql)) {
+      return Promise.resolve({});
+    }
+    if (userIdx >= userResponses.length) {
+      return Promise.resolve({ rows: [], rowCount: 0 });
+    }
+    const next = userResponses[userIdx++];
+    if (next instanceof Error) return Promise.reject(next);
+    return Promise.resolve(next);
+  }) as any);
+}
 
 // Dynamic import after mock
 let executeSql: any;
@@ -409,7 +465,7 @@ describe('SQL Tools', () => {
       mockGetClient.mockResolvedValue(mockClient);
 
       // Create unique test directory for each test run
-      testDir = fs.mkdtempSync('/tmp/postgres-mcp-test-');
+      testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-mcp-test-'));
       testFile = `${testDir}/test.sql`;
     });
 
@@ -486,11 +542,10 @@ describe('SQL Tools', () => {
 
     it('should rollback on error with useTransaction=true', async () => {
       fs.writeFileSync(testFile, 'SELECT 1; INVALID SQL; SELECT 3;');
-      mockClient.query
-        .mockResolvedValueOnce({}) // BEGIN
-        .mockResolvedValueOnce({ rowCount: 1 }) // SELECT 1
-        .mockRejectedValueOnce(new Error('syntax error')) // INVALID SQL
-        .mockResolvedValueOnce({}); // ROLLBACK
+      setupSmartClientMock(mockClient.query, [
+        { rowCount: 1 }, // SELECT 1
+        new Error('syntax error'), // INVALID SQL
+      ]);
 
       const result = await executeSqlFile({ filePath: testFile });
 
@@ -503,16 +558,32 @@ describe('SQL Tools', () => {
       expect(result.errors[0].statementIndex).toBe(2);
     });
 
-    it('should continue on error with stopOnError=false', async () => {
-      fs.writeFileSync(testFile, 'SELECT 1; INVALID SQL; SELECT 3;');
-      mockClient.query
-        .mockResolvedValueOnce({}) // BEGIN
-        .mockResolvedValueOnce({ rowCount: 1 }) // SELECT 1
-        .mockRejectedValueOnce(new Error('syntax error')) // INVALID SQL
-        .mockResolvedValueOnce({ rowCount: 1 }) // SELECT 3
-        .mockResolvedValueOnce({}); // COMMIT
+    it('should refuse useTransaction=true with stopOnError=false (SP-1 validation)', async () => {
+      fs.writeFileSync(testFile, 'SELECT 1; SELECT 2;');
+      // SP-1: this combination is now refused at validation time because
+      // PostgreSQL aborts the entire transaction on the first error,
+      // ignoring all subsequent statements. Per-statement isolation
+      // requires useTransaction=false.
+      await expect(
+        executeSqlFile({ filePath: testFile, useTransaction: true, stopOnError: false })
+      ).rejects.toThrow(/cannot be combined/i);
+    });
 
-      const result = await executeSqlFile({ filePath: testFile, stopOnError: false });
+    it('should continue on error with stopOnError=false (useTransaction=false)', async () => {
+      fs.writeFileSync(testFile, 'SELECT 1; INVALID SQL; SELECT 3;');
+      // useTransaction=false enables per-statement execution; this is the
+      // correct way to use stopOnError=false.
+      setupSmartClientMock(mockClient.query, [
+        { rowCount: 1 }, // SELECT 1
+        new Error('syntax error'), // INVALID SQL
+        { rowCount: 1 }, // SELECT 3
+      ]);
+
+      const result = await executeSqlFile({
+        filePath: testFile,
+        useTransaction: false,
+        stopOnError: false,
+      });
 
       expect(result.success).toBe(false); // Not success because there was a failure
       expect(result.statementsExecuted).toBe(2);
@@ -604,12 +675,11 @@ describe('SQL Tools', () => {
         INVALID SYNTAX HERE;
         SELECT 4;
       `);
-      mockClient.query
-        .mockResolvedValueOnce({}) // BEGIN
-        .mockResolvedValueOnce({ rowCount: 1 }) // SELECT 1
-        .mockResolvedValueOnce({ rowCount: 1 }) // SELECT 2
-        .mockRejectedValueOnce(new Error('syntax error')) // INVALID
-        .mockResolvedValueOnce({}); // ROLLBACK
+      setupSmartClientMock(mockClient.query, [
+        { rowCount: 1 }, // SELECT 1
+        { rowCount: 1 }, // SELECT 2
+        new Error('syntax error'), // INVALID
+      ]);
 
       const result = await executeSqlFile({ filePath: testFile, stopOnError: true });
 
@@ -628,13 +698,18 @@ FROM table1;
 -- Line 6
 SELECT 1;
 INVALID;`);
-      mockClient.query
-        .mockResolvedValueOnce({}) // BEGIN
-        .mockResolvedValueOnce({ rowCount: 1 }) // First SELECT
-        .mockResolvedValueOnce({ rowCount: 1 }) // SELECT 1
-        .mockRejectedValueOnce(new Error('syntax error')); // INVALID
+      // useTransaction=false so stopOnError=false works (per SP-1 validation)
+      setupSmartClientMock(mockClient.query, [
+        { rowCount: 1 }, // First SELECT
+        { rowCount: 1 }, // SELECT 1
+        new Error('syntax error'), // INVALID
+      ]);
 
-      const result = await executeSqlFile({ filePath: testFile, stopOnError: false });
+      const result = await executeSqlFile({
+        filePath: testFile,
+        useTransaction: false,
+        stopOnError: false,
+      });
 
       expect(result.errors).toBeDefined();
       expect(result.errors!.length).toBe(1);
@@ -682,7 +757,7 @@ SELECT 2;`);
 
     beforeEach(() => {
       // Create unique test directory for each test run
-      testDir = fs.mkdtempSync('/tmp/postgres-mcp-preview-test-');
+      testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-mcp-preview-test-'));
       testFile = `${testDir}/test.sql`;
     });
 
@@ -1052,11 +1127,10 @@ SELECT * FROM ins;
     it('should execute UPDATE in transaction and rollback', async () => {
       const { mutationDryRun } = await import('../tools/sql-tools.js');
 
-      mockClient.query
-        .mockResolvedValueOnce({}) // BEGIN
-        .mockResolvedValueOnce({ rows: [{ id: 1, name: 'old' }] }) // SELECT before
-        .mockResolvedValueOnce({ rows: [{ id: 1, name: 'new' }], rowCount: 1 }) // UPDATE RETURNING
-        .mockResolvedValueOnce({}); // ROLLBACK
+      setupSmartClientMock(mockClient.query, [
+        { rows: [{ id: 1, name: 'old' }] }, // SELECT before
+        { rows: [{ id: 1, name: 'new' }], rowCount: 1 }, // UPDATE RETURNING
+      ]);
 
       const result = await mutationDryRun({
         sql: "UPDATE users SET name = 'new' WHERE id = 1"
@@ -1072,11 +1146,10 @@ SELECT * FROM ins;
     it('should execute DELETE in transaction and rollback', async () => {
       const { mutationDryRun } = await import('../tools/sql-tools.js');
 
-      mockClient.query
-        .mockResolvedValueOnce({}) // BEGIN
-        .mockResolvedValueOnce({ rows: [{ id: 1 }] }) // SELECT before
-        .mockResolvedValueOnce({ rows: [{ id: 1 }], rowCount: 1 }) // DELETE RETURNING
-        .mockResolvedValueOnce({}); // ROLLBACK
+      setupSmartClientMock(mockClient.query, [
+        { rows: [{ id: 1 }] }, // SELECT before
+        { rows: [{ id: 1 }], rowCount: 1 }, // DELETE RETURNING
+      ]);
 
       const result = await mutationDryRun({
         sql: 'DELETE FROM users WHERE id = 1'
@@ -1090,10 +1163,9 @@ SELECT * FROM ins;
     it('should execute INSERT in transaction and rollback', async () => {
       const { mutationDryRun } = await import('../tools/sql-tools.js');
 
-      mockClient.query
-        .mockResolvedValueOnce({}) // BEGIN
-        .mockResolvedValueOnce({ rows: [{ id: 1, name: 'test' }], rowCount: 1 }) // INSERT RETURNING
-        .mockResolvedValueOnce({}); // ROLLBACK
+      setupSmartClientMock(mockClient.query, [
+        { rows: [{ id: 1, name: 'test' }], rowCount: 1 }, // INSERT RETURNING
+      ]);
 
       const result = await mutationDryRun({
         sql: "INSERT INTO users (name) VALUES ('test')"
@@ -1194,11 +1266,10 @@ SELECT * FROM ins;
     it('should capture before and after rows for UPDATE', async () => {
       const { mutationDryRun } = await import('../tools/sql-tools.js');
 
-      mockClient.query
-        .mockResolvedValueOnce({}) // BEGIN
-        .mockResolvedValueOnce({ rows: [{ id: 1, status: 'active' }] }) // SELECT before
-        .mockResolvedValueOnce({ rows: [{ id: 1, status: 'inactive' }], rowCount: 1 }) // UPDATE RETURNING
-        .mockResolvedValueOnce({}); // ROLLBACK
+      setupSmartClientMock(mockClient.query, [
+        { rows: [{ id: 1, status: 'active' }] }, // SELECT before
+        { rows: [{ id: 1, status: 'inactive' }], rowCount: 1 }, // UPDATE RETURNING
+      ]);
 
       const result = await mutationDryRun({
         sql: "UPDATE users SET status = 'inactive' WHERE id = 1"
@@ -1256,7 +1327,7 @@ SELECT * FROM ins;
       };
       mockGetClient.mockResolvedValue(mockClient);
 
-      testDir = fs.mkdtempSync('/tmp/postgres-mcp-dryrun-test-');
+      testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'postgres-mcp-dryrun-test-'));
       testFile = `${testDir}/test.sql`;
     });
 
@@ -1312,13 +1383,12 @@ SELECT 4;`);
       (pgError as any).code = '42601';
       (pgError as any).position = '1';
 
-      mockClient.query
-        .mockResolvedValueOnce({}) // BEGIN
-        .mockResolvedValueOnce({ rows: [], rowCount: 1 }) // SELECT 1
-        .mockResolvedValueOnce({ rows: [], rowCount: 1 }) // SELECT 2
-        .mockRejectedValueOnce(pgError) // INVALID
-        .mockResolvedValueOnce({ rows: [], rowCount: 1 }) // SELECT 4
-        .mockResolvedValueOnce({}); // ROLLBACK
+      setupSmartClientMock(mockClient.query, [
+        { rows: [], rowCount: 1 }, // SELECT 1
+        { rows: [], rowCount: 1 }, // SELECT 2
+        pgError, // INVALID
+        { rows: [], rowCount: 1 }, // SELECT 4
+      ]);
 
       const result = await dryRunSqlFile({ filePath: testFile, stopOnError: false });
 
@@ -1336,11 +1406,10 @@ SELECT 4;`);
 INVALID;
 SELECT 3;`);
 
-      mockClient.query
-        .mockResolvedValueOnce({}) // BEGIN
-        .mockResolvedValueOnce({ rows: [], rowCount: 1 }) // SELECT 1
-        .mockRejectedValueOnce(new Error('syntax error')) // INVALID
-        .mockResolvedValueOnce({}); // ROLLBACK
+      setupSmartClientMock(mockClient.query, [
+        { rows: [], rowCount: 1 }, // SELECT 1
+        new Error('syntax error'), // INVALID
+      ]);
 
       const result = await dryRunSqlFile({ filePath: testFile, stopOnError: true });
 
@@ -1356,12 +1425,11 @@ SELECT 3;`);
 INVALID;
 SELECT 3;`);
 
-      mockClient.query
-        .mockResolvedValueOnce({}) // BEGIN
-        .mockResolvedValueOnce({ rows: [], rowCount: 1 }) // SELECT 1
-        .mockRejectedValueOnce(new Error('syntax error')) // INVALID
-        .mockResolvedValueOnce({ rows: [], rowCount: 1 }) // SELECT 3
-        .mockResolvedValueOnce({}); // ROLLBACK
+      setupSmartClientMock(mockClient.query, [
+        { rows: [], rowCount: 1 }, // SELECT 1
+        new Error('syntax error'), // INVALID
+        { rows: [], rowCount: 1 }, // SELECT 3
+      ]);
 
       const result = await dryRunSqlFile({ filePath: testFile, stopOnError: false });
 
@@ -1375,11 +1443,10 @@ SELECT 3;`);
       fs.writeFileSync(testFile, `INSERT INTO users (name) VALUES ('test');
 SELECT nextval('users_id_seq');`);
 
-      mockClient.query
-        .mockResolvedValueOnce({}) // BEGIN
-        .mockResolvedValueOnce({ rows: [], rowCount: 1 }) // INSERT (with warning but executed)
-        .mockResolvedValueOnce({ rows: [{ 'QUERY PLAN': [{ Plan: { 'Node Type': 'Result' } }] }] }) // EXPLAIN for nextval
-        .mockResolvedValueOnce({}); // ROLLBACK
+      setupSmartClientMock(mockClient.query, [
+        { rows: [], rowCount: 1 }, // INSERT (with warning but executed)
+        { rows: [{ 'QUERY PLAN': [{ Plan: { 'Node Type': 'Result' } }] }] }, // EXPLAIN for nextval
+      ]);
 
       const result = await dryRunSqlFile({ filePath: testFile });
 
@@ -1476,13 +1543,12 @@ SELECT * FROM test;`);
       const { dryRunSqlFile } = await import('../tools/sql-tools.js');
       fs.writeFileSync(testFile, 'SELECT id, name FROM users;');
 
-      mockClient.query
-        .mockResolvedValueOnce({}) // BEGIN
-        .mockResolvedValueOnce({
+      setupSmartClientMock(mockClient.query, [
+        {
           rows: [{ id: 1, name: 'Alice' }, { id: 2, name: 'Bob' }],
           rowCount: 2
-        })
-        .mockResolvedValueOnce({}); // ROLLBACK
+        },
+      ]);
 
       const result = await dryRunSqlFile({ filePath: testFile });
 
@@ -1502,10 +1568,7 @@ SELECT * FROM test;`);
       (pgError as any).table = 'users';
       (pgError as any).constraint = 'users_email_key';
 
-      mockClient.query
-        .mockResolvedValueOnce({}) // BEGIN
-        .mockRejectedValueOnce(pgError) // INSERT fails
-        .mockResolvedValueOnce({}); // ROLLBACK
+      setupSmartClientMock(mockClient.query, [pgError]);
 
       const result = await dryRunSqlFile({ filePath: testFile });
 
@@ -1529,10 +1592,7 @@ SELECT * FROM test;`);
       (pgError as any).detail = 'Key (user_id)=(999) is not present in table "users".';
       (pgError as any).constraint = 'orders_user_id_fkey';
 
-      mockClient.query
-        .mockResolvedValueOnce({}) // BEGIN
-        .mockRejectedValueOnce(pgError)
-        .mockResolvedValueOnce({}); // ROLLBACK
+      setupSmartClientMock(mockClient.query, [pgError]);
 
       const result = await dryRunSqlFile({ filePath: testFile });
 
