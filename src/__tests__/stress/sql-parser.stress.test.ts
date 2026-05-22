@@ -252,7 +252,8 @@ $outer$;`;
         'schema"name',
         'schema`name',
         "schema'; DELETE",
-        "1schema", // starts with digit
+        // Hotfix-3.0.3: digit-leading is no longer an injection signal.
+        // ("1schema" is a valid PG schema name when quoted.)
         "schema name", // contains space
       ];
 

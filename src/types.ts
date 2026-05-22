@@ -86,7 +86,15 @@ export interface DatabaseInfo {
   name: string;
   owner: string;
   encoding: string;
-  size: string;
+  /**
+   * pg_size_pretty(pg_database_size(...)) when the role has CONNECT on
+   * the database; null otherwise. (pg_database_size() requires CONNECT
+   * or pg_read_all_stats — calling it on a DB the role lacks access to
+   * throws SQLSTATE 42501, which previously aborted the entire listing.)
+   */
+  size: string | null;
+  /** True when the current role has CONNECT on this database. */
+  canConnect: boolean;
 }
 
 export interface SchemaInfo {

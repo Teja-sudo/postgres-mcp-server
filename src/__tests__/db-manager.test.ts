@@ -552,9 +552,12 @@ describe('DatabaseManager', () => {
 
       await expect(manager.switchServer('dev', 'invalid;db')).rejects.toThrow('Invalid database name');
       await expect(manager.switchServer('dev', 'db--name')).rejects.toThrow('Invalid database name'); // SQL comment
-      await expect(manager.switchServer('dev', '123db')).rejects.toThrow('Invalid database name'); // starts with digit
       await expect(manager.switchServer('dev', "db'name")).rejects.toThrow('Invalid database name'); // quote
-      // Note: 'GraphQL-Intro-DB' with single hyphens is valid and allowed
+      // Hotfix-3.0.3: digit-leading names are NOW accepted (the value
+      // passes through escapeIdentifier which quotes it).  '123db' /
+      // '1188' would only fail at the actual PG connect step if the
+      // server lacks the database — that's not a validation error.
+      // Compound-hyphen names are still allowed.
     });
 
     it('should throw when querying without connection', async () => {

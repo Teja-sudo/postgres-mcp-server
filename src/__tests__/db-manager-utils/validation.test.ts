@@ -47,11 +47,17 @@ describe('db-manager validation', () => {
       });
     });
 
-    describe('invalid names', () => {
-      it('should reject names starting with digit', () => {
-        expect(() => validateDatabaseName('1db')).toThrow();
+    describe('valid names', () => {
+      it('accepts names starting with a digit', () => {
+        // Hotfix-3.0.3: relaxed to permit digit-leading PG identifiers.
+        // The value always passes through escapeIdentifier() (which wraps
+        // it in double quotes) before reaching SQL.
+        expect(() => validateDatabaseName('1188')).not.toThrow();
+        expect(() => validateDatabaseName('42_tenant_db')).not.toThrow();
       });
+    });
 
+    describe('invalid names', () => {
       it('should reject names with semicolons (SQL injection)', () => {
         expect(() => validateDatabaseName('db;DROP TABLE')).toThrow();
       });
@@ -113,11 +119,16 @@ describe('db-manager validation', () => {
       });
     });
 
-    describe('invalid names', () => {
-      it('should reject names starting with digit', () => {
-        expect(() => validateSchemaName('1schema')).toThrow();
+    describe('valid names (extended)', () => {
+      it('accepts names starting with a digit', () => {
+        // Hotfix-3.0.3: schema names quoted via escapeIdentifier, so
+        // digit-leading values are now accepted.
+        expect(() => validateSchemaName('1schema')).not.toThrow();
+        expect(() => validateSchemaName('2024q1')).not.toThrow();
       });
+    });
 
+    describe('invalid names', () => {
       it('should reject names with hyphens', () => {
         expect(() => validateSchemaName('my-schema')).toThrow();
       });
@@ -143,12 +154,15 @@ describe('db-manager validation', () => {
       expect(isValidDatabaseName('mydb')).toBe(true);
       expect(isValidDatabaseName('my_db')).toBe(true);
       expect(isValidDatabaseName('my-db')).toBe(true);
+      // Hotfix-3.0.3: digit-leading accepted
+      expect(isValidDatabaseName('1188')).toBe(true);
     });
 
     it('should return false for invalid names', () => {
-      expect(isValidDatabaseName('1db')).toBe(false);
       expect(isValidDatabaseName('db;DROP')).toBe(false);
       expect(isValidDatabaseName("db'name")).toBe(false);
+      expect(isValidDatabaseName('db@name')).toBe(false);
+      expect(isValidDatabaseName('-leadinghyphen')).toBe(false);
     });
   });
 
@@ -156,12 +170,14 @@ describe('db-manager validation', () => {
     it('should return true for valid names', () => {
       expect(isValidSchemaName('public')).toBe(true);
       expect(isValidSchemaName('my_schema')).toBe(true);
+      // Hotfix-3.0.3: digit-leading accepted
+      expect(isValidSchemaName('1schema')).toBe(true);
     });
 
     it('should return false for invalid names', () => {
-      expect(isValidSchemaName('1schema')).toBe(false);
       expect(isValidSchemaName('my-schema')).toBe(false);
       expect(isValidSchemaName('schema;DROP')).toBe(false);
+      expect(isValidSchemaName('schema@name')).toBe(false);
     });
   });
 });

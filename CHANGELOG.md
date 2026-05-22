@@ -4,6 +4,54 @@ All notable changes to `@tejasanik/postgres-mcp-server` are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/), versioning
 follows [Semantic Versioning](https://semver.org/).
 
+## [3.0.3] — 2026-05-04
+
+Hotfix release. Two real bugs reported by users running the MCP
+against a multi-tenant cluster.
+
+### Fixed
+
+- **`list_databases` no longer aborts when any database denies CONNECT
+  to the listing role.** The query previously called
+  `pg_database_size(datname)` for every row in `pg_database`; PG raises
+  `SQLSTATE 42501 permission denied for database X` from inside the
+  function when the role lacks CONNECT, which aborted the entire
+  listing. The size lookup is now guarded by
+  `has_database_privilege(datname, 'CONNECT')` — inaccessible databases
+  return `size: null` and `canConnect: false` instead of throwing. The
+  caller-supplied `filter` is also now applied IN SQL (ILIKE on
+  `pg_database`) instead of JS-side, so the per-row size call only
+  fires for rows that match the filter. `DatabaseInfo` gains the
+  `canConnect: boolean` field; `size` widens to `string | null`.
+- **`DatabaseManager.listDatabases()` accepts an options object**
+  (`{ filter?, includeTemplates? }`) — used by both the in-pool and
+  temp-pool paths in the `listDatabases` tool wrapper. Backward-
+  compatible (all parameters optional).
+- **`validateDatabaseName` / `validateSchemaName` accept digit-leading
+  names.** PostgreSQL allows digit-leading identifiers when quoted, and
+  these values always pass through `escapeIdentifier()` (which double-
+  quotes them) before reaching SQL, so the unquoted-identifier
+  restriction was over-strict. Concrete impact: switching to a database
+  literally named `'1188'` (or `'2024q1_archive'`, etc.) no longer
+  throws `Invalid database name`. Real injection patterns (`--`, `;`,
+  quotes, backticks) are still rejected.
+
+### Tests
+
+- New `src/__tests__/audit/hotfix-3-0-3.test.ts` — 6 integration tests
+  exercising both bugs end-to-end:
+  - listing completes across a DB the role lacks CONNECT on
+  - filter argument is applied in SQL (not JS)
+  - validators accept digit-leading names + still reject injections
+  - `switch_server_db` succeeds with a digit-leading database name
+  - `switch_server_db` with a purely numeric name now fails at PG
+    connect time (not client-side validation)
+- Existing unit tests in `db-manager-utils/validation.test.ts`,
+  `db-manager.test.ts`, and `stress/sql-parser.stress.test.ts`
+  updated to match the relaxed identifier contract.
+
+Total: 827 tests pass across 29 suites against real PG 17.
+
 ## [3.0.2] — 2026-05-04
 
 Documentation-only release. No source or behavior changes.

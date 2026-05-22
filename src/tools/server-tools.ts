@@ -27,6 +27,34 @@ interface ListDatabasesResult {
 }
 
 /**
+ * SQL query used by listDatabases in both the in-pool (connected server)
+ * and temp-pool (different server) paths. Kept in one place so the
+ * permission-denied / filter behavior stays consistent.
+ *
+ * - `$1::boolean` — when true, include templates (template0/template1)
+ * - `$2::text`    — optional ILIKE filter, NULL means no filter
+ *
+ * Guards `pg_database_size()` behind `has_database_privilege(..., 'CONNECT')`
+ * so listing never aborts on a database the role can't access. `size` is
+ * NULL for inaccessible databases; `canConnect` indicates which.
+ */
+const LIST_DATABASES_SQL = `
+  SELECT
+    datname AS name,
+    pg_catalog.pg_get_userbyid(datdba) AS owner,
+    pg_catalog.pg_encoding_to_char(encoding) AS encoding,
+    CASE WHEN pg_catalog.has_database_privilege(datname, 'CONNECT')
+         THEN pg_catalog.pg_size_pretty(pg_catalog.pg_database_size(datname))
+         ELSE NULL
+    END AS size,
+    pg_catalog.has_database_privilege(datname, 'CONNECT') AS "canConnect"
+  FROM pg_catalog.pg_database
+  WHERE ($1::boolean OR datistemplate = false)
+    AND ($2::text IS NULL OR datname ILIKE '%' || $2 || '%')
+  ORDER BY datname
+`;
+
+/**
  * Creates a temporary database connection for listing databases.
  */
 async function createTempConnection(serverName: string, config: any): Promise<any> {
@@ -56,17 +84,11 @@ async function createTempConnection(serverName: string, config: any): Promise<an
   }
 
   return {
-    async listDatabases(): Promise<DatabaseInfo[]> {
-      const result = await pool.query(`
-        SELECT
-          datname as name,
-          pg_catalog.pg_get_userbyid(datdba) as owner,
-          pg_catalog.pg_encoding_to_char(encoding) as encoding,
-          pg_catalog.pg_size_pretty(pg_catalog.pg_database_size(datname)) as size
-        FROM pg_catalog.pg_database
-        WHERE datistemplate = false
-        ORDER BY datname
-      `);
+    async listDatabases(opts: { filter?: string; includeTemplates?: boolean }): Promise<DatabaseInfo[]> {
+      const result = await pool.query(LIST_DATABASES_SQL, [
+        opts.includeTemplates ?? false,
+        opts.filter ?? null,
+      ]);
       return result.rows;
     },
     async close(): Promise<void> {
@@ -174,7 +196,6 @@ export async function listDatabases(args: {
     throw new Error(`Server '${args.serverName}' not found. Available servers: ${availableServers}`);
   }
 
-  const systemDbs = ['template0', 'template1'];
   // Audit-iteration-3 fix (group 1 P1-3, P1-4): clamp maxResults
   // to a sane positive range. Previously `|| 50` swallowed an
   // explicit `0` and negative values caused `slice(0, -100)` which
@@ -184,34 +205,33 @@ export async function listDatabases(args: {
   const requested = args.maxResults ?? 50;
   const maxResults = Math.min(Math.max(requested, 0), 200);
 
+  // Hotfix-3.0.3 (list_databases aborted on permission_denied): push
+  // the ILIKE filter into the SQL so the per-row pg_database_size()
+  // call only fires on the candidate set the caller asked for, and
+  // guard the size lookup behind has_database_privilege so a single
+  // inaccessible database doesn't abort the entire listing.
+  // `includeTemplates` is forwarded into SQL too — the JS-side
+  // filter that used to drop templates is no longer needed.
+  const listOpts = {
+    filter: args.filter,
+    includeTemplates: args.includeSystemDbs === true,
+  };
+
   let databases: DatabaseInfo[];
 
   // If connected to this server, use existing connection
   if (currentState.currentServer === args.serverName) {
-    databases = await dbManager.listDatabases();
+    databases = await dbManager.listDatabases(listOpts);
   } else {
     // Create temporary connection to the server
     const config = serversConfig[args.serverName];
     const tempDbManager = await createTempConnection(args.serverName, config);
 
     try {
-      databases = await tempDbManager.listDatabases();
+      databases = await tempDbManager.listDatabases(listOpts);
     } finally {
       await tempDbManager.close();
     }
-  }
-
-  // Filter system databases unless explicitly included
-  if (!args.includeSystemDbs) {
-    databases = databases.filter(db => !systemDbs.includes(db.name));
-  }
-
-  // Apply name filter
-  if (args.filter) {
-    const filterLower = args.filter.toLowerCase();
-    databases = databases.filter(db =>
-      db.name.toLowerCase().includes(filterLower)
-    );
   }
 
   // Limit results

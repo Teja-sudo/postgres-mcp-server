@@ -5,14 +5,31 @@
  * Prevents SQL injection and ensures PostgreSQL-compatible identifiers.
  */
 
-/** Pattern for valid database names: start with letter/underscore, alphanumeric/underscore/hyphen */
-const DATABASE_NAME_PATTERN = /^[a-zA-Z_][a-zA-Z0-9_-]*$/;
+/**
+ * Pattern for valid database names: any combination of letters, digits,
+ * underscores, and hyphens.
+ *
+ * Hotfix-3.0.3: leading digit allowed. Database names in PostgreSQL can
+ * start with a digit when quoted, and these values always pass through
+ * `escapeIdentifier()` before reaching SQL — so we don't need to require
+ * unquoted-identifier form here. Real-world examples of digit-leading
+ * names (numeric tenant IDs, date-stamped DBs) were rejected by the
+ * previous pattern.
+ */
+const DATABASE_NAME_PATTERN = /^[a-zA-Z0-9_][a-zA-Z0-9_-]*$/;
 
 /** Pattern for SQL injection characters that must not appear in database names */
 const SQL_INJECTION_PATTERN = /--|;|'|"|`/;
 
-/** Pattern for valid schema names: start with letter/underscore, alphanumeric/underscore only */
-const SCHEMA_NAME_PATTERN = /^[a-zA-Z_]\w*$/;
+/**
+ * Pattern for valid schema names: any combination of letters, digits,
+ * and underscores (no hyphens — PG schemas almost never use them).
+ *
+ * Hotfix-3.0.3: leading digit allowed (same reasoning as
+ * DATABASE_NAME_PATTERN — value is double-quoted via escapeIdentifier
+ * before reaching SQL).
+ */
+const SCHEMA_NAME_PATTERN = /^[a-zA-Z0-9_]\w*$/;
 
 /**
  * Validates a database name for PostgreSQL compatibility and SQL injection prevention.

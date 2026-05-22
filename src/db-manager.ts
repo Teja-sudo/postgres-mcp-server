@@ -729,17 +729,32 @@ export class DatabaseManager {
     await this.switchServer(this.connectionState.currentServer, database);
   }
 
-  public async listDatabases(): Promise<DatabaseInfo[]> {
-    const result = await this.query<DatabaseInfo>(`
-      SELECT
-        datname as name,
-        pg_catalog.pg_get_userbyid(datdba) as owner,
-        pg_catalog.pg_encoding_to_char(encoding) as encoding,
-        pg_catalog.pg_size_pretty(pg_catalog.pg_database_size(datname)) as size
-      FROM pg_catalog.pg_database
-      WHERE datistemplate = false
-      ORDER BY datname
-    `);
+  public async listDatabases(opts?: {
+    filter?: string;
+    includeTemplates?: boolean;
+  }): Promise<DatabaseInfo[]> {
+    // Apply ILIKE filter in SQL so the per-row pg_database_size() call
+    // is only made for databases the caller actually wants. Skip the
+    // size lookup entirely for databases the role lacks CONNECT on
+    // (pg_database_size raises SQLSTATE 42501 in that case, which would
+    // abort the whole query). The has_database_privilege() probe is
+    // cheap and never throws — it just returns false.
+    const result = await this.query<DatabaseInfo>(
+      `SELECT
+         datname AS name,
+         pg_catalog.pg_get_userbyid(datdba) AS owner,
+         pg_catalog.pg_encoding_to_char(encoding) AS encoding,
+         CASE WHEN pg_catalog.has_database_privilege(datname, 'CONNECT')
+              THEN pg_catalog.pg_size_pretty(pg_catalog.pg_database_size(datname))
+              ELSE NULL
+         END AS size,
+         pg_catalog.has_database_privilege(datname, 'CONNECT') AS "canConnect"
+       FROM pg_catalog.pg_database
+       WHERE ($1::boolean OR datistemplate = false)
+         AND ($2::text IS NULL OR datname ILIKE '%' || $2 || '%')
+       ORDER BY datname`,
+      [opts?.includeTemplates ?? false, opts?.filter ?? null]
+    );
     return result.rows;
   }
 
